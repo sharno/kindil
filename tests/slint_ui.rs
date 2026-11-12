@@ -1,265 +1,340 @@
-//! Test the production component and renderer, not a reimplementation.
-use kindil::{config::Config, ui};
+//! The production window and renderer, driven by real taps on a simulated
+//! device. Coordinates are the 758×1024 panel's; see ui/app.slint for layout.
+use kindil::config::Config;
+use kindil::host::{Host, Simulated};
+use kindil::preview::{self, drag, pixels, tap};
+use kindil::ui::{App, DashboardKind, Execution, Kindil, Options, Page, Panel, Switch};
+use kindil::wifi::Credentials;
+use slint::platform::software_renderer::MinimalSoftwareWindow;
 use slint::{ComponentHandle, Model};
+use std::path::Path;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
+const TAB_Y: f32 = 978.0;
+const HOME_TAB: f32 = 95.0;
+const LIBRARY_TAB: f32 = 284.0;
+const SETTINGS_TAB: f32 = 663.0;
+
+struct Fixture {
+    app: App,
+    window: Rc<MinimalSoftwareWindow>,
+    dir: tempfile::TempDir,
+}
+
+impl Fixture {
+    fn new(host: Arc<dyn Host>) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let books = dir.path().join("books");
+        std::fs::create_dir(&books).unwrap();
+        std::fs::write(
+            books.join("A_Real_Book.txt"),
+            "A real book\nقنديل\n".repeat(400),
+        )
+        .unwrap();
+        let config = Config {
+            books,
+            prefs: dir.path().join("prefs.toml"),
+            ..Config::parse("dashboard = \"clock\"").unwrap()
+        };
+        let window = preview::install().unwrap();
+        let app = App::new(Options {
+            config,
+            host,
+            panel: Panel::Lcd,
+            execution: Execution::Inline,
+        })
+        .unwrap();
+        app.refresh_now();
+        app.window.show().unwrap();
+        Self { app, window, dir }
+    }
+
+    fn k(&self) -> Kindil<'_> {
+        self.app.window.global::<Kindil>()
+    }
+
+    fn tap(&self, x: f32, y: f32) {
+        let _ = pixels(&self.window);
+        tap(&self.window, x, y);
+        let _ = pixels(&self.window);
+    }
+
+    fn books(&self) -> std::path::PathBuf {
+        self.dir.path().join("books")
+    }
+
+    fn keyboard_visible(&self) -> bool {
+        self.app.window.get_keyboard_visible()
+    }
+}
+
 #[test]
-fn actual_slint_miqat_reader_sliders_and_arabic() {
-    let window = ui::preview::install().unwrap();
-    let books = tempfile::tempdir().unwrap();
-    std::fs::write(
-        books.path().join("test.txt"),
-        "A real book\nقنديل\n".repeat(100),
-    )
-    .unwrap();
-    let config = Config::default();
-    let app = ui::create(config, books.path()).unwrap();
-    app.window.show().unwrap();
-    let miqat = miqat::config::Config::load(std::path::Path::new("examples/miqat.toml")).unwrap();
-    let instant = chrono::DateTime::from_timestamp(1794398400, 0).unwrap();
-    let gray = kindil::dashboards::preview(&miqat, instant).unwrap();
+fn miqat_is_pixel_exact_and_taps_reveal_the_tabs() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    let miqat = miqat::config::Config::load(Path::new("examples/miqat.toml")).unwrap();
+    let noon = chrono::DateTime::from_timestamp(1_794_398_400, 0).unwrap();
+    let gray = kindil::dashboards::preview(&miqat, noon).unwrap();
     let expected = gray.pixels.clone();
-    app.set_miqat(gray);
-    let rendered = ui::preview::pixels(&window);
-    assert_eq!(rendered.len(), expected.len());
+    f.app.set_miqat(gray);
+    f.k().set_dashboard(DashboardKind::Miqat);
+    let rendered = pixels(&f.window);
     assert!(
         rendered
             .iter()
-            .zip(expected)
-            .all(|(p, g)| p.r == g && p.g == g && p.b == g),
-        "Slint must show Miqat pixel-for-pixel without chrome/scaling"
+            .zip(&expected)
+            .all(|(p, g)| p.r == *g && p.g == *g && p.b == *g),
+        "the dashboard must be Miqat's frame, without chrome or scaling"
     );
-    assert_eq!(app.window.get_books().row_count(), 1);
-    app.window.invoke_open_book(0);
-    assert_eq!(app.window.get_page(), 2);
-    assert!(app.window.get_book_text().contains("A real book"));
-    app.window.invoke_turn_page(true);
-    assert!(app.window.get_book_page().starts_with("2 /"));
-    app.window
-        .set_book_text("Scroll this line\n".repeat(100).into());
-    let _ = ui::preview::pixels(&window);
-    {
-        use slint::platform::{PointerEventButton, WindowAdapter, WindowEvent};
-        let position = slint::LogicalPosition::new(300.0, 600.0);
-        window.window().dispatch_event(WindowEvent::PointerPressed {
-            position,
-            button: PointerEventButton::Left,
-        });
-        for y in [550.0, 450.0, 300.0] {
-            window.window().dispatch_event(WindowEvent::PointerMoved {
-                position: slint::LogicalPosition::new(300.0, y),
-            });
-        }
-        window
-            .window()
-            .dispatch_event(WindowEvent::PointerReleased {
-                position: slint::LogicalPosition::new(300.0, 300.0),
-                button: PointerEventButton::Left,
-            });
-    }
-    let _ = ui::preview::pixels(&window);
-    assert!(
-        app.window.get_reader_offset() < 0.0,
-        "touch drag must scroll the reader"
-    );
-    app.window.invoke_turn_page(true);
-    let _ = ui::preview::pixels(&window);
-    assert_eq!(
-        app.window.get_reader_offset(),
-        0.0,
-        "new page starts at top"
-    );
-    app.window.set_reading_font_size(36.0);
-    app.window.invoke_font_size_changed(36.0);
-    assert!(!app.window.get_book_text().is_empty());
-    app.window.invoke_brightness_changed(80.0);
-    assert!(app
-        .window
-        .get_brightness_status()
-        .contains("no device writes"));
-    app.window.set_dashboard_mode(1);
-    app.window.set_page(0);
-    // ZWNJ deliberately disables contextual joining. A proper shaping pipeline
-    // produces a narrower normal word than its explicitly disconnected form.
-    let span = |pixels: Vec<slint::Rgb8Pixel>| {
-        let xs = (28..300)
-            .filter(|x| (28..68).any(|y| pixels[y * 758 + x].r < 128))
-            .collect::<Vec<_>>();
-        xs.last().unwrap() - xs.first().unwrap()
-    };
-    app.window.set_brand("قنديل".into());
-    let frame = ui::preview::pixels(&window);
-    assert_eq!(
-        frame[0],
-        slint::Rgb8Pixel {
-            r: 255,
-            g: 255,
-            b: 255
-        },
-        "fresh preview buffers must repaint unchanged background too"
-    );
-    let joined = span(frame);
-    app.window
-        .set_brand("ق\u{200c}ن\u{200c}د\u{200c}ي\u{200c}ل".into());
-    let disconnected = span(ui::preview::pixels(&window));
-    assert!(
-        joined < disconnected,
-        "Arabic must use contextual joining ({joined} vs {disconnected})"
-    );
-    // Do not leak the deliberately broken fixture into later workflow previews.
-    app.window.set_brand("kindil · قنديل".into());
-    app.window.invoke_rename_file(0, "renamed.txt".into());
-    assert!(books.path().join("renamed.txt").exists());
-    app.window.invoke_trash_file(0);
-    assert!(!books.path().join("renamed.txt").exists());
-    app.window.invoke_undo_trash();
-    assert!(books.path().join("renamed.txt").exists());
-    touch_entry(&app, &window);
-    app.window.set_page(1);
-    app.window.set_selected_file(-1);
-    app.window.set_file_status("".into());
-    let _ = ui::preview::pixels(&window);
-    ui::preview::tap(&window, 690.0, 210.0); // actual file-actions button
-    assert_eq!(app.window.get_selected_file(), 0);
-    app.window.set_new_filename("".into());
-    let _ = ui::preview::pixels(&window);
-    ui::preview::tap(&window, 140.0, 834.0);
-    let _ = ui::preview::pixels(&window);
-    assert!(
-        app.window.get_keyboard_visible(),
-        "rename field supports touch entry"
-    );
-    for (x, y) in [
+    f.tap(380.0, 500.0);
+    assert!(f.k().get_chrome_visible());
+    f.tap(LIBRARY_TAB, TAB_Y);
+    assert_eq!(f.k().get_page(), Page::Library);
+}
+
+#[test]
+fn reading_turns_pages_and_remembers_the_position() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    f.tap(LIBRARY_TAB, TAB_Y);
+    assert_eq!(f.k().get_books().row_count(), 1);
+    assert_eq!(f.k().get_books().row_data(0).unwrap().title, "A Real Book");
+    f.tap(300.0, 208.0);
+    assert_eq!(f.k().get_page(), Page::Reader);
+    assert!(f.k().get_book_text().contains("A real book"));
+    assert!(f.k().get_book_position().starts_with("1 of"));
+    f.tap(600.0, 500.0); // right two-thirds: forward
+    f.tap(600.0, 500.0);
+    assert!(f.k().get_book_position().starts_with("3 of"));
+    f.tap(100.0, 500.0); // left third: back
+    assert!(f.k().get_book_position().starts_with("2 of"));
+    let prefs = std::fs::read_to_string(f.dir.path().join("prefs.toml")).unwrap();
+    assert!(prefs.contains("A_Real_Book.txt"), "{prefs}");
+
+    // A larger font repaginates but keeps the place in the book.
+    let before = f.k().get_book_progress();
+    f.k().invoke_font_larger();
+    f.k().invoke_font_larger();
+    assert_eq!(f.k().get_font_size(), 28);
+    assert!((f.k().get_book_progress() - before).abs() < 0.02);
+
+    // Reopening resumes where reading stopped.
+    f.tap(HOME_TAB, TAB_Y);
+    f.tap(LIBRARY_TAB, TAB_Y);
+    f.tap(300.0, 208.0);
+    assert!(!f.k().get_book_position().starts_with("1 of"));
+}
+
+#[test]
+fn rename_with_the_touch_keyboard_then_trash_and_undo() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    f.tap(LIBRARY_TAB, TAB_Y);
+    f.tap(716.0, 208.0); // "···"
+    assert_eq!(f.k().get_selected_book(), 0);
+    assert_eq!(f.k().get_new_name(), "A_Real_Book.txt");
+    f.k().set_new_name("".into());
+    f.tap(380.0, 786.0); // file name field
+    assert!(f.keyboard_visible(), "the field opens the keyboard");
+    [
         (109.0, 742.0),
         (595.0, 870.0),
         (354.0, 742.0),
         (161.0, 870.0),
         (354.0, 742.0),
-    ] {
-        ui::preview::tap(&window, x, y);
-        let _ = ui::preview::pixels(&window);
-    }
-    assert_eq!(app.window.get_new_filename(), "q.txt");
-    ui::preview::tap(&window, 721.0, 806.0); // Return dismisses keyboard
-    let _ = ui::preview::pixels(&window);
-    assert!(!app.window.get_keyboard_visible());
-    ui::preview::tap(&window, 180.0, 868.0); // actual Rename button
+    ]
+    .into_iter()
+    .for_each(|(x, y)| f.tap(x, y));
+    assert_eq!(f.k().get_new_name(), "q.txt");
+    f.tap(721.0, 806.0); // Return
+    assert!(!f.keyboard_visible());
+    f.tap(570.0, 870.0); // Rename
+    assert!(f.books().join("q.txt").is_file());
+    assert_eq!(f.k().get_selected_book(), -1);
+
+    f.tap(716.0, 208.0);
+    f.tap(200.0, 870.0); // Move to Trash
+    assert!(
+        f.books().join("q.txt").is_file(),
+        "the first tap only arms it"
+    );
+    f.tap(200.0, 870.0);
+    assert!(!f.books().join("q.txt").exists());
+    assert!(f.k().get_notice_undo());
+    f.k().invoke_undo();
+    assert!(f.books().join("q.txt").is_file());
+}
+
+#[test]
+fn settings_switch_the_simulated_device() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    f.tap(SETTINGS_TAB, TAB_Y);
+    assert_eq!(f.k().get_page(), Page::Settings);
+    f.tap(571.0, 246.0); // Clock
+    assert_eq!(f.k().get_dashboard(), DashboardKind::Clock);
+    let prefs = std::fs::read_to_string(f.dir.path().join("prefs.toml")).unwrap();
+    assert!(prefs.contains("dashboard = \"clock\""), "{prefs}");
+    assert_eq!(f.k().get_brightness(), 40);
+    f.tap(700.0, 380.0); // front light +
+    assert_eq!(f.k().get_brightness(), 50);
+    assert_eq!(f.k().get_ssh(), Switch::On);
+    f.tap(380.0, 829.0); // SSH server row
+    assert_eq!(f.k().get_ssh(), Switch::Off);
+    assert_eq!(f.k().get_sync(), Switch::Unavailable);
+    drag(&f.window, 380.0, 900.0, 200.0);
+    drag(&f.window, 380.0, 900.0, 200.0);
+    let facts: Vec<String> = f
+        .k()
+        .get_facts()
+        .iter()
+        .map(|fact| fact.label.to_string())
+        .collect();
     assert_eq!(
-        std::fs::read_to_string(books.path().join("q.txt")).unwrap(),
-        "A real book\nقنديل\n".repeat(100)
+        facts,
+        ["Battery", "Memory free", "Storage free", "Up for", "kindil"]
     );
 }
 
-fn touch_entry(app: &ui::App, window: &slint::platform::software_renderer::MinimalSoftwareWindow) {
-    use std::{cell::RefCell, rc::Rc};
-    let captured = Rc::new(RefCell::new(None));
-    let result = captured.clone();
-    // Fixture interception proves exact values without opening a real socket.
-    app.window.on_connect_wifi(move |ssid, password| {
-        *result.borrow_mut() = Some((ssid.to_string(), password.to_string()));
-    });
-    app.window.set_controls_open(false);
-    app.window.set_page(3);
-    let _ = ui::preview::pixels(window);
-    ui::preview::tap(window, 140.0, 250.0);
-    let _ = ui::preview::pixels(window);
-    assert!(
-        app.window.get_keyboard_visible(),
-        "tapping SSID opens keyboard"
-    );
-    let tap = |x, y| {
-        ui::preview::tap(window, x, y);
-        let _ = ui::preview::pixels(window);
-    };
-    tap(109.0, 742.0); // q
-    tap(171.0, 742.0); // w
-    assert_eq!(app.window.get_ssid(), "qw");
-    tap(683.0, 934.0); // cursor left
-    tap(232.0, 742.0); // e in middle
-    assert_eq!(app.window.get_ssid(), "qew");
-    tap(721.0, 742.0); // backspace
-    assert_eq!(app.window.get_ssid(), "qw");
-    tap(37.0, 870.0); // shift
-    tap(109.0, 742.0);
-    assert_eq!(app.window.get_ssid(), "qQw");
-    tap(75.0, 934.0); // symbols
-    tap(109.0, 742.0); // 1
-    assert_eq!(app.window.get_ssid(), "qQ1w");
-    tap(75.0, 934.0); // Arabic
-    tap(293.0, 742.0); // ق
-    assert_eq!(app.window.get_ssid(), "qQ1قw");
-    tap(721.0, 742.0); // delete one Unicode scalar, not one byte
-    assert_eq!(app.window.get_ssid(), "qQ1w");
-    // Enter a whole joined word through actual Arabic key taps, not a setter.
-    app.window.set_ssid("".into());
-    for (x, y) in [
+/// Records what the UI asked to join, so no passphrase has to be exposed.
+#[derive(Default)]
+struct Recording {
+    device: Simulated,
+    joined: Mutex<Vec<(String, bool)>>,
+}
+
+impl Host for Recording {
+    fn brightness(&self) -> anyhow::Result<kindil::host::Brightness> {
+        self.device.brightness()
+    }
+    fn set_brightness(&self, level: kindil::host::Brightness) -> anyhow::Result<()> {
+        self.device.set_brightness(level)
+    }
+    fn wifi(&self) -> kindil::host::Wifi {
+        self.device.wifi()
+    }
+    fn set_wifi(&self, power: kindil::host::Power) -> anyhow::Result<()> {
+        self.device.set_wifi(power)
+    }
+    fn scan(&self) -> anyhow::Result<Vec<kindil::wifi::Network>> {
+        self.device.scan()
+    }
+    fn join(&self, credentials: &Credentials) -> anyhow::Result<()> {
+        let entry = match credentials {
+            Credentials::Open(ssid) => (ssid.as_str().to_owned(), false),
+            Credentials::Wpa(ssid, _) => (ssid.as_str().to_owned(), true),
+        };
+        self.joined.lock().unwrap().push(entry);
+        self.device.join(credentials)
+    }
+    fn ssh(&self) -> kindil::host::Ssh {
+        self.device.ssh()
+    }
+    fn set_ssh(&self, power: kindil::host::Power) -> anyhow::Result<()> {
+        self.device.set_ssh(power)
+    }
+    fn set_ssh_at_boot(&self, power: kindil::host::Power) -> anyhow::Result<()> {
+        self.device.set_ssh_at_boot(power)
+    }
+    fn info(&self) -> kindil::host::DeviceInfo {
+        self.device.info()
+    }
+}
+
+#[test]
+fn join_a_network_and_type_arabic() {
+    let host = Arc::new(Recording::default());
+    let f = Fixture::new(host.clone());
+    f.tap(SETTINGS_TAB, TAB_Y);
+    f.tap(380.0, 695.0); // Choose a network
+    assert_eq!(f.k().get_page(), Page::Networks);
+    assert_eq!(f.k().get_networks().row_count(), 3);
+    f.tap(380.0, 228.0); // Home
+    assert!(f.k().get_join_open());
+    assert_eq!(f.k().get_join_ssid(), "Home");
+
+    f.tap(380.0, 869.0); // password field
+    assert!(f.keyboard_visible());
+    [109.0, 171.0, 232.0, 293.0, 354.0, 415.0, 476.0, 537.0]
+        .into_iter()
+        .for_each(|x| f.tap(x, 742.0));
+    // The sheet sits above the keyboard, so Join stays reachable.
+    f.tap(570.0, 633.0);
+    assert!(!f.k().get_join_open());
+    assert!(!f.keyboard_visible());
+    assert_eq!(*host.joined.lock().unwrap(), [("Home".to_string(), true)]);
+
+    // A too-short password never reaches the device.
+    f.k().invoke_join_network("Home".into(), "short".into());
+    assert_eq!(host.joined.lock().unwrap().len(), 1);
+    assert!(f.k().get_network_status().contains("8–63"));
+
+    // Arabic through real key taps: shaping, deletion by scalar.
+    f.tap(380.0, 492.0); // Other network…
+    assert_eq!(f.k().get_join_ssid(), "");
+    f.tap(380.0, 785.0); // network name field
+    f.tap(75.0, 934.0); // symbols
+    f.tap(75.0, 934.0); // Arabic
+    [
         (293.0, 742.0),
         (537.0, 806.0),
         (285.0, 870.0),
         (232.0, 806.0),
         (354.0, 806.0),
-    ] {
-        tap(x, y);
-    }
-    assert_eq!(app.window.get_ssid(), "قنديل");
+    ]
+    .into_iter()
+    .for_each(|(x, y)| f.tap(x, y));
+    assert_eq!(f.k().get_join_ssid(), "قنديل");
+    f.tap(721.0, 742.0); // backspace removes one scalar
+    assert_eq!(f.k().get_join_ssid(), "قندي");
     if let Some(dir) = std::env::var_os("KINDIL_TEST_PREVIEW_DIR") {
-        let dir = std::path::PathBuf::from(dir);
         std::fs::create_dir_all(&dir).unwrap();
-        ui::preview::snapshot(window, &dir.join("arabic-keyboard.ppm")).unwrap();
+        preview::snapshot(&f.window, &Path::new(&dir).join("arabic-keyboard.ppm")).unwrap();
     }
-    app.window.set_ssid("qQ1w".into());
-    app.window
-        .global::<ui::VirtualKeyboardHandler>()
-        .invoke_key_pressed(slint::platform::Key::End.into());
-    app.window
-        .global::<ui::VirtualKeyboardHandler>()
-        .invoke_key_pressed(slint::platform::Key::LeftArrow.into());
-    tap(75.0, 934.0); // wrap back to Latin
-    tap(109.0, 742.0);
-    assert_eq!(app.window.get_ssid(), "qQ1qw");
-    tap(42.0, 742.0); // Esc dismisses and removes field focus
-    assert!(!app.window.get_keyboard_visible());
-    tap(140.0, 250.0); // same field can reopen keyboard
-    assert!(app.window.get_keyboard_visible());
-    tap(140.0, 282.0); // password field
-    for x in [109.0, 171.0, 232.0, 293.0, 354.0, 415.0, 476.0, 537.0] {
-        tap(x, 742.0);
-    }
-    if let Some(dir) = std::env::var_os("KINDIL_TEST_PREVIEW_DIR") {
-        let dir = std::path::PathBuf::from(dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        ui::preview::snapshot(window, &dir.join("password-keyboard.ppm")).unwrap();
-    }
-    tap(140.0, 316.0); // Connect remains reachable above keyboard
-    assert!(!app.window.get_keyboard_visible());
-    assert_eq!(
-        *captured.borrow(),
-        Some(("qQ1qw".into(), "qwertyui".into()))
-    );
-    tap(140.0, 316.0);
-    assert_eq!(
-        *captured.borrow(),
-        Some(("qQ1qw".into(), String::new())),
-        "password field is cleared immediately after submission"
-    );
+    f.tap(42.0, 742.0); // Esc
+    assert!(!f.keyboard_visible());
+}
 
-    // Every printable ASCII character is reachable in the upstream key model.
-    let mut available = std::collections::HashSet::from([' ']);
-    for layout in app
+#[test]
+fn arabic_text_is_shaped() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    f.k().set_dashboard(DashboardKind::Clock);
+    f.k().set_clock("".into());
+    // Ink extent of the status-bar date, left of the Wi-Fi and battery icons.
+    let span = |date: &str| {
+        f.k().set_date(date.into());
+        let frame = pixels(&f.window);
+        let xs: Vec<usize> = (20..500)
+            .filter(|x| (8..48).any(|y| frame[y * 758 + x].r < 128))
+            .collect();
+        xs.last().unwrap() - xs.first().unwrap()
+    };
+    // ZWNJ disables contextual joining; a shaped word is narrower.
+    let joined = span("قنديل");
+    let disconnected = span("ق\u{200c}ن\u{200c}د\u{200c}ي\u{200c}ل");
+    assert!(joined < disconnected, "{joined} vs {disconnected}");
+}
+
+#[test]
+fn every_printable_ascii_key_exists() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    let sets = f
+        .app
         .window
-        .global::<ui::VirtualKeyboardHandler>()
-        .get_default_key_sets()
+        .global::<kindil::ui::VirtualKeyboardHandler>()
+        .get_default_key_sets();
+    let available: std::collections::HashSet<char> = sets
         .iter()
-    {
-        for row in layout.iter() {
-            for key in row.iter() {
-                available.extend(key.key.chars());
-                available.extend(key.shift_key.chars());
-            }
-        }
-    }
-    for byte in 32u8..=126 {
-        assert!(
-            available.contains(&char::from(byte)),
-            "missing ASCII key {byte}"
-        );
-    }
+        .flat_map(|set| set.iter().collect::<Vec<_>>())
+        .flat_map(|row| row.iter().collect::<Vec<_>>())
+        .flat_map(|key| {
+            key.key
+                .chars()
+                .chain(key.shift_key.chars())
+                .collect::<Vec<_>>()
+        })
+        .chain([' '])
+        .collect();
+    let missing: Vec<char> = (32u8..=126)
+        .map(char::from)
+        .filter(|c| !available.contains(c))
+        .collect();
+    assert!(missing.is_empty(), "missing keys: {missing:?}");
 }

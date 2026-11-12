@@ -1,173 +1,1344 @@
-import { Button, LineEdit, ScrollView, VerticalBox, Slider, Palette } from "std-widgets.slint";
+// kindil · قنديل — one window for the dashboard, library, reader and settings.
+//
+// Designed for a 758×1024, 16-level e-ink panel driven by touch:
+// - black on white, a few solid grays, no animation or translucency (each frame
+//   costs a panel update, and dithered grays look dirty);
+// - every tap target is at least 64 px tall, row targets span the full width;
+// - the prayer dashboard stays full-bleed: tap it to reveal the tab bar.
 import { VirtualKeyboard, VirtualKeyboardHandler } from "vendor/slint-keyboard/virtual_keyboard.slint";
 export { VirtualKeyboardHandler }
-import "../assets/DejaVuSans.ttf";
+import "../crates/miqat/assets/fonts/IBMPlexSansArabic-Regular.ttf";
+import "../crates/miqat/assets/fonts/IBMPlexSansArabic-SemiBold.ttf";
+import "../crates/miqat/assets/fonts/IBMPlexSansArabic-Bold.ttf";
+
+export enum Page { dashboard, library, reader, settings, networks }
+export enum DashboardKind { miqat, clock }
+/// A setting's switch. `unavailable` covers "not installed" and "no hardware".
+export enum Switch { off, on, unavailable }
+
+export struct BookItem {
+    title: string,
+    format: string,
+    detail: string,
+    progress: float,
+    /// The file name on disk, for rename.
+    file: string,
+}
+
+export struct NetworkItem {
+    ssid: string,
+    detail: string,
+    bars: int,
+}
+
+export struct Fact {
+    label: string,
+    value: string,
+}
+
+global Theme {
+    out property <color> ink: #000000;
+    out property <color> ink-2: #404040;
+    out property <color> ink-3: #808080;
+    out property <color> line: #c0c0c0;
+    out property <color> surface: #ececec;
+    out property <color> paper: #ffffff;
+    out property <length> gutter: 28px;
+    out property <length> touch: 68px;
+    out property <length> radius: 14px;
+}
+
+/// Everything the Rust side reads, writes and handles. Components bind here
+/// directly instead of threading dozens of properties through each page.
+export global Kindil {
+    in-out property <Page> page: Page.dashboard;
+    in-out property <DashboardKind> dashboard: DashboardKind.miqat;
+    in-out property <bool> chrome-visible: false;
+
+    // Status bar
+    in property <string> clock: "--:--";
+    in property <string> date;
+    in property <int> battery-level: -1;
+    in property <string> battery-label: "—";
+    in property <int> wifi-bars: -1;
+
+    // Dashboard
+    in property <image> miqat-frame;
+    in property <string> miqat-error: "Starting the prayer dashboard…";
+
+    // Library
+    in property <[BookItem]> books;
+    in property <string> books-root;
+    in-out property <int> selected-book: -1;
+    in-out property <string> new-name;
+
+    // Reader
+    in property <bool> has-book: false;
+    in property <string> book-title;
+    in property <string> book-text;
+    in property <string> book-position;
+    in property <float> book-progress;
+    in property <int> font-size: 24;
+    in-out property <bool> reader-options: false;
+
+    // Settings
+    in property <int> brightness: -1;
+    in property <Switch> wifi: Switch.unavailable;
+    in property <string> wifi-detail;
+    in property <Switch> ssh: Switch.unavailable;
+    in property <Switch> ssh-at-boot: Switch.unavailable;
+    in property <string> ssh-detail;
+    in property <Switch> sync: Switch.unavailable;
+    in property <string> sync-detail;
+    in property <[Fact]> facts;
+    in property <string> version;
+
+    // Wi-Fi networks
+    in property <[NetworkItem]> networks;
+    in property <string> network-status;
+    in property <bool> network-busy: false;
+    in-out property <bool> join-open: false;
+    in-out property <string> join-ssid;
+
+    // A short message above the tab bar, optionally with Undo.
+    in-out property <string> notice;
+    in-out property <bool> notice-undo: false;
+
+    callback navigated(Page);
+    callback choose-dashboard(DashboardKind);
+    callback open-book(int);
+    callback rename-book(int, string);
+    callback trash-book(int);
+    callback undo();
+    callback next-page();
+    callback previous-page();
+    callback font-larger();
+    callback font-smaller();
+    callback brighter();
+    callback dimmer();
+    callback clean-screen();
+    callback toggle-wifi();
+    callback scan-networks();
+    callback join-network(string, string);
+    callback toggle-ssh();
+    callback toggle-ssh-at-boot();
+    callback toggle-sync();
+    callback exit-app();
+
+    public function go(target: Page) {
+        page = target;
+        chrome-visible = false;
+        reader-options = false;
+        navigated(target);
+    }
+}
+
+// ───────────────────────── primitives ─────────────────────────
+
+component Divider inherits Rectangle {
+    height: 1px;
+    background: Theme.line;
+}
+
+component Caption inherits Text {
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: 1.2px;
+    color: Theme.ink-3;
+}
+
+enum ButtonKind { primary, outline, quiet }
+
+component Button {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <ButtonKind> kind: ButtonKind.outline;
+    in property <length> font-size: 21px;
+    callback clicked();
+    min-height: Theme.touch;
+    min-width: Theme.touch;
+    preferred-width: label.preferred-width + 44px;
+
+    Rectangle {
+        border-radius: Theme.radius;
+        background: root.kind == ButtonKind.primary
+            ? (root.enabled ? (touch.pressed ? Theme.ink-2 : Theme.ink) : Theme.line)
+            : (touch.pressed ? Theme.surface : transparent);
+        border-width: root.kind == ButtonKind.outline ? 2px : 0px;
+        border-color: root.enabled ? Theme.ink : Theme.line;
+    }
+    label := Text {
+        text: root.text;
+        font-size: root.font-size;
+        font-weight: 600;
+        color: root.kind == ButtonKind.primary ? Theme.paper : (root.enabled ? Theme.ink : Theme.ink-3);
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Toggle {
+    in property <Switch> state;
+    width: 80px;
+    height: 44px;
+    Rectangle {
+        border-radius: self.height / 2;
+        background: root.state == Switch.on ? Theme.ink : Theme.paper;
+        border-width: 2px;
+        border-color: root.state == Switch.unavailable ? Theme.line : Theme.ink;
+        Rectangle {
+            width: 32px;
+            height: 32px;
+            y: 6px;
+            x: root.state == Switch.on ? parent.width - self.width - 6px : 6px;
+            border-radius: self.height / 2;
+            background: root.state == Switch.on ? Theme.paper : (root.state == Switch.unavailable ? Theme.line : Theme.ink);
+        }
+    }
+}
+
+/// A full-width row: title, optional detail line, and a switch. The whole row is the target.
+component SwitchRow {
+    in property <string> title;
+    in property <string> detail;
+    in property <Switch> state;
+    callback toggled();
+    min-height: 84px;
+    HorizontalLayout {
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 16px;
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: root.title;
+                font-size: 23px;
+                font-weight: 600;
+                color: root.state == Switch.unavailable ? Theme.ink-3 : Theme.ink;
+            }
+            if root.detail != "": Text {
+                text: root.detail;
+                font-size: 18px;
+                color: Theme.ink-2;
+                wrap: word-wrap;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Toggle { state: root.state; }
+        }
+    }
+    TouchArea {
+        enabled: root.state != Switch.unavailable;
+        clicked => { root.toggled(); }
+    }
+}
+
+component RoundButton {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 64px;
+    height: 64px;
+    Rectangle {
+        border-radius: self.height / 2;
+        border-width: 2px;
+        border-color: root.enabled ? Theme.ink : Theme.line;
+        background: touch.pressed ? Theme.surface : Theme.paper;
+    }
+    Text {
+        text: root.text;
+        font-size: 30px;
+        font-weight: 600;
+        color: root.enabled ? Theme.ink : Theme.line;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Stepper {
+    in property <string> title;
+    in property <string> value;
+    in property <bool> enabled: true;
+    callback decrease();
+    callback increase();
+    min-height: 88px;
+    HorizontalLayout {
+        spacing: 14px;
+        alignment: stretch;
+        Text {
+            text: root.title;
+            font-size: 23px;
+            font-weight: 600;
+            color: root.enabled ? Theme.ink : Theme.ink-3;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        VerticalLayout {
+            alignment: center;
+            RoundButton { text: "−"; enabled: root.enabled; clicked => { root.decrease(); } }
+        }
+        Text {
+            text: root.value;
+            width: 92px;
+            font-size: 23px;
+            font-weight: 700;
+            color: root.enabled ? Theme.ink : Theme.ink-3;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        VerticalLayout {
+            alignment: center;
+            RoundButton { text: "+"; enabled: root.enabled; clicked => { root.increase(); } }
+        }
+    }
+}
+
+component TextField {
+    in-out property <string> text;
+    in property <string> placeholder;
+    in property <InputType> input-type: InputType.text;
+    out property <bool> focused: input.has-focus;
+    callback accepted();
+    forward-focus: input;
+    height: 68px;
+    Rectangle {
+        border-radius: 12px;
+        border-width: input.has-focus ? 3px : 2px;
+        border-color: Theme.ink;
+        background: Theme.paper;
+    }
+    if root.text == "": Text {
+        x: 20px;
+        width: parent.width - 40px;
+        height: parent.height;
+        text: root.placeholder;
+        font-size: 21px;
+        color: Theme.ink-3;
+        vertical-alignment: center;
+    }
+    input := TextInput {
+        x: 20px;
+        width: parent.width - 40px;
+        height: parent.height;
+        text <=> root.text;
+        input-type: root.input-type;
+        single-line: true;
+        font-size: 22px;
+        color: Theme.ink;
+        vertical-alignment: center;
+        accepted => { root.accepted(); }
+    }
+}
+
+/// Wi-Fi strength as four bars; a single short gray bar when off.
+component WifiBars {
+    in property <int> bars;
+    in property <color> color: Theme.ink;
+    width: 30px;
+    height: 22px;
+    for i in 4: Rectangle {
+        x: i * 8px;
+        width: 6px;
+        height: (i + 1) * 5px + 2px;
+        y: parent.height - self.height;
+        border-radius: 1px;
+        background: i < root.bars ? root.color : Theme.line;
+    }
+}
+
+component BatteryIcon {
+    in property <int> level;
+    width: 42px;
+    height: 22px;
+    Rectangle {
+        x: 0;
+        width: 38px;
+        height: parent.height;
+        border-radius: 5px;
+        border-width: 2px;
+        border-color: Theme.ink;
+        Rectangle {
+            x: 4px;
+            y: 4px;
+            height: parent.height - 8px;
+            width: (parent.width - 8px) * clamp(root.level, 0, 100) / 100;
+            border-radius: 2px;
+            background: Theme.ink;
+        }
+    }
+    Rectangle {
+        x: 38px;
+        y: 7px;
+        width: 4px;
+        height: 8px;
+        border-radius: 1px;
+        background: Theme.ink;
+    }
+}
+
+component ProgressBar {
+    in property <float> value;
+    height: 6px;
+    Rectangle {
+        border-radius: 3px;
+        background: Theme.surface;
+    }
+    Rectangle {
+        x: 0;
+        width: parent.width * clamp(root.value, 0, 1);
+        border-radius: 3px;
+        background: Theme.ink;
+    }
+}
+
+// ───────────────────────── chrome ─────────────────────────
+
+component StatusBar {
+    height: 56px;
+    HorizontalLayout {
+        padding-left: Theme.gutter;
+        padding-right: Theme.gutter;
+        spacing: 12px;
+        Text {
+            text: Kindil.clock;
+            font-size: 22px;
+            font-weight: 700;
+            color: Theme.ink;
+            vertical-alignment: center;
+        }
+        Text {
+            text: Kindil.date;
+            font-size: 19px;
+            color: Theme.ink-2;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        if Kindil.wifi-bars >= 0: VerticalLayout {
+            alignment: center;
+            WifiBars { bars: Kindil.wifi-bars; }
+        }
+        Rectangle { width: 6px; }
+        VerticalLayout {
+            alignment: center;
+            BatteryIcon { level: Kindil.battery-level; }
+        }
+        Text {
+            text: Kindil.battery-label;
+            font-size: 19px;
+            font-weight: 600;
+            color: Theme.ink;
+            vertical-alignment: center;
+        }
+    }
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Theme.line;
+    }
+}
+
+component TabIcon {
+    in property <Page> page;
+    in property <color> color;
+    width: 34px;
+    height: 28px;
+    if root.page == Page.dashboard: Rectangle {
+        for i in 4: Rectangle {
+            x: mod(i, 2) * 18px;
+            y: floor(i / 2) * 15px;
+            width: 15px;
+            height: 12px;
+            border-radius: 3px;
+            border-width: 2px;
+            border-color: root.color;
+            background: i == 0 ? root.color : transparent;
+        }
+    }
+    if root.page == Page.library: Rectangle {
+        for i in 3: Rectangle {
+            x: 3px + i * 10px;
+            y: i == 1 ? 4px : 0px;
+            width: 8px;
+            height: parent.height - self.y;
+            border-radius: 2px;
+            background: root.color;
+        }
+    }
+    if root.page == Page.reader: Rectangle {
+        for i in 2: Rectangle {
+            x: 2px + i * 15px;
+            y: 2px;
+            width: 15px;
+            height: 24px;
+            border-radius: 2px;
+            border-width: 2px;
+            border-color: root.color;
+        }
+    }
+    if root.page == Page.settings: Rectangle {
+        for i in 3: Rectangle {
+            y: 3px + i * 10px;
+            height: 2px;
+            background: root.color;
+            Rectangle {
+                x: mod(i * 13px + 6px, 26px);
+                y: -3px;
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: root.color;
+            }
+        }
+    }
+}
+
+component Tab {
+    in property <Page> target;
+    in property <string> label;
+    in property <bool> enabled: true;
+    property <bool> active: Kindil.page == root.target
+        || (root.target == Page.settings && Kindil.page == Page.networks);
+    property <color> color: !root.enabled ? Theme.line : (root.active ? Theme.ink : Theme.ink-3);
+    horizontal-stretch: 1;
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: 0;
+        width: 64px;
+        height: 5px;
+        border-radius: 2px;
+        background: root.active ? Theme.ink : transparent;
+    }
+    VerticalLayout {
+        alignment: center;
+        spacing: 6px;
+        HorizontalLayout {
+            alignment: center;
+            TabIcon { page: root.target; color: root.color; }
+        }
+        Text {
+            text: root.label;
+            font-size: 17px;
+            font-weight: root.active ? 700 : 400;
+            color: root.color;
+            horizontal-alignment: center;
+        }
+    }
+    TouchArea {
+        enabled: root.enabled;
+        clicked => { Kindil.go(root.target); }
+    }
+}
+
+component TabBar inherits Rectangle {
+    height: 92px;
+    background: Theme.paper;
+    Rectangle {
+        y: 0;
+        height: 2px;
+        background: Theme.ink;
+    }
+    HorizontalLayout {
+        Tab { target: Page.dashboard; label: "Home"; }
+        Tab { target: Page.library; label: "Library"; }
+        Tab { target: Page.reader; label: "Reading"; enabled: Kindil.has-book; }
+        Tab { target: Page.settings; label: "Settings"; }
+    }
+}
+
+component Notice inherits Rectangle {
+    height: 72px;
+    border-radius: Theme.radius;
+    background: Theme.ink;
+    HorizontalLayout {
+        padding-left: 24px;
+        padding-right: 8px;
+        spacing: 8px;
+        Text {
+            text: Kindil.notice;
+            font-size: 20px;
+            color: Theme.paper;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        if Kindil.notice-undo: Rectangle {
+            width: 110px;
+            Text {
+                text: "Undo";
+                font-size: 21px;
+                font-weight: 700;
+                color: Theme.paper;
+            }
+            TouchArea { clicked => { Kindil.undo(); } }
+        }
+    }
+}
+
+component PageHeader {
+    in property <string> title;
+    in property <string> trailing;
+    height: 96px;
+    HorizontalLayout {
+        padding-left: Theme.gutter;
+        padding-right: Theme.gutter;
+        padding-top: 16px;
+        Text {
+            text: root.title;
+            font-size: 40px;
+            font-weight: 700;
+            color: Theme.ink;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.trailing;
+            font-size: 19px;
+            color: Theme.ink-3;
+            vertical-alignment: center;
+        }
+    }
+}
+
+/// A sheet anchored to the bottom of the content area (above the keyboard).
+component Sheet inherits Rectangle {
+    background: Theme.paper;
+    Rectangle {
+        y: 0;
+        height: 3px;
+        background: Theme.ink;
+    }
+    // Swallow taps so they never reach the page underneath.
+    TouchArea { }
+    VerticalLayout {
+        padding: Theme.gutter;
+        padding-top: 28px;
+        spacing: 16px;
+        @children
+    }
+}
+
+// ───────────────────────── pages ─────────────────────────
+
+component ClockPage {
+    VerticalLayout {
+        alignment: center;
+        spacing: 4px;
+        Text {
+            text: Kindil.clock;
+            font-size: 190px;
+            font-weight: 700;
+            color: Theme.ink;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: Kindil.date;
+            font-size: 34px;
+            color: Theme.ink-2;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+component BookRow {
+    in property <BookItem> book;
+    in property <int> index;
+    height: 112px;
+    TouchArea { clicked => { Kindil.open-book(root.index); } }
+    HorizontalLayout {
+        padding-left: Theme.gutter;
+        spacing: 20px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 58px;
+                height: 80px;
+                border-radius: 6px;
+                border-width: 2px;
+                border-color: Theme.ink;
+                Rectangle {
+                    x: 8px;
+                    y: 0;
+                    width: 3px;
+                    background: Theme.ink;
+                }
+                Text {
+                    x: 14px;
+                    width: parent.width - 16px;
+                    text: root.book.format;
+                    font-size: 13px;
+                    font-weight: 700;
+                    color: Theme.ink;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 6px;
+            horizontal-stretch: 1;
+            Text {
+                text: root.book.title;
+                font-size: 24px;
+                font-weight: 600;
+                color: Theme.ink;
+                overflow: elide;
+            }
+            Text {
+                text: root.book.detail;
+                font-size: 18px;
+                color: Theme.ink-2;
+                overflow: elide;
+            }
+            // Wrapped: a fixed-width child would cap the whole column's width.
+            if root.book.progress > 0: HorizontalLayout {
+                alignment: start;
+                ProgressBar {
+                    width: 180px;
+                    value: root.book.progress;
+                }
+            }
+        }
+        Rectangle {
+            width: 84px;
+            Text {
+                text: "···";
+                font-size: 30px;
+                font-weight: 700;
+                color: Theme.ink;
+            }
+            TouchArea {
+                clicked => {
+                    Kindil.selected-book = root.index;
+                    Kindil.new-name = root.book.file;
+                }
+            }
+        }
+    }
+    Divider {
+        x: Theme.gutter;
+        y: parent.height - 1px;
+        width: parent.width - 2 * Theme.gutter;
+    }
+}
+
+component LibraryPage {
+    VerticalLayout {
+        PageHeader {
+            title: "Library";
+            trailing: Kindil.books.length == 1 ? "1 book" : Kindil.books.length + " books";
+        }
+        if Kindil.books.length == 0: VerticalLayout {
+            alignment: center;
+            vertical-stretch: 1;
+            spacing: 12px;
+            padding: 48px;
+            Text {
+                text: "No books yet";
+                font-size: 30px;
+                font-weight: 600;
+                color: Theme.ink;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: "Copy .epub or .txt files into " + Kindil.books-root + " over USB or SSH.";
+                font-size: 20px;
+                color: Theme.ink-2;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+            }
+        }
+        if Kindil.books.length > 0: Flickable {
+            vertical-stretch: 1;
+            content-height: list.preferred-height;
+            list := VerticalLayout {
+                width: parent.width;
+                alignment: start;
+                for book[index] in Kindil.books: BookRow { book: book; index: index; }
+            }
+        }
+    }
+}
+
+component BookActions inherits Sheet {
+    property <bool> confirm-trash: false;
+    property <string> current: Kindil.selected-book >= 0 && Kindil.selected-book < Kindil.books.length
+        ? Kindil.books[Kindil.selected-book].title : "";
+    Caption { text: "FILE"; }
+    Text {
+        text: root.current;
+        font-size: 24px;
+        font-weight: 600;
+        color: Theme.ink;
+        overflow: elide;
+    }
+    name := TextField {
+        text <=> Kindil.new-name;
+        placeholder: "New file name";
+        accepted => { name-sink.focus(); }
+    }
+    HorizontalLayout {
+        spacing: 12px;
+        Button {
+            text: root.confirm-trash ? "Tap again to trash" : "Move to Trash";
+            horizontal-stretch: 1;
+            clicked => {
+                if root.confirm-trash {
+                    Kindil.trash-book(Kindil.selected-book);
+                    Kindil.selected-book = -1;
+                } else {
+                    root.confirm-trash = true;
+                }
+            }
+        }
+        Button {
+            text: "Rename";
+            kind: ButtonKind.primary;
+            enabled: Kindil.new-name != "";
+            horizontal-stretch: 1;
+            clicked => {
+                Kindil.rename-book(Kindil.selected-book, Kindil.new-name);
+                Kindil.selected-book = -1;
+                name-sink.focus();
+            }
+        }
+    }
+    Button {
+        text: "Cancel";
+        kind: ButtonKind.quiet;
+        clicked => {
+            Kindil.selected-book = -1;
+            name-sink.focus();
+        }
+    }
+    name-sink := FocusScope { height: 0px; }
+}
+
+component ReaderPage {
+    VerticalLayout {
+        HorizontalLayout {
+            height: 68px;
+            padding-left: 8px;
+            padding-right: 8px;
+            Button {
+                text: "‹ Library";
+                kind: ButtonKind.quiet;
+                font-size: 19px;
+                clicked => { Kindil.go(Page.library); }
+            }
+            Text {
+                text: Kindil.book-title;
+                font-size: 19px;
+                font-weight: 600;
+                color: Theme.ink-2;
+                overflow: elide;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Button {
+                text: "Aa";
+                kind: ButtonKind.quiet;
+                font-size: 24px;
+                clicked => { Kindil.reader-options = !Kindil.reader-options; }
+            }
+        }
+        // Pagination plans conservatively; if a page still overflows it scrolls.
+        flick := Flickable {
+            vertical-stretch: 1;
+            content-height: max(self.height, body.preferred-height + 40px);
+            property <string> text: Kindil.book-text;
+            changed text => { self.content-y = 0; }
+            // Classic e-reader zones: the left third goes back, the rest forward.
+            TouchArea {
+                clicked => {
+                    if self.mouse-x < self.width / 3 {
+                        Kindil.previous-page();
+                    } else {
+                        Kindil.next-page();
+                    }
+                }
+            }
+            body := Text {
+                x: 44px;
+                y: 16px;
+                width: parent.width - 88px;
+                text: Kindil.book-text;
+                font-size: Kindil.font-size * 1px;
+                line-height-factor: 1.0;
+                color: Theme.ink;
+                wrap: word-wrap;
+                vertical-alignment: top;
+            }
+        }
+        HorizontalLayout {
+            height: 76px;
+            padding-left: 8px;
+            padding-right: 8px;
+            spacing: 8px;
+            Button {
+                text: "‹ Prev";
+                kind: ButtonKind.quiet;
+                width: 140px;
+                clicked => { Kindil.previous-page(); }
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 8px;
+                horizontal-stretch: 1;
+                ProgressBar { value: Kindil.book-progress; }
+                Text {
+                    text: Kindil.book-position;
+                    font-size: 17px;
+                    color: Theme.ink-2;
+                    horizontal-alignment: center;
+                }
+            }
+            Button {
+                text: "Next ›";
+                kind: ButtonKind.quiet;
+                width: 140px;
+                clicked => { Kindil.next-page(); }
+            }
+        }
+    }
+}
+
+component ReaderOptions inherits Sheet {
+    Caption { text: "READING"; }
+    Stepper {
+        title: "Text size";
+        value: Kindil.font-size + " px";
+        decrease => { Kindil.font-smaller(); }
+        increase => { Kindil.font-larger(); }
+    }
+    Divider { }
+    Stepper {
+        title: "Front light";
+        enabled: Kindil.brightness >= 0;
+        value: Kindil.brightness >= 0 ? Kindil.brightness + "%" : "—";
+        decrease => { Kindil.dimmer(); }
+        increase => { Kindil.brighter(); }
+    }
+    Button {
+        text: "Done";
+        kind: ButtonKind.primary;
+        clicked => { Kindil.reader-options = false; }
+    }
+}
+
+component Segment {
+    in property <string> text;
+    in property <bool> selected;
+    callback clicked();
+    horizontal-stretch: 1;
+    Rectangle {
+        border-radius: Theme.radius - 4px;
+        background: root.selected ? Theme.ink : transparent;
+    }
+    Text {
+        text: root.text;
+        font-size: 20px;
+        font-weight: 600;
+        color: root.selected ? Theme.paper : Theme.ink;
+    }
+    TouchArea { clicked => { root.clicked(); } }
+}
+
+component Group {
+    in property <string> title;
+    VerticalLayout {
+        padding-top: 22px;
+        padding-bottom: 4px;
+        spacing: 2px;
+        Caption { text: root.title; }
+        @children
+    }
+}
+
+component SettingsPage {
+    VerticalLayout {
+        PageHeader { title: "Settings"; trailing: Kindil.version; }
+        Flickable {
+            vertical-stretch: 1;
+            content-height: content.preferred-height;
+            content := VerticalLayout {
+                width: parent.width;
+                alignment: start;
+                padding-left: Theme.gutter;
+                padding-right: Theme.gutter;
+                padding-bottom: 32px;
+                Group {
+                    title: "HOME SCREEN";
+                    Rectangle {
+                        height: 72px;
+                        border-radius: Theme.radius;
+                        border-width: 2px;
+                        border-color: Theme.ink;
+                        HorizontalLayout {
+                            padding: 6px;
+                            spacing: 6px;
+                            Segment {
+                                text: "Prayer times";
+                                selected: Kindil.dashboard == DashboardKind.miqat;
+                                clicked => { Kindil.choose-dashboard(DashboardKind.miqat); }
+                            }
+                            Segment {
+                                text: "Clock";
+                                selected: Kindil.dashboard == DashboardKind.clock;
+                                clicked => { Kindil.choose-dashboard(DashboardKind.clock); }
+                            }
+                        }
+                    }
+                }
+                Group {
+                    title: "DISPLAY";
+                    Stepper {
+                        title: "Front light";
+                        enabled: Kindil.brightness >= 0;
+                        value: Kindil.brightness >= 0 ? Kindil.brightness + "%" : "—";
+                        decrease => { Kindil.dimmer(); }
+                        increase => { Kindil.brighter(); }
+                    }
+                    Divider { }
+                    HorizontalLayout {
+                        min-height: 84px;
+                        spacing: 16px;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text { text: "Clean screen"; font-size: 23px; font-weight: 600; color: Theme.ink; }
+                            Text { text: "Flash once to clear ghosting"; font-size: 18px; color: Theme.ink-2; }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Button { text: "Refresh"; clicked => { Kindil.clean-screen(); } }
+                        }
+                    }
+                }
+                Group {
+                    title: "WI-FI";
+                    SwitchRow {
+                        title: "Wi-Fi";
+                        detail: Kindil.wifi-detail;
+                        state: Kindil.wifi;
+                        toggled => { Kindil.toggle-wifi(); }
+                    }
+                    Divider { }
+                    Rectangle {
+                        min-height: 76px;
+                        HorizontalLayout {
+                            Text {
+                                text: "Choose a network";
+                                font-size: 23px;
+                                font-weight: 600;
+                                color: Kindil.wifi == Switch.on ? Theme.ink : Theme.ink-3;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            Text { text: "›"; font-size: 34px; color: Theme.ink-2; vertical-alignment: center; }
+                        }
+                        TouchArea {
+                            enabled: Kindil.wifi == Switch.on;
+                            clicked => {
+                                Kindil.go(Page.networks);
+                                Kindil.scan-networks();
+                            }
+                        }
+                    }
+                }
+                Group {
+                    title: "REMOTE ACCESS";
+                    SwitchRow {
+                        title: "SSH server";
+                        detail: Kindil.ssh-detail;
+                        state: Kindil.ssh;
+                        toggled => { Kindil.toggle-ssh(); }
+                    }
+                    Divider { }
+                    SwitchRow {
+                        title: "Start SSH at boot";
+                        state: Kindil.ssh-at-boot;
+                        toggled => { Kindil.toggle-ssh-at-boot(); }
+                    }
+                    Divider { }
+                    SwitchRow {
+                        title: "Syncthing";
+                        detail: Kindil.sync-detail;
+                        state: Kindil.sync;
+                        toggled => { Kindil.toggle-sync(); }
+                    }
+                }
+                Group {
+                    title: "DEVICE";
+                    for fact in Kindil.facts: HorizontalLayout {
+                        min-height: 52px;
+                        Text {
+                            text: fact.label;
+                            font-size: 20px;
+                            color: Theme.ink-2;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        Text {
+                            text: fact.value;
+                            font-size: 20px;
+                            font-weight: 600;
+                            color: Theme.ink;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                Rectangle { height: 20px; }
+                Button {
+                    text: "Exit to Kindle";
+                    clicked => { Kindil.exit-app(); }
+                }
+                Text {
+                    text: "Returns to Amazon's home screen. kindil never changes the system.";
+                    font-size: 17px;
+                    color: Theme.ink-3;
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+component NetworksPage {
+    VerticalLayout {
+        HorizontalLayout {
+            height: 96px;
+            padding-left: 8px;
+            padding-right: Theme.gutter;
+            padding-top: 16px;
+            spacing: 4px;
+            Button {
+                text: "‹";
+                kind: ButtonKind.quiet;
+                font-size: 40px;
+                clicked => { Kindil.go(Page.settings); }
+            }
+            Text {
+                text: "Networks";
+                font-size: 40px;
+                font-weight: 700;
+                color: Theme.ink;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            VerticalLayout {
+                alignment: center;
+                Button {
+                    text: Kindil.network-busy ? "Scanning…" : "Scan";
+                    enabled: !Kindil.network-busy;
+                    clicked => { Kindil.scan-networks(); }
+                }
+            }
+        }
+        Text {
+            x: Theme.gutter;
+            text: Kindil.network-status;
+            font-size: 18px;
+            color: Theme.ink-2;
+            height: 32px;
+            vertical-alignment: center;
+        }
+        Flickable {
+            vertical-stretch: 1;
+            content-height: rows.preferred-height;
+            rows := VerticalLayout {
+                width: parent.width;
+                alignment: start;
+                for network in Kindil.networks: Rectangle {
+                    height: 88px;
+                    TouchArea {
+                        clicked => {
+                            Kindil.join-ssid = network.ssid;
+                            Kindil.join-open = true;
+                        }
+                    }
+                    HorizontalLayout {
+                        padding-left: Theme.gutter;
+                        padding-right: Theme.gutter;
+                        spacing: 16px;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text { text: network.ssid; font-size: 23px; font-weight: 600; color: Theme.ink; overflow: elide; }
+                            Text { text: network.detail; font-size: 18px; color: Theme.ink-2; }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            WifiBars { bars: network.bars; }
+                        }
+                    }
+                    Divider {
+                        x: Theme.gutter;
+                        y: parent.height - 1px;
+                        width: parent.width - 2 * Theme.gutter;
+                    }
+                }
+                Rectangle {
+                    height: 88px;
+                    TouchArea {
+                        clicked => {
+                            Kindil.join-ssid = "";
+                            Kindil.join-open = true;
+                        }
+                    }
+                    Text {
+                        x: Theme.gutter;
+                        text: "Other network…";
+                        font-size: 23px;
+                        font-weight: 600;
+                        color: Theme.ink-2;
+                    }
+                }
+            }
+        }
+    }
+}
+
+component JoinSheet inherits Sheet {
+    Caption { text: "JOIN NETWORK"; }
+    ssid := TextField {
+        text <=> Kindil.join-ssid;
+        placeholder: "Network name";
+        accepted => { password.focus(); }
+    }
+    password := TextField {
+        input-type: InputType.password;
+        placeholder: "Password (empty for open networks)";
+        accepted => { sink.focus(); }
+    }
+    HorizontalLayout {
+        spacing: 12px;
+        Button {
+            text: "Cancel";
+            horizontal-stretch: 1;
+            clicked => {
+                password.text = "";
+                Kindil.join-open = false;
+                sink.focus();
+            }
+        }
+        Button {
+            text: "Join";
+            kind: ButtonKind.primary;
+            enabled: Kindil.join-ssid != "" && !Kindil.network-busy;
+            horizontal-stretch: 1;
+            clicked => {
+                Kindil.join-network(Kindil.join-ssid, password.text);
+                // Never keep a passphrase in the UI longer than the request.
+                password.text = "";
+                Kindil.join-open = false;
+                sink.focus();
+            }
+        }
+    }
+    sink := FocusScope { height: 0px; }
+}
+
+// ───────────────────────── window ─────────────────────────
 
 export component AppWindow inherits Window {
     title: "kindil · قنديل";
     width: 758px;
     height: 1024px;
-    background: white;
-    default-font-family: "DejaVu Sans";
+    background: Theme.paper;
+    default-font-family: "IBM Plex Sans Arabic";
     default-font-size: 22px;
-    init => { Palette.color-scheme = ColorScheme.light; }
+
     out property <bool> keyboard-visible: TextInputInterface.text-input-focused;
     callback dismiss-keyboard();
-    dismiss-keyboard => { keyboard-focus-sink.focus(); }
-    in-out property <int> page: 0;
-    in-out property <string> brand: "kindil · قنديل";
-    in property <string> clock;
-    in property <string> date;
-    in property <string> status;
-    in property <string> settings;
-    in-out property <int> dashboard-mode: 0;
-    in property <image> miqat-frame;
-    in property <string> miqat-error: "Miqat configuration required. Tap the top-right corner for controls.";
-    in property <[string]> books;
-    in property <[string]> networks;
-    in property <string> network-status: "Not connected";
-    in property <bool> network-busy: false;
-    in-out property <string> ssid;
-    in property <string> book-title;
-    in property <string> book-text;
-    in property <string> book-page;
-    in-out property <length> reader-offset: 0px;
-    in property <string> wifi-state: "not monitored";
-    in property <string> ssh-state: "not managed";
-    in property <string> sync-state: "not managed";
-    in property <string> service-status: "⌁ " + root.wifi-state + "   >_ SSH: " + root.ssh-state + "   ↻ Sync: " + root.sync-state;
-    in-out property <int> selected-file: -1;
-    in-out property <string> new-filename;
-    in-out property <bool> confirm-trash: false;
-    in property <string> file-status;
-    in property <bool> can-undo-trash: false;
-    callback rename-file(int, string);
-    callback trash-file(int);
-    callback undo-trash();
-    in-out property <float> reading-font-size: 22;
-    in-out property <float> brightness: 50;
-    in property <bool> brightness-enabled: true;
-    in property <string> brightness-status: "Simulated frontlight — preview only";
-    in-out property <bool> controls-open: false;
-    callback font-size-changed(float);
-    callback brightness-changed(float);
-    callback open-book(int);
-    callback turn-page(bool);
-    callback scan-wifi();
-    callback connect-wifi(string, string);
+    dismiss-keyboard => { focus-sink.focus(); }
 
-    if root.page == 0 && root.dashboard-mode == 0: Rectangle {
-        Image { source: root.miqat-frame; width: 100%; height: 100%; image-fit: contain; }
-        if root.miqat-frame.width == 0: Text {text: root.miqat-error; color: black; wrap: word-wrap; width: parent.width - 56px; x: 28px; y: 200px;}
-        TouchArea { x: parent.width - 100px; width: 100px; height: 90px;
-            clicked => {root.page = 4; root.controls-open = true;} }
+    property <bool> immersive: Kindil.page == Page.dashboard && Kindil.dashboard == DashboardKind.miqat;
+    property <length> usable-height: root.height - (root.keyboard-visible ? keyboard.height : 0px);
+
+    // Full-bleed and pixel-exact: Miqat renders for this exact panel.
+    if root.immersive: Rectangle {
+        Image {
+            source: Kindil.miqat-frame;
+            width: 100%;
+            height: 100%;
+            image-fit: contain;
+        }
+        if Kindil.miqat-frame.width == 0: Text {
+            x: 48px;
+            width: parent.width - 96px;
+            text: Kindil.miqat-error;
+            font-size: 24px;
+            color: Theme.ink;
+            wrap: word-wrap;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        TouchArea { clicked => { Kindil.chrome-visible = !Kindil.chrome-visible; } }
     }
+
     VerticalLayout {
-        x: 0px;
-        y: 0px;
-        width: root.width;
-        height: root.height - (root.keyboard-visible ? keyboard.height : 0px);
-        visible: root.page != 0 || root.dashboard-mode != 0;
-        padding: 28px;
-        spacing: 18px;
-        HorizontalLayout {
-            Text { text: root.brand; color: black; font-size: 26px; }
-            Text { text: root.status; color: black; font-size: 17px; horizontal-alignment: right; }
-            Button { text: "Aa / ☀"; clicked => {root.controls-open = !root.controls-open;} }
+        height: root.usable-height;
+        if !root.immersive: StatusBar { }
+        Rectangle {
+            vertical-stretch: 1;
+            if Kindil.page == Page.dashboard && Kindil.dashboard == DashboardKind.clock: ClockPage { width: parent.width; height: parent.height; }
+            if Kindil.page == Page.library: LibraryPage { width: parent.width; height: parent.height; }
+            if Kindil.page == Page.reader: ReaderPage { width: parent.width; height: parent.height; }
+            if Kindil.page == Page.settings: SettingsPage { width: parent.width; height: parent.height; }
+            if Kindil.page == Page.networks: NetworksPage { width: parent.width; height: parent.height; }
         }
-        if root.controls-open && !root.keyboard-visible: VerticalLayout {
-            Text { text: "Reading font: " + round(root.reading-font-size) + " px"; color: black; }
-            Slider { minimum: 16; maximum: 40; value <=> root.reading-font-size;
-                changed(value) => {root.font-size-changed(round(value));} }
-            Text { text: "Brightness: " + round(root.brightness) + "%"; color: black; }
-            Slider { minimum: 0; maximum: 100; enabled: root.brightness-enabled; value <=> root.brightness;
-                changed(value) => {root.brightness-changed(round(value));} }
-            Text { text: root.brightness-status; color: black; font-size: 16px; wrap: word-wrap; }
-        }
-        Rectangle { height: 2px; background: black; }
-        Text { text: root.service-status; color: black; font-size: 15px; }
-        if root.page == 0: VerticalLayout {
-            spacing: 22px;
-            Text { text: root.clock; font-size: 94px; color: black; horizontal-alignment: center; }
-            Text { text: root.date; color: black; horizontal-alignment: center; }
-            Rectangle { height: 2px; background: black; }
-        }
-        if root.page == 1: VerticalLayout {
-            Text { text: "Library — EPUB / text"; font-size: 30px; color: black; }
-            library-scroll := ScrollView { vertical-stretch: 1; mouse-drag-pan-enabled: true; content-width: self.visible-width; VerticalBox {
-                width: library-scroll.visible-width;
-                alignment: start;
-                for title[index] in root.books: HorizontalLayout {
-                    height: 60px;
-                    Button { text: title; clicked => { root.open-book(index); } }
-                    Button { width: 64px; text: "⋮"; clicked => {root.selected-file = index; root.new-filename = title; root.confirm-trash = false;} }
-                }
-            } }
-            if root.selected-file >= 0: VerticalLayout {
-                filename-input := LineEdit { text <=> root.new-filename; placeholder-text: "New filename"; accepted => { root.dismiss-keyboard(); } }
-                HorizontalLayout {
-                    Button { text: "Rename"; clicked => { root.rename-file(root.selected-file, root.new-filename); } }
-                    Button { text: root.confirm-trash ? "Confirm move to Trash" : "Move to Trash"; clicked => {
-                        if root.confirm-trash {root.trash-file(root.selected-file); root.confirm-trash = false;} else {root.confirm-trash = true;}
-                    } }
-                }
-            }
-            Text { text: root.file-status; color: black; font-size: 17px; wrap: word-wrap; }
-            Button { text: "Undo last Trash"; enabled: root.can-undo-trash; clicked => {root.undo-trash();} }
-        }
-        if root.page == 2: VerticalLayout {
-            Text { text: root.book-title; font-size: 28px; color: black; overflow: elide; }
-            reader-scroll := ScrollView {
-                vertical-stretch: 1;
-                mouse-drag-pan-enabled: true;
-                content-width: self.visible-width;
-                content-y <=> root.reader-offset;
-                in property <string> current-page: root.book-text;
-                changed current-page => { self.content-y = 0px; }
-                VerticalBox {
-                width: reader-scroll.visible-width;
-                Text { text: root.book-text; color: black; font-size: root.reading-font-size * 1px; wrap: word-wrap; vertical-alignment: top; }
-            } }
-            HorizontalLayout {
-                Button { text: "Previous"; clicked => { root.turn-page(false); } }
-                Text { text: root.book-page; color: black; horizontal-alignment: center; }
-                Button { text: "Next"; clicked => { root.turn-page(true); } }
-            }
-        }
-        if root.page == 3: VerticalLayout {
-            Text { text: "Wi-Fi"; color: black; font-size: 30px; }
-            Text { text: root.network-status; color: black; wrap: word-wrap; }
-            Button { text: "Search networks"; enabled: !root.network-busy; clicked => { root.scan-wifi(); } }
-            ssid-input := LineEdit { text <=> root.ssid; placeholder-text: "Network name"; accepted => { password.focus(); } }
-            password := LineEdit { input-type: InputType.password; placeholder-text: "WPA2 passphrase"; accepted => { root.dismiss-keyboard(); } }
-            Button { text: "Connect"; enabled: !root.network-busy; clicked => {
-                root.connect-wifi(root.ssid, password.text);
-                password.text = "";
-                root.dismiss-keyboard();
-            } }
-            networks-scroll := ScrollView { vertical-stretch: 1; mouse-drag-pan-enabled: true; content-width: self.visible-width; VerticalBox {
-                width: networks-scroll.visible-width;
-                alignment: start;
-                for network in root.networks: Button { height: 60px; text: network; clicked => { root.ssid = network; } }
-            } }
-        }
-        if root.page == 4: VerticalLayout {
-            HorizontalLayout {
-                Button { text: "Miqat dashboard"; clicked => {root.dashboard-mode = 0; root.page = 0;} }
-                Button { text: "Clock dashboard"; clicked => {root.dashboard-mode = 1; root.page = 0;} }
-            }
-            Text { text: "Settings & diagnostics"; color: black; font-size: 30px; }
-            Text { text: root.settings; color: black; wrap: word-wrap; vertical-stretch: 1; }
-        }
-        if root.page == 0: Rectangle { vertical-stretch: 1; }
-        HorizontalLayout {
-            Button { text: "Dashboard"; clicked => { root.page = 0; } }
-            Button { text: "Library"; clicked => { root.page = 1; } }
-            Button { text: "Wi-Fi"; clicked => { root.page = 3; } }
-            Button { text: "Settings"; clicked => { root.page = 4; } }
+        if !root.immersive || Kindil.chrome-visible: TabBar { }
+    }
+
+    // Hide the revealed tab bar again so the wall dashboard stays clean.
+    Timer {
+        interval: 20s;
+        running: Kindil.chrome-visible;
+        triggered => { Kindil.chrome-visible = false; }
+    }
+
+    Timer {
+        interval: 8s;
+        running: Kindil.notice != "";
+        triggered => {
+            Kindil.notice = "";
+            Kindil.notice-undo = false;
         }
     }
-    keyboard-focus-sink := FocusScope { width: 0px; height: 0px; }
+
+    if Kindil.notice != "": Notice {
+        x: 16px;
+        width: parent.width - 32px;
+        y: root.usable-height - 92px - self.height - 12px;
+    }
+
+    if Kindil.page == Page.library && Kindil.selected-book >= 0: BookActions {
+        y: root.usable-height - self.height;
+        height: self.preferred-height;
+    }
+    if Kindil.page == Page.reader && Kindil.reader-options: ReaderOptions {
+        y: root.height - 92px - self.height;
+        height: self.preferred-height;
+    }
+    if Kindil.page == Page.networks && Kindil.join-open: JoinSheet {
+        y: root.usable-height - self.height;
+        height: self.preferred-height;
+    }
+
+    focus-sink := FocusScope { width: 0px; height: 0px; }
     keyboard := VirtualKeyboard {
         visible: root.keyboard-visible;
         y: root.height - self.height;

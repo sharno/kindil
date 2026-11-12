@@ -1,195 +1,139 @@
-use kindil::{config::Config, ui};
-use slint::{ComponentHandle, Model};
+use clap::{Parser, Subcommand};
+use kindil::config::Config;
+use kindil::host::Simulated;
+use kindil::ui::{App, Execution, Options, Panel};
+use slint::ComponentHandle;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::args()
-        .next()
-        .is_some_and(|s| s.ends_with("kindil-dhcp"))
-    {
-        return kindil::runtime::dhcp_hook(&std::env::args().nth(1).unwrap_or_default())
-            .map_err(Into::into);
-    }
-    let pid1 = std::process::id() == 1;
-    let mut args = std::env::args().skip(1);
-    let mut preview = None;
-    let mut desktop = false;
-    let mut kindle = false;
-    let mut config = Config::load()?;
-    let mut books = config.books.clone();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--preview" | "--sim" => {
-                preview = Some(PathBuf::from(
-                    args.next().ok_or("--preview requires a directory")?,
-                ))
-            }
-            "--config" => {
-                config = Config::from_path(&PathBuf::from(
-                    args.next().ok_or("--config requires a file")?,
-                ))?;
-                books = config.books.clone();
-            }
-            "--miqat-config" => {
-                config.miqat_config =
-                    PathBuf::from(args.next().ok_or("--miqat-config requires a file")?)
-            }
-            "--books" => books = PathBuf::from(args.next().ok_or("--books requires a directory")?),
-            "--desktop" => desktop = true,
-            "--kindle" => kindle = true,
-            "--version" => {
-                println!("kindil {}", env!("CARGO_PKG_VERSION"));
-                return Ok(());
-            }
-            "--help" | "-h" => {
-                println!("kindil · قنديل\n\n--preview DIR  Render Slint screens without touching hardware\n--desktop      Interactive preview (build --features desktop)\n--kindle       Experimental device UI (build --features kindle)\n--config FILE  Configuration file\n--miqat-config FILE  Existing Miqat configuration\n--books DIR    UTF-8 .txt / EPUB library\n\nNo flashing, bootloader modification, or automatic suspend.");
-                return Ok(());
-            }
-            other => return Err(format!("unknown argument: {other}").into()),
-        }
-    }
-    if pid1 && preview.is_none() && !desktop {
-        kindle = true;
-    }
-    if [preview.is_some(), desktop, kindle]
-        .into_iter()
-        .filter(|x| *x)
-        .count()
-        != 1
-    {
-        return Err("choose exactly one of --preview DIR, --desktop, --kindle (see --help)".into());
-    }
-    if let Some(dir) = preview {
-        std::fs::create_dir_all(&dir)?;
-        let window = ui::preview::install()?;
-        let app = ui::create(config.clone(), &books)?;
-        if config.miqat_config.is_file() {
-            let miqat = miqat::config::Config::load(&config.miqat_config)?;
-            let now =
-                chrono::DateTime::from_timestamp(1794398400, 0).ok_or("invalid fixture instant")?;
-            app.set_miqat(kindil::dashboards::preview(&miqat, now)?);
-        }
-        ui::refresh_at(
-            &app.window,
-            &config,
-            kindil::civil::unix_from_civil(2026, 11, 11, 12, 0, 0),
-        );
-        app.window.show()?;
-        for (page, name) in [
-            (0, "dashboard"),
-            (1, "library"),
-            (3, "wifi"),
-            (4, "settings"),
-        ] {
-            app.window.set_page(page);
-            ui::preview::snapshot(&window, &dir.join(format!("{name}.ppm")))?;
-        }
-        if app.window.get_books().row_count() > 0 {
-            app.window.invoke_open_book(0);
-            ui::preview::snapshot(&window, &dir.join("reader.ppm"))?;
-        }
-        app.window.set_controls_open(true);
-        ui::preview::snapshot(&window, &dir.join("controls.ppm"))?;
-        app.window.set_controls_open(false);
-        app.window.set_page(3);
-        let _ = ui::preview::pixels(&window);
-        ui::preview::tap(&window, 140.0, 250.0);
-        ui::preview::snapshot(&window, &dir.join("keyboard.ppm"))?;
-        if !app.window.get_keyboard_visible() {
-            return Err("touch keyboard failed to open in preview".into());
-        }
-        app.window.invoke_dismiss_keyboard();
-        if app.window.get_books().row_count() > 0 {
-            app.window.set_page(1);
-            app.window.set_selected_file(0);
-            app.window.set_new_filename("renamed.txt".into());
-            ui::preview::snapshot(&window, &dir.join("file-actions.ppm"))?;
-        }
-        println!("Slint software previews: {}", dir.display());
-        return Ok(());
-    }
-    if desktop {
-        #[cfg(feature = "desktop")]
-        {
-            let path = config.miqat_config.clone();
-            let app = ui::create(config, &books)?;
-            app.start_miqat(path);
-            app.window.run()?;
-            return Ok(());
-        }
-        #[cfg(not(feature = "desktop"))]
-        return Err("rebuild with --features desktop".into());
-    }
-    #[cfg(feature = "kindle")]
-    {
-        if pid1 {
-            kindil::runtime::prepare_pid1()?;
-        }
-        let supervisor = std::rc::Rc::new(std::cell::RefCell::new(if pid1 {
-            kindil::services::Supervisor::from_config(
-                &config,
-                std::path::Path::new("/run/kindil/log"),
-            )
-        } else {
-            kindil::services::Supervisor::empty()
-        }));
-        let _backend = slint_backend_kindle::install(include_bytes!("../assets/DejaVuSans.ttf"))?;
-        // No set_wake_schedule: suspend/wake is opt-in only after PW1 validation.
-        let path = config.miqat_config.clone();
-        let interface = config.interface.clone();
-        let app = ui::create(config, &books)?;
-        app.start_miqat(path);
-        app.monitor_wifi(interface);
-        app.enable_frontlight();
-        app.window.set_status(
-            kindil::battery::read(std::path::Path::new("/sys"))
-                .label()
-                .into(),
-        );
-        let service_timer = slint::Timer::default();
-        let weak = app.window.as_weak();
-        service_timer.start(
-            slint::TimerMode::Repeated,
-            std::time::Duration::from_secs(5),
-            move || {
-                supervisor.borrow_mut().poll(std::time::Instant::now());
-                if let Some(ui) = weak.upgrade() {
-                    let supervisor = supervisor.borrow();
-                    let status = |name: &str| {
-                        supervisor
-                            .statuses()
-                            .into_iter()
-                            .find(|(n, _)| *n == name)
-                            .map(|(_, s)| s.label())
-                            .unwrap_or(if pid1 { "off" } else { "not managed" })
-                    };
-                    ui.set_ssh_state(status("dropbear").into());
-                    ui.set_sync_state(status("syncthing").into());
-                }
-                if pid1 {
-                    // Reap orphaned grandchildren after managed Child handles were polled.
-                    while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
-                }
-            },
-        );
-        app.window.run()?;
-        Ok(())
-    }
-    #[cfg(not(feature = "kindle"))]
-    Err("rebuild with --features kindle".into())
+/// kindil · قنديل — prayer-time dashboard and reader for the Kindle Paperwhite.
+#[derive(Parser)]
+#[command(version)]
+struct Cli {
+    /// Settings file [default: /mnt/us/kindil/kindil.toml when present]
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    /// Override the Miqat settings file
+    #[arg(long, global = true)]
+    miqat_config: Option<PathBuf>,
+    /// Override the books directory
+    #[arg(long, global = true)]
+    books: Option<PathBuf>,
+    /// Override where on-device choices are saved
+    #[arg(long, global = true)]
+    prefs: Option<PathBuf>,
+    #[command(subcommand)]
+    mode: Mode,
 }
-fn main() {
-    let result = run();
-    if let Err(ref error) = result {
-        eprintln!("kindil: {error}");
+
+#[derive(Subcommand)]
+enum Mode {
+    /// Render every screen to DIR/*.ppm with a simulated device
+    Preview { dir: PathBuf },
+    /// Interactive window with a simulated device
+    #[cfg(feature = "desktop")]
+    Desktop,
+    /// Run on the Kindle; start it from the KUAL launcher, which stops and
+    /// restarts Amazon's UI around it
+    #[cfg(feature = "kindle")]
+    Kindle,
+}
+
+impl Cli {
+    fn config(&self) -> anyhow::Result<Config> {
+        let config = Config::load(self.config.as_deref())?;
+        Ok(Config {
+            miqat_config: self.miqat_config.clone().unwrap_or(config.miqat_config),
+            books: self.books.clone().unwrap_or(config.books),
+            prefs: self.prefs.clone().unwrap_or(config.prefs),
+            ..config
+        })
     }
-    if std::process::id() == 1 {
-        // Exiting PID 1 panics the kernel, including after a successful UI close.
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(60));
+}
+
+/// Simulated runs never write next to the device's real preferences.
+fn scratch_prefs(cli: &Cli, config: Config, dir: &std::path::Path) -> Config {
+    Config {
+        prefs: cli
+            .prefs
+            .clone()
+            .unwrap_or_else(|| dir.join("kindil-prefs.toml")),
+        ..config
+    }
+}
+
+fn preview(cli: &Cli, dir: &std::path::Path) -> anyhow::Result<()> {
+    let config = scratch_prefs(cli, cli.config()?, dir);
+    let miqat_config = config.miqat_config.clone();
+    let window = kindil::preview::install()?;
+    let app = App::new(Options {
+        config,
+        host: Arc::new(Simulated::default()),
+        panel: Panel::Lcd,
+        execution: Execution::Inline,
+    })?;
+    app.refresh_now();
+    if miqat_config.is_file() {
+        let miqat = miqat::config::Config::load(&miqat_config)?;
+        let noon = chrono::DateTime::from_timestamp(1_794_398_400, 0)
+            .ok_or_else(|| anyhow::anyhow!("fixture instant"))?;
+        app.set_miqat(kindil::dashboards::preview(&miqat, noon)?);
+    }
+    app.window.show()?;
+    kindil::preview::screens(&app, &window, dir)?;
+    println!("previews: {}", dir.display());
+    Ok(())
+}
+
+#[cfg(feature = "desktop")]
+fn desktop(cli: &Cli) -> anyhow::Result<()> {
+    let config = scratch_prefs(cli, cli.config()?, &std::env::temp_dir());
+    let app = App::new(Options {
+        config,
+        host: Arc::new(Simulated::default()),
+        panel: Panel::Lcd,
+        execution: Execution::Background,
+    })?;
+    app.start();
+    app.window.run()?;
+    app.shutdown();
+    Ok(())
+}
+
+#[cfg(feature = "kindle")]
+fn kindle(cli: &Cli) -> anyhow::Result<()> {
+    use kindil::kindle::KindleHost;
+    const REGULAR: &[u8] =
+        include_bytes!("../crates/miqat/assets/fonts/IBMPlexSansArabic-Regular.ttf");
+    let config = cli.config()?;
+    let backend = slint_backend_kindle::install(REGULAR)?;
+    // Suspend stays with Amazon's powerd; kindil never arms a wake alarm.
+    let app = App::new(Options {
+        config,
+        host: Arc::new(KindleHost::open()),
+        panel: Panel::Eink(backend.full_refresh_flag()),
+        execution: Execution::Background,
+    })?;
+    app.start();
+    app.window.run()?;
+    app.shutdown();
+    Ok(())
+}
+
+fn main() -> std::process::ExitCode {
+    let cli = Cli::parse();
+    let result = match &cli.mode {
+        Mode::Preview { dir } => preview(&cli, dir),
+        #[cfg(feature = "desktop")]
+        Mode::Desktop => desktop(&cli),
+        #[cfg(feature = "kindle")]
+        Mode::Kindle => kindle(&cli),
+    };
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("kindil: {error:#}");
+            std::process::ExitCode::FAILURE
         }
-    }
-    if result.is_err() {
-        std::process::exit(1);
     }
 }

@@ -1,0 +1,11 @@
+{
+  "items": [
+    {
+      "name": "kindil",
+      "priority": 0,
+      "items": [
+        { "name": "Start kindil", "priority": 1, "action": "bin/start.sh" }
+      ]
+    }
+  ]
+}

@@ -600,6 +600,7 @@ checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
 dependencies = [
  "chrono",
  "phf 0.12.1",
+ "serde",
 ]
 
 [[package]]
@@ -2403,10 +2404,12 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "kindil"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "chrono-tz",
+ "clap",
  "fontdb",
  "fontique",
  "html2text",
@@ -2421,7 +2424,6 @@ dependencies = [
  "tempfile",
  "textwrap",
  "toml",
- "tz-rs",
  "zip",
 ]
 
@@ -4215,8 +4217,6 @@ dependencies = [
 [[package]]
 name = "slint-backend-kindle"
 version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97e59c71155375de993cc21cfcd3d2d96767ee0666be2ae383d8143f6b7fed69"
 dependencies = [
  "fontdb",
  "fontique",
@@ -4868,12 +4868,6 @@ name = "typed-path"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
-
-[[package]]
-name = "tz-rs"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fc6c929ffa10fb34f4a3c7e9a73620a83ef2e85e47f9ec3381b8289e6762f42"
 
 [[package]]
 name = "udev"

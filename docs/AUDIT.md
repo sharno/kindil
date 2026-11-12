@@ -1,4 +1,20 @@
-# 2026-11 architecture audit
+# 2026-11-12: app mode and redesign
+
+kindil now runs as a KUAL-launched app on the stock OS instead of as PID 1.
+
+| Finding | Resolution |
+|---|---|
+| Booting as PID 1 risked an unrecoverable device for little gain | Removed the PID-1 runtime, service supervisor, DHCP hook and initramfs scripts; Amazon's kernel, wifid, powerd and USBNetwork own the system |
+| Hardware calls were scattered through the UI | One `Host` trait; `KindleHost` for the device, `Simulated` for previews and tests, so previews cannot touch hardware |
+| Validated values travelled as strings and integers | Newtypes and sum types: `Ssid`, `Passphrase`, `Credentials`, `Brightness`, `FontSize`, `Progress`, `FileName`, `Trashed`, `Wifi`, `Ssh`, `Battery`, typed Syncthing transitions |
+| Hand-rolled timezone and civil-date code | `chrono-tz`, decoded once in `Config` |
+| Reading position and choices were lost on restart | `prefs.toml`, written atomically |
+| Partial e-ink updates accumulated ghosts | A tested `Ghosting` policy plus a vendored backend patch for full refreshes |
+| A dense, desktop-style UI | Redesigned for touch e-ink: tab bar, 64 px+ targets, sheets, IBM Plex Sans Arabic throughout |
+
+The table below is the earlier audit of the PID-1 design, kept for history.
+
+# 2026-11-11: architecture audit
 
 The previous implementation's host builds and test counts overstated what had
 been established. This refactor keeps the useful project intent while replacing

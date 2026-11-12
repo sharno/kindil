@@ -52,7 +52,7 @@
           target = "armv7-unknown-linux-musleabihf";
           common = {
             pname = "kindil";
-            version = "0.3.0";
+            version = "0.4.0";
             src = pkgs.lib.cleanSource ./.;
             cargoLock.lockFile = ./Cargo.lock;
             meta.license = pkgs.lib.licenses.mit;
@@ -105,8 +105,6 @@
               linker
               pkgs.qemu
               pkgs.binutils
-              pkgs.cpio
-              pkgs.gzip
               pkgs.pkg-config
             ];
             CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER = "${linker}/bin/armv7l-unknown-linux-gnueabihf-gcc";

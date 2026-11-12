@@ -1,14 +1,17 @@
-//! kindil (قنديل): library-first Rust userland for a Kindle wall dashboard/reader.
+//! kindil (قنديل): a Rust/Slint wall dashboard and reader that runs as an app
+//! on the Kindle Paperwhite's stock OS.
 pub mod battery;
-pub mod civil;
 pub mod config;
 pub mod dashboards;
 pub mod files;
 pub mod frontlight;
+pub mod ghosting;
+pub mod host;
+pub mod kindle;
+pub mod prefs;
+pub mod preview;
 pub mod reader;
-pub mod runtime;
-pub mod services;
-pub mod time;
-pub mod tz;
+pub mod sync;
 pub mod ui;
+pub mod view;
 pub mod wifi;

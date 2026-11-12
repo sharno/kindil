@@ -1,9 +1,14 @@
-dashboard = "miqat"
-miqat_config = "examples/miqat.toml"
-books = "examples/books"
-timezone = "UTC0"
-interface = "wlan0"
-ssh = true
-sync = false
-# wifi_ssid = "your-home"
-# wifi_psk = "your-passphrase"
+# kindil settings. On the Kindle this lives at /mnt/us/kindil/kindil.toml.
+# Every key is optional; choices made on the device go to `prefs` instead.
+
+dashboard = "miqat"                  # miqat | clock (the first-run home screen)
+miqat_config = "examples/miqat.toml" # device default: /mnt/us/kindil/miqat.toml
+books = "examples/books"             # device default: /mnt/us/books
+timezone = "Europe/Amsterdam"        # IANA name, for the clock and status bar
+# prefs = "/mnt/us/kindil/prefs.toml"
+
+# Optional: a Syncthing build you copied to the Kindle. kindil only starts it
+# when switched on in Settings, at low priority. See README before enabling.
+# [syncthing]
+# binary = "/mnt/us/kindil/syncthing"
+# home = "/mnt/us/kindil/syncthing-home"

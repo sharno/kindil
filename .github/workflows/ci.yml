@@ -19,23 +19,8 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - name: Read pinned Miqat revision
-        id: miqat
-        run: echo "rev=$(git ls-tree HEAD crates/miqat | awk '{print $3}')" >> "$GITHUB_OUTPUT"
-      - name: Fetch private Miqat library with its dedicated read-only key
-        uses: actions/checkout@v4
         with:
-          repository: sharno/miqat
-          ref: ${{ steps.miqat.outputs.rev }}
-          path: crates/miqat
-          ssh-key: ${{ secrets.MIQAT_READ_KEY }}
-          persist-credentials: true
-      - name: Register checkout as a submodule and share scoped SSH command with Nix
-        run: |
-          ssh_command=$(git -C crates/miqat config --get core.sshCommand)
-          printf 'GIT_SSH_COMMAND=%s\n' "$ssh_command" >> "$GITHUB_ENV"
-          git submodule init
-          git submodule absorbgitdirs
+          submodules: recursive
       - uses: DeterminateSystems/nix-installer-action@v23
       - uses: Swatinem/rust-cache@v2
         with:
@@ -59,10 +44,9 @@ jobs:
             mkdir -p dist
             cp "$device/bin/kindil" dist/kindil
             qemu-arm dist/kindil --version
-            bash scripts/test-initramfs.sh
           '
       - uses: actions/upload-artifact@v4
         if: matrix.kind == 'arm'
         with:
-          name: kindil-arm-experimental
+          name: kindil-arm
           path: dist/kindil

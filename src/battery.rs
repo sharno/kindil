@@ -1,72 +1,57 @@
 //! Battery state from sysfs.
 //!
-//! Which fuel gauge a Kindle has depends on the board, so rather than naming
-//! one driver the reader scans `/sys/class/power_supply/*/capacity` and prefers
-//! an entry whose name mentions the battery. A device without a gauge simply
-//! reports `None` and the dashboard omits it.
+//! Which fuel gauge a Kindle has depends on the board, so the reader scans
+//! `/sys/class/power_supply/*/capacity` and prefers an entry whose name
+//! mentions the battery. A board without a gauge reports [`Battery::Unknown`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// The battery as the dashboard shows it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Battery {
-    /// Charge in percent, if a gauge is present.
-    pub percent: Option<u8>,
-    /// True when the gauge says the battery is charging or full.
-    pub charging: bool,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Charge {
+    /// Plugged in: charging or already full.
+    Charging,
+    Discharging,
 }
 
-impl Battery {
-    /// A short label for the status bar.
-    pub fn label(&self) -> String {
-        match self.percent {
-            Some(percent) if self.charging => std::format!("{percent}% +"),
-            Some(percent) => std::format!("{percent}%"),
-            None => "battery ?".to_string(),
-        }
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Battery {
+    Unknown,
+    Known { percent: u8, charge: Charge },
 }
 
-/// Read the battery from a sysfs root (`/sys` in production).
+/// Read the battery from a sysfs root (`/sys` on the device).
 pub fn read(root: &Path) -> Battery {
-    let Ok(entries) = std::fs::read_dir(root.join("class/power_supply")) else {
-        return Battery::default();
+    let mut supplies: Vec<PathBuf> = std::fs::read_dir(root.join("class/power_supply"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    supplies.sort();
+    // Some boards also expose `ac` and `usb` supplies without a capacity.
+    let named = |path: &&PathBuf| {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("batt"))
     };
-    let mut candidates: Vec<_> = entries.flatten().map(|e| e.path()).collect();
-    candidates.sort();
-
-    // Prefer a supply whose directory name mentions the battery; some boards
-    // also expose `ac` and `usb` supplies that have no capacity.
-    let best = candidates
+    let Some(supply) = supplies
         .iter()
-        .find(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains("batt"))
-        })
-        .or_else(|| {
-            candidates
-                .iter()
-                .find(|path| path.join("capacity").is_file())
-        });
-
-    let Some(path) = best else {
-        return Battery::default();
+        .find(named)
+        .or_else(|| supplies.iter().find(|p| p.join("capacity").is_file()))
+    else {
+        return Battery::Unknown;
     };
-
-    let percent = std::fs::read_to_string(path.join("capacity"))
-        .ok()
-        .and_then(|text| text.trim().parse::<u8>().ok())
-        .map(|p| p.min(100));
-
-    let status = std::fs::read_to_string(path.join("status"))
-        .ok()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    let charging = status == "charging" || status == "full";
-
-    Battery { percent, charging }
+    let read = |name: &str| std::fs::read_to_string(supply.join(name)).unwrap_or_default();
+    match read("capacity").trim().parse::<u8>() {
+        Ok(percent) => Battery::Known {
+            percent: percent.min(100),
+            charge: match read("status").trim().to_ascii_lowercase().as_str() {
+                "charging" | "full" => Charge::Charging,
+                _ => Charge::Discharging,
+            },
+        },
+        Err(_) => Battery::Unknown,
+    }
 }
 
 #[cfg(test)]
@@ -74,63 +59,43 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tempdir(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(std::format!("kindil-battery-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+    fn supply(root: &Path, name: &str, capacity: &str, status: &str) {
+        let dir = root.join("class/power_supply").join(name);
         fs::create_dir_all(&dir).unwrap();
-        dir
+        fs::write(dir.join("capacity"), capacity).unwrap();
+        fs::write(dir.join("status"), status).unwrap();
     }
 
     #[test]
     fn reads_capacity_and_status() {
-        let root = tempdir("read");
-        let supply = root.join("class/power_supply/max17040_battery");
-        fs::create_dir_all(&supply).unwrap();
-        fs::write(supply.join("capacity"), "87\n").unwrap();
-        fs::write(supply.join("status"), "Discharging\n").unwrap();
-
-        let battery = read(&root);
-        assert_eq!(battery.percent, Some(87));
-        assert!(!battery.charging);
-        assert_eq!(battery.label(), "87%");
-        let _ = fs::remove_dir_all(&root);
+        let root = tempfile::tempdir().unwrap();
+        supply(root.path(), "max17040_battery", "87\n", "Discharging\n");
+        assert_eq!(
+            read(root.path()),
+            Battery::Known {
+                percent: 87,
+                charge: Charge::Discharging
+            }
+        );
     }
 
     #[test]
-    fn prefers_the_battery_over_ac() {
-        let root = tempdir("prefer");
-        let ac = root.join("class/power_supply/ac");
-        let battery = root.join("class/power_supply/battery");
-        fs::create_dir_all(&ac).unwrap();
-        fs::create_dir_all(&battery).unwrap();
-        fs::write(ac.join("capacity"), "10").unwrap();
-        fs::write(battery.join("capacity"), "55").unwrap();
-        fs::write(battery.join("status"), "Charging").unwrap();
-
-        let read_back = read(&root);
-        assert_eq!(read_back.percent, Some(55));
-        assert!(read_back.charging);
-        assert_eq!(read_back.label(), "55% +");
-        let _ = fs::remove_dir_all(&root);
+    fn prefers_the_battery_over_ac_and_clamps() {
+        let root = tempfile::tempdir().unwrap();
+        supply(root.path(), "ac", "10", "");
+        supply(root.path(), "battery", "250", "Full");
+        assert_eq!(
+            read(root.path()),
+            Battery::Known {
+                percent: 100,
+                charge: Charge::Charging
+            }
+        );
     }
 
     #[test]
-    fn a_missing_gauge_is_not_an_error() {
-        let root = tempdir("missing");
-        let battery = read(&root);
-        assert_eq!(battery.percent, None);
-        assert_eq!(battery.label(), "battery ?");
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn capacity_is_clamped() {
-        let root = tempdir("clamp");
-        let supply = root.join("class/power_supply/battery");
-        fs::create_dir_all(&supply).unwrap();
-        fs::write(supply.join("capacity"), "250").unwrap();
-        assert_eq!(read(&root).percent, Some(100));
-        let _ = fs::remove_dir_all(&root);
+    fn a_missing_gauge_is_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(read(root.path()), Battery::Unknown);
     }
 }

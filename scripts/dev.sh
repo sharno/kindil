@@ -11,15 +11,17 @@
 #   test        run the test suite on the host
 #   test-arm    run the test suite on the ARM target under qemu-arm
 #   device      build dist/kindil (static ARMv7 musl)
-#   sim         render the screens to dist/sim/*.png
-#   desktop     interactive Slint preview (never opens Kindle devices)
+#   sim         render every screen to dist/sim/*.png (simulated device)
+#   desktop     interactive window (simulated device)
+#   deploy H    build, then copy the binary and KUAL launcher to ssh host H
 #   fmt         format the Rust and Nix sources
 #   check       test + clippy + fmt --check
 #   help        this text
 
 set -euo pipefail
 
-readonly PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly PROJECT_DIR
 cd "$PROJECT_DIR"
 
 readonly TARGET="armv7-unknown-linux-musleabihf"
@@ -59,12 +61,12 @@ device_build() {
 	if readelf -l "$binary" | grep -q INTERP; then
 		die "the binary is dynamically linked"
 	fi
-	echo "device binary: $binary ($(stat -c %s "$binary") bytes, static ARMv7)"
+	echo "device binary: $binary ($(wc -c <"$binary" | tr -d " ") bytes, static ARMv7)"
 }
 
 sim() {
 	mkdir -p "$DIST/sim"
-	cargo run --quiet -- --preview "$DIST/sim" --config examples/kindil.toml --books examples/books
+	cargo run --quiet -- preview "$DIST/sim" --config examples/kindil.toml --books examples/books
 	if command -v ffmpeg >/dev/null 2>&1; then
 		for pgm in "$DIST"/sim/*.ppm; do
 			ffmpeg -loglevel error -y -i "$pgm" "${pgm%.ppm}.png"
@@ -73,6 +75,18 @@ sim() {
 	else
 		echo "(install ffmpeg to convert the PGMs to PNG)"
 	fi
+}
+
+# The Kindle has no rsync; stream a tar over SSH. The launcher's own files go
+# first, then the binary, so a half-finished copy never runs a stale binary.
+deploy() {
+	local host="$1"
+	[[ -n "$host" ]] || die "usage: scripts/dev.sh deploy root@KINDLE_IP"
+	device_build
+	tar -C kindle/extensions -cf - kindil |
+		ssh "$host" 'mkdir -p /mnt/us/extensions /mnt/us/kindil && tar -C /mnt/us/extensions -xf -'
+	ssh "$host" 'cat > /mnt/us/extensions/kindil/bin/kindil.new && chmod 755 /mnt/us/extensions/kindil/bin/kindil.new && mv /mnt/us/extensions/kindil/bin/kindil.new /mnt/us/extensions/kindil/bin/kindil' <"$DIST/kindil"
+	ssh "$host" /mnt/us/extensions/kindil/bin/kindil --version
 }
 
 arm_tests() {
@@ -89,7 +103,8 @@ test) cargo test ;;
 test-arm) arm_tests ;;
 device) device_build ;;
 sim) sim ;;
-desktop) cargo run --features desktop -- --desktop --config examples/kindil.toml --books examples/books ;;
+desktop) cargo run --features desktop -- desktop --config examples/kindil.toml --books examples/books ;;
+deploy) deploy "${2:-}" ;;
 fmt)
 	cargo fmt
 	nix fmt
@@ -99,6 +114,6 @@ check)
 	cargo clippy --all-targets -- -D warnings
 	cargo test
 	;;
-help) sed -n '3,23p' "$0" | sed 's/^# \{0,1\}//' ;;
+help) sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//' ;;
 *) die "unknown command: $1" ;;
 esac

@@ -1,162 +1,126 @@
 # kindil · قنديل
 
-A Rust/Slint userland for the first-generation Kindle Paperwhite: a Miqat wall
-dashboard, an EPUB/text reader, and basic user-file management.
+A prayer-time wall dashboard and e-reader for the first-generation Kindle
+Paperwhite (PW1), in Rust and Slint.
 
-**Experimental, not a device-validated replacement OS. No flash/install command
-is provided.** Host software rendering and QEMU user-mode tests do not establish
-that an image boots on the PW1's Linux 2.6.31 kernel. Nothing in the development
-commands opens the framebuffer, changes brightness, stops Amazon services, or
-modifies a bootloader. `--kindle` explicitly selects the hardware backend.
+kindil runs **as an app on Amazon's stock OS**, started from KUAL. While it
+runs, Amazon's UI steps aside; when it exits or crashes, Amazon's UI comes
+back. It never flashes, never replaces init or the bootloader, and changes no
+system file. A reboot always returns the Kindle to stock.
 
-## Design
+## What it does
 
-- **Slint 1.18.1** owns widgets, layout, touch dispatch and software rendering.
-  Full runtime font shaping is retained: bitmap-font-only rendering breaks
-  Arabic contextual joining. Bundled DejaVu Sans is used for the shell.
-- **Miqat is reused, not recreated.** `crates/miqat` is a pinned submodule of
-  [sharno/miqat](https://github.com/sharno/miqat). Its existing Rust renderer,
-  IBM Plex Sans Arabic fonts, prayer settings, Hijri calendar, weather, radar
-  and contrast correction produce the same 758×1024 dashboard. Slint displays
-  the frame 1:1 without a surrounding toolbar. A regression test compares every
-  displayed pixel with Miqat's output. Tap the **top-right corner** for controls.
-- Miqat and a simple clock are selectable dashboard views. Miqat refreshes on a
-  single background worker using its existing weather/radar cache. UI input
-  does not wait for network requests. Supply your real Miqat TOML unchanged.
-- **slint-backend-kindle 0.7.1** is the pinned experimental hardware adapter,
-  reported tested on PW1 upstream. Amazon's Linux drivers still own the EPDC,
-  touch controller, Wi-Fi firmware and electrical limits. We do not replace
-  those drivers or install our own waveform tables.
-- **rbook**, **html2text** and **textwrap** provide the basic EPUB/text reading
-  path. This is text reflow, not a full CSS/image EPUB engine. DRM, PDF, MOBI
-  and AZW are not supported. EPUBs are checked against compressed/expanded-size
-  limits before parsing to fit a 256 MiB device.
-- SSH is **Dropbear**, Wi-Fi authentication is **wpa_supplicant**, and DHCP is
-  **BusyBox udhcpc**, supervised only in standalone PID-1 mode. We do not
-  reimplement cryptography or Wi-Fi drivers. SSH is key-only, on by policy;
-  the runtime image must actually supply the server, keys and account files.
+- **Home**: the [Miqat](https://github.com/sharno/miqat) prayer dashboard,
+  full-bleed and pixel-exact, refreshed on each minute; or a large clock. Tap
+  the dashboard to reveal the tab bar; it hides again after 20 s.
+- **Library and reader**: `.epub` and UTF-8 `.txt` files from `/mnt/us/books`.
+  Tap the right two-thirds of a page to go forward, the left third to go back.
+  **Aa** sets text size and front light. kindil remembers the position in every
+  book, the text size and the home screen across restarts. Rename and Trash
+  (with Undo) from a book's **···** menu; nothing is ever overwritten or
+  deleted outright.
+- **Settings**: home screen, front light, a "clean screen" flash, Wi-Fi on/off
+  with network status, scan and join, SSH server and SSH-at-boot switches,
+  Syncthing, and device facts (battery, memory, storage, uptime).
+- **E-ink care**: page changes flash the panel once; reading flashes every 6th
+  page turn, the dashboard every 30 minutes, to clear ghosting.
 
-## Fast development
+## Install on the Kindle
 
-Both repositories are private; use an account/SSH key with access:
+Needs a jailbroken PW1 with KUAL. SSH needs the USBNetwork hack; for Wi-Fi
+SSH set `USE_WIFI="true"` and `USE_WIFI_SSHD_ONLY="true"` in
+`/mnt/us/usbnet/etc/config` and add your key to `usbnet/etc/authorized_keys`.
+
+```sh
+nix develop
+scripts/dev.sh device                  # dist/kindil, static ARMv7
+scripts/dev.sh deploy root@KINDLE_IP   # binary + KUAL launcher over SSH
+```
+
+Or copy over USB: `kindle/extensions/kindil` to `/mnt/us/extensions/kindil`,
+and `dist/kindil` to `/mnt/us/extensions/kindil/bin/kindil`.
+
+Then put your Miqat settings at `/mnt/us/kindil/miqat.toml` and, optionally,
+a `/mnt/us/kindil/kindil.toml` (see [examples/kindil.toml](examples/kindil.toml)).
+Start it from KUAL → **kindil → Start kindil**. **Settings → Exit to Kindle**
+returns to Amazon's UI. The log is `/mnt/us/kindil/kindil.log`.
+
+If kindil ever stops responding: SSH in and `killall kindil` (the launcher then
+restarts Amazon's UI), or hold the power button for about 20 s to reboot.
+
+## Files on the device
+
+| Path | What |
+|---|---|
+| `/mnt/us/extensions/kindil/` | KUAL launcher and the `kindil` binary |
+| `/mnt/us/kindil/kindil.toml` | Optional settings (every key has a default) |
+| `/mnt/us/kindil/miqat.toml` | Miqat's own settings: location, prayer method |
+| `/mnt/us/kindil/prefs.toml` | Choices made on the device; safe to delete |
+| `/mnt/us/books/` | Books |
+| `/mnt/us/books/.kindil-trash/` | Trashed books, recoverable |
+
+## Syncthing
+
+Optional and off by default. kindil does not download it: copy an ARM
+(`linux-arm`) Syncthing build to the Kindle and add a `[syncthing]` section to
+`kindil.toml`. The Settings switch then starts it with `nice 10`,
+`GOMAXPROCS=1` and `GOGC=50`, logs to `<home>/kindil-syncthing.log`, and stops
+it on exit.
+
+Caveats before relying on it:
+
+- Go officially requires Linux 3.2 or later. The PW1 runs 2.6.31, so current
+  Syncthing builds may fail to start; the switch then shows the error.
+- It costs roughly 40–80 MB of the PW1's 256 MB RAM and noticeable CPU while
+  scanning, and it keeps Wi-Fi busy, which drains the battery.
+- For a lighter way to fill the library, push books from a computer:
+  `rsync -av ~/Books/ root@KINDLE_IP:/mnt/us/books/`.
+
+## Develop
 
 ```sh
 git clone --recurse-submodules git@github.com:sharno/kindil.git
 cd kindil
 nix develop
 
-scripts/dev.sh sim       # actual Slint screens → dist/sim/*.ppm (+ PNG with ffmpeg)
-scripts/dev.sh desktop   # interactive software-rendered desktop window
-scripts/dev.sh check     # host tests, formatting, clippy
-scripts/dev.sh test-arm  # run actual ARM test binaries under qemu-arm
-scripts/dev.sh device    # experimental static ARM binary → dist/kindil
+scripts/dev.sh sim       # every screen → dist/sim/*.png, simulated device
+scripts/dev.sh desktop   # interactive window, simulated device
+scripts/dev.sh check     # fmt, clippy, tests
+scripts/dev.sh test-arm  # tests on ARM under qemu-arm
 ```
 
-The flake uses official **prebuilt Rust + ARM musl std** and a cached **Zig**
-compiler/linker. It does not build cross GCC/rustc from source. Cargo caches the
-first Slint/library compilation; subsequent UI edits rebuild the application.
-`nix build .#kindil` builds the host package; `nix build .#kindil-device` builds
-the pinned device binary. Do not use the old `packages.armv7l-linux.kindile`
-attribute or stale manually selected GCC paths.
+`preview` and `desktop` use a simulated device: no file under `/mnt/us`, no
+framebuffer, no front light and no network is touched. Previews use fixture
+weather and make no requests.
 
-For plain Cargo, Rust ≥1.92 and the ARM musl target are required. The Nix shell
-supplies the pinned toolchain, link driver, QEMU and archive tools.
+### Layout
 
-## Use
+| Module | Role |
+|---|---|
+| `ui/app.slint` | The whole UI: theme, components, pages, the `Kindil` global |
+| `ui.rs` | Wiring: callbacks, worker threads, timers, e-ink refresh policy |
+| `view.rs` | Pure domain → display text (units, wording) |
+| `host.rs` | The `Host` trait the UI uses, and the `Simulated` device |
+| `kindle.rs` | `Host` on the stock OS: lipc (wifid, powerd), USBNetwork, frontlight |
+| `wifi.rs` | wpa_supplicant control socket, typed SSID/passphrase |
+| `sync.rs` | Syncthing as a typed state machine |
+| `reader.rs`, `files.rs`, `prefs.rs` | Books, Trash, persisted choices |
+| `ghosting.rs` | When to flash the panel |
+| `vendor/slint-backend-kindle` | Display/touch backend, patched for full refresh |
 
-```sh
-cargo run -- --preview dist/preview --config examples/kindil.toml --books examples/books
-cargo run --features desktop -- --desktop --config examples/kindil.toml --books examples/books
-# Only after emulator/hardware compatibility checks and a recovery plan:
-# ./kindil --kindle --config /mnt/us/kindil.toml
-```
+The build pins Slint 1.18.1 with its software renderer and full font shaping
+(Arabic joins correctly). IBM Plex Sans Arabic, from Miqat, is the only font.
+The device binary is static ARMv7 musl, linked by Zig for the 2.6.31 kernel.
 
-`examples/miqat.toml` is Miqat's example, **not your personal configuration**.
-Use `miqat_config` in Kindil's TOML (or `--miqat-config FILE`) to select the
-current Miqat configuration. Previews use fixture weather and make no requests.
-Desktop/device Miqat mode fetches weather/radar as the existing Miqat engine does.
-Missing configuration is shown as an error, never silently replaced by another
-city's prayer times. The clock dashboard has its own explicit timezone setting.
+## Not yet validated on hardware
 
-### Reader, files and controls
-
-- The library lists up to 256 regular `.txt`/`.epub` files in the configured
-  `books` directory, without following symlinks or scanning system directories.
-- Open a book, turn pages, and use **Aa / ☀** for font-size and brightness
-  sliders. Font changes repaginate; the reader can scroll a page as needed.
-  These preferences are currently session-local.
-- Preview brightness is explicitly simulated. Hardware control queries the
-  PW1 driver's maximum first, clamps percentages to that range and debounces
-  writes. If discovery/read/write fails, the slider is disabled. The tiny
-  `/dev/yoshime_fl` adapter is the only project-owned device ioctl surface.
-- **⋮** opens rename/Trash actions. Trash requires confirmation, retains bytes
-  in `.kindil-trash`, and supports undo of the last move. Existing files are
-  never overwritten. No recursive deletion or filesystem formatting exists.
-- Text fields open an on-screen keyboard adapted from Slint's MIT example.
-  Use the globe key to cycle **Latin → symbols → Arabic**, Shift for capitals
-  or alternate symbols, arrows to move the cursor, and Backspace to delete.
-  Esc, Return (where appropriate), or the down-arrow dismisses it; tapping the
-  field opens it again. The form stays above the keyboard. All printable ASCII
-  characters are available for WPA2 credentials; passwords remain masked and
-  are cleared on submission. Slint owns editing and Arabic contextual shaping.
-- Wi-Fi search/connect uses wpa_supplicant's control socket on a worker thread.
-  WPA2 passphrases are not logged; interactive credentials are session-local.
-  Previews do not launch daemons. Repeated network actions are disabled while a
-  request is in flight. Touch typing is covered by actual pointer-event tests,
-  not just callback/property tests; physical PW1 touch remains a release gate.
-
-## Standalone runtime (not boot-validated)
-
-`scripts/make-initramfs.sh RUNTIME_OVERLAY NEW_OUTPUT.cpio.gz` only stages an
-experimental **RAM image**. It refuses missing helpers, wrong-architecture or
-dynamically linked binaries, absent SSH authorized keys, and existing outputs.
-It neither downloads random helper executables nor writes a device partition.
-
-The overlay must provide matching static ARM BusyBox (`/bin/sh`, `ip`, udhcpc),
-Dropbear, wpa_supplicant, account files, SSH host keys/authorized_keys, your
-`/etc/kindil.toml`, Miqat config and any books. Exact kernel modules, panel
-waveforms, firmware, Wi-Fi board calibration and storage mounts are **not**
-guessed or provisioned by this project. A valid archive alone does not prove
-that those prerequisites exist or that the OS boots.
-
-PID 1 mounts proc/sysfs/devtmpfs (static-node fallback), devpts and volatile
-runtime directories, supervises services and reaps orphans. It does not mount
-or rewrite eMMC partitions. Fatal startup errors leave PID 1 alive for serial
-diagnosis rather than deliberately panicking the kernel.
-
-SSH is reachable only once networking, accounts, PTYs, keys and compatible
-helper binaries are present. No default password is supplied. Syncthing is
-optional/off by default; no claim of PW1 compatibility or memory usage is made.
-
-## Hardware validation boundary
-
-1. Host Slint rendering/UI tests: safe, no hardware involved.
-2. ARM tests under `qemu-arm`: validate instruction/ABI behavior on the host's
-   kernel, **not** EPDC, old-kernel syscalls, boot, Wi-Fi or suspend behavior.
-3. Full-system testing: use [eink-emulator](https://github.com/katadelos/eink-emulator)
-   with the **PW1/Celeste** model and an owned firmware image. It needs a patched
-   QEMU; its upstream currently does not publish a ready-made release binary.
-4. Only then consider a reversible, RAM-only boot on real hardware, with tested
-   recovery. Do not flash eMMC/bootloader or copy another model's waveforms.
-
-See [the release-gate checklist](docs/VALIDATION.md) for exact missing inputs,
-safe emulator preparation and the evidence still needed. No hardware milestone
-is considered complete merely because a preview, build or archive succeeds.
-
-Modern Rust/musl libraries can assume a newer Linux than the PW1's 2.6.31. The
-linker targets that kernel version, but this does **not** remove every library's
-minimum-kernel requirement. This remains a release blocker until a matching
-full-system boot is tested. No guarantee against bricking is possible.
-
-Deep suspend/RTC wake is deliberately **not enabled**. Sleeping in an event loop
-is not suspend-to-RAM, and continuous Wi-Fi/SSH/sync prevents e-reader-like
-battery-life claims. Battery-mode scheduling must be validated against recovery,
-RTC wake and actual power measurements; plugged-in dashboard use is the initial
-target.
+Rendering, touch, Arabic shaping and every UI flow are tested on the host with
+the real Slint component and renderer. Still to confirm on the PW1 itself:
+Linux 2.6.31 compatibility of the musl binary, panel refresh and touch through
+the backend, frontlight ioctls, lipc property names, memory use and boot time.
+See [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## Licensing
 
-Project-owned code is MIT. Dependencies retain their own licenses: in particular
-Slint has GPL/commercial/other alternative terms which must be reviewed before
-distributing an embedded product. See `THIRD_PARTY.md`, the pinned crate licenses,
-and the font license files. The old public-domain bitmap font was removed.
+Project code is MIT. Slint is GPL-3.0 / Slint licensed; review before
+distributing. See [THIRD_PARTY.md](THIRD_PARTY.md).
