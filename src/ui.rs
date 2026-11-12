@@ -297,6 +297,7 @@ fn wire(window: &AppWindow, ctx: &Ctx) {
         }};
     }
     on!(on_navigated => navigated(page));
+    on!(on_scrolled => scrolled());
     on!(on_choose_dashboard => choose_dashboard(kind));
     on!(on_open_book => open_book(index));
     on!(on_rename_book => rename_book(index, name));
@@ -404,6 +405,12 @@ impl Ctx {
                 self.show_sync();
             }
             Page::Dashboard | Page::Reader | Page::Networks => {}
+        }
+    }
+
+    fn scrolled(&self) {
+        if let Some(ui) = self.ui() {
+            self.display.updated(&ui, Update::PageTurn);
         }
     }
 

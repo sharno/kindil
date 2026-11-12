@@ -338,3 +338,40 @@ fn every_printable_ascii_key_exists() {
         .collect();
     assert!(missing.is_empty(), "missing keys: {missing:?}");
 }
+
+#[test]
+fn lists_move_a_page_per_swipe_without_redrawing_mid_drag() {
+    use slint::platform::{PointerEventButton, WindowAdapter, WindowEvent};
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    f.tap(SETTINGS_TAB, TAB_Y);
+    let before = pixels(&f.window);
+    let at = |y| slint::LogicalPosition::new(380.0, y);
+    let send = |event| {
+        f.window.window().dispatch_event(event);
+        slint::platform::update_timers_and_animations();
+    };
+    send(WindowEvent::PointerPressed {
+        position: at(800.0),
+        button: PointerEventButton::Left,
+    });
+    [700.0, 550.0, 400.0]
+        .into_iter()
+        .for_each(|y| send(WindowEvent::PointerMoved { position: at(y) }));
+    assert!(
+        pixels(&f.window) == before,
+        "an e-ink panel must not redraw while the finger moves"
+    );
+    send(WindowEvent::PointerReleased {
+        position: at(400.0),
+        button: PointerEventButton::Left,
+    });
+    assert!(
+        pixels(&f.window) != before,
+        "release moves to the next page"
+    );
+    drag(&f.window, 380.0, 300.0, 800.0);
+    assert!(
+        pixels(&f.window) == before,
+        "swiping down returns to the first page"
+    );
+}

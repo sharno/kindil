@@ -12,6 +12,7 @@ pub mod lipc;
 pub mod prefs;
 pub mod preview;
 pub mod reader;
+pub mod signals;
 pub mod sync;
 pub mod ui;
 pub mod view;

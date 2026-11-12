@@ -2,6 +2,8 @@
 # Runs kindil as an app on the stock OS: Amazon's UI steps aside while it runs
 # and always comes back afterwards, whether kindil exits, crashes or is killed.
 # Nothing here survives a reboot, so a reboot is always a way back.
+# Upstart's stop/start and eips live in sbin; KUAL has it on PATH, SSH does not.
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$DIR/bin/kindil"
 CONFIG=/mnt/us/kindil/kindil.toml
@@ -36,6 +38,6 @@ if [ -f "$CONFIG" ]; then
 else
   set --
 fi
-log "kindil $("$BIN" --version)"
+log "$("$BIN" --version)"
 "$BIN" "$@" kindle
 log "kindil exited ($?)"

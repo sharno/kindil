@@ -95,6 +95,7 @@ fn desktop(cli: &Cli) -> anyhow::Result<()> {
         execution: Execution::Background,
     })?;
     app.start();
+    kindil::signals::quit_on_termination()?;
     app.window.run()?;
     app.shutdown();
     Ok(())
@@ -115,6 +116,7 @@ fn kindle(cli: &Cli) -> anyhow::Result<()> {
         execution: Execution::Background,
     })?;
     app.start();
+    kindil::signals::quit_on_termination()?;
     app.window.run()?;
     app.shutdown();
     Ok(())

@@ -22,8 +22,11 @@ system file. A reboot always returns the Kindle to stock.
 - **Settings**: home screen, front light, a "clean screen" flash, Wi-Fi on/off
   with network status, scan and join, SSH server and SSH-at-boot switches,
   Syncthing, and device facts (battery, memory, storage, uptime).
-- **E-ink care**: page changes flash the panel once; reading flashes every 6th
-  page turn, the dashboard every 30 minutes, to clear ghosting.
+- **E-ink care**: lists move a page per swipe (up/down) instead of scrolling,
+  so the panel updates once per swipe, not on every finger movement. In the
+  reader, swipe left/right or tap to turn pages. Page changes flash the panel
+  once; reading flashes every 6th page turn, the dashboard every 30 minutes, to
+  clear ghosting.
 
 ## Install on the Kindle
 
