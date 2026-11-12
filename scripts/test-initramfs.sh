@@ -16,8 +16,11 @@ reject() {
 reject 'runtime missing'
 mkdir -p "$runtime/bin" "$runtime/sbin" "$runtime/root/.ssh" "$runtime/etc"
 # A known static ARM ELF suffices to test architecture checks, not helper behavior.
+install -m555 "$project/dist/kindil" "$testdir/readonly-elf"
 for tool in bin/busybox sbin/dropbear sbin/wpa_supplicant sbin/udhcpc; do
-    cp "$project/dist/kindil" "$runtime/$tool"
+    # Nix-store executables are read-only. Fixtures must remain replaceable for
+    # the deliberate wrong-architecture test below.
+    install -m755 "$testdir/readonly-elf" "$runtime/$tool"
 done
 ln -s /bin/busybox "$runtime/bin/sh"
 echo 'fixture-only-not-a-key' > "$runtime/root/.ssh/authorized_keys"
@@ -26,9 +29,9 @@ echo 'root:x:0:0:root:/root:/bin/sh' > "$runtime/etc/passwd"
 ln -s "$testdir/outside" "$runtime/tmp"
 reject 'unsafe runtime directory symlink'
 unlink "$runtime/tmp"
-cp /bin/sh "$runtime/sbin/dropbear"
+install -m755 /bin/sh "$runtime/sbin/dropbear"
 reject 'not ARM'
-cp "$project/dist/kindil" "$runtime/sbin/dropbear"
+install -m755 "$testdir/readonly-elf" "$runtime/sbin/dropbear"
 "$project/scripts/make-initramfs.sh" "$runtime" "$testdir/image.gz"
 [[ $(stat -c %a "$testdir/image.gz") == 600 ]]
 gzip -t "$testdir/image.gz"
