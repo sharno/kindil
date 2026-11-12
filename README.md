@@ -1,9 +1,9 @@
-# kindile
+# kindil
 
 A single-process Rust shell for the **first-generation Amazon Kindle
 Paperwhite** (2012, model `EY21`, board "Celeste"/"Yoshime").
 
-kindile owns the e-ink panel and the touch controller directly. There is no
+kindil owns the e-ink panel and the touch controller directly. There is no
 init, no window manager and no compositor: one process renders the screen,
 pushes it to the panel, and reacts to taps. It is meant to run either as a
 [KUAL](https://www.mobileread.com/forums/showthread.php?t=203326) extension
@@ -24,7 +24,7 @@ Kindle OS entirely.
 | Bootloader | U-Boot 2009.08-lab126 (no secure boot; serial console) |
 | Frontlight | misc device `/dev/yoshime_fl` (minor 162) |
 
-The stock userland is uClibc, so **kindile is built as a static ARMv7 musl
+The stock userland is uClibc, so **kindil is built as a static ARMv7 musl
 binary**: no dynamic loader, no shared libraries, nothing to install.
 
 The panel geometry is read from the kernel at runtime rather than hard-coded:
@@ -35,13 +35,13 @@ landscape, and one code path serves both.
 
 ```bash
 # The device binary (static ARMv7 musl)
-nix build .#packages.armv7l-linux.kindile
+nix build .#packages.armv7l-linux.kindil
 
 # A native build, for running the tests and developing the UI
-nix build .#kindile
+nix build .#kindil
 
 # Run the unit tests
-nix build .#checks.x86_64-linux.kindile-tests
+nix build .#checks.x86_64-linux.kindil-tests
 
 # A dev shell with cargo, rustc, rustfmt and clippy
 nix develop
@@ -107,12 +107,12 @@ attribute under the `fl_tps6116x` sysfs class, which we fall back to.
 
 ## Deploying
 
-kindile is a single static binary. Two ways to run it:
+kindil is a single static binary. Two ways to run it:
 
 ### As a KUAL extension, alongside Amazon's UI
 
 ```bash
-nix build .#packages.armv7l-linux.kindile
+nix build .#packages.armv7l-linux.kindil
 ./scripts/make-kual-extension.sh
 ```
 
@@ -120,8 +120,8 @@ That writes a KUAL extension (a `config.xml` plus the binary) to
 `result/kual-extension/`. Copy it onto the Kindle's user partition:
 
 ```bash
-cp -r result/kual-extension/kindile /mnt/us/extensions/
-chmod 755 /mnt/us/extensions/kindile/kindile
+cp -r result/kual-extension/kindil /mnt/us/extensions/
+chmod 755 /mnt/us/extensions/kindil/kindil
 ```
 
 It then appears in the KUAL menu.
@@ -129,11 +129,11 @@ It then appears in the KUAL menu.
 ### As PID 1, replacing the Kindle OS
 
 ```bash
-nix build .#packages.armv7l-linux.kindile
+nix build .#packages.armv7l-linux.kindil
 ./scripts/make-initramfs.sh
 ```
 
-That writes a minimal initramfs whose `/sbin/init` is kindile. Boot it with
+That writes a minimal initramfs whose `/sbin/init` is kindil. Boot it with
 `kexec`:
 
 ```sh

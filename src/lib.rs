@@ -1,4 +1,4 @@
-//! kindile: a single-process shell for the first-generation Kindle Paperwhite.
+//! kindil: a single-process shell for the first-generation Kindle Paperwhite.
 //!
 //! The crate is split into a library and a binary so that the hardware
 //! layers can be exercised by tests and, later, by a second front end.

@@ -1,4 +1,4 @@
-//! The kindile shell: a single process that owns the panel, the clock and the
+//! The kindil shell: a single process that owns the panel, the clock and the
 //! touch input.
 //!
 //! This is the "one process runs the whole system" shape. There is no
@@ -141,7 +141,7 @@ impl Shell {
                     );
                 }
                 Screen::List => {
-                    r.draw_text(margin, margin, "kindile", BLACK, FONT_SCALE + 1);
+                    r.draw_text(margin, margin, "kindil", BLACK, FONT_SCALE + 1);
                     r.hline(margin, margin + title_height, width - margin * 2, BLACK);
 
                     let mut y = list_top;
@@ -175,7 +175,7 @@ impl Shell {
                             height,
                             frontlight_state()
                         ),
-                        _ => "kindile - a shell for the Paperwhite".to_string(),
+                        _ => "kindil - a shell for the Paperwhite".to_string(),
                     };
                     let mut y = list_top;
                     for line in body.lines() {
@@ -220,11 +220,11 @@ impl Shell {
         };
 
         if let Err(e) = self.epdc.send_update(region, waveform, full) {
-            eprintln!("kindile: send_update failed: {e}");
+            eprintln!("kindil: send_update failed: {e}");
             return;
         }
         if let Err(e) = self.epdc.wait_for_update_complete() {
-            eprintln!("kindile: wait_for_update_complete failed: {e}");
+            eprintln!("kindil: wait_for_update_complete failed: {e}");
         }
     }
 

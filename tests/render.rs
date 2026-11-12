@@ -4,8 +4,8 @@
 //! renderer against an in-memory buffer with the same layout and check the
 //! resulting pixels.
 
-use kindile::font::FONT8X8_BASIC;
-use kindile::render::{Renderer, BLACK, FONT_SCALE, WHITE};
+use kindil::font::FONT8X8_BASIC;
+use kindil::render::{Renderer, BLACK, FONT_SCALE, WHITE};
 
 /// A stand-in for the framebuffer with the same geometry rules.
 struct FakeFb {

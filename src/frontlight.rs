@@ -2,7 +2,7 @@
 //!
 //! Amazon's Kindle kernels expose the frontlight as a character device driven
 //! with the ioctls in `<linux/frontlight.h>` (FBInk vendors the same header as
-//! `eink/frontlight-kindle.h`). There is no sysfs `brightness` node on these
+//! `eink/frontlight-kindil.h`). There is no sysfs `brightness` node on these
 //! devices, so the ioctl interface is the only way in.
 //!
 //! On the Paperwhite 1 the driver is `drivers/misc/yoshime_fl.c`, which

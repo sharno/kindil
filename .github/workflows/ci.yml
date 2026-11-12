@@ -21,10 +21,10 @@ jobs:
 
       - uses: cachix/install-nix-action@v27
         with:
-          name: kindile
+          name: kindil
 
       - name: Build and run the unit tests
-        run: nix build .#checks.x86_64-linux.kindile-tests
+        run: nix build .#checks.x86_64-linux.kindil-tests
 
       - name: Check formatting
         run: nix fmt -- --fail-on-change
@@ -43,14 +43,14 @@ jobs:
 
       - uses: cachix/install-nix-action@v27
         with:
-          name: kindile
+          name: kindil
 
       - name: Build the device binary
-        run: nix build .#packages.armv7l-linux.kindile
+        run: nix build .#packages.armv7l-linux.kindil
 
       - name: Check that the binary is a static ARM executable
         run: |
-          binary=$(nix build .#packages.armv7l-linux.kindile --no-link --print-out-paths)/bin/kindile
+          binary=$(nix build .#packages.armv7l-linux.kindil --no-link --print-out-paths)/bin/kindil
           readelf -h "$binary" | grep -E "Class|Machine"
           readelf -l "$binary" | grep -q INTERP && {
             echo "error: the binary is dynamically linked"; exit 1;

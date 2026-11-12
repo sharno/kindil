@@ -1,5 +1,5 @@
 {
-  description = "kindile - a single-process Rust shell for the first-generation Amazon Kindle Paperwhite";
+  description = "kindil - a single-process Rust shell for the first-generation Amazon Kindle Paperwhite";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -31,7 +31,7 @@
         "aarch64-linux"
       ];
 
-      kindileFor =
+      kindilFor =
         pkgs:
         let
           # The Rust target triple this build produces. For a host build it is
@@ -39,7 +39,7 @@
           rustcTargetSpec = pkgs.stdenv.hostPlatform.rust.rustcTargetSpec;
         in
         pkgs.rustPlatform.buildRustPackage {
-          pname = "kindile";
+          pname = "kindil";
           version = "0.1.0";
 
           src = ./.;
@@ -53,7 +53,7 @@
             runHook preInstall
 
             mkdir -p $out/bin
-            install -m755 target/${rustcTargetSpec}/release/kindile $out/bin/kindile
+            install -m755 target/${rustcTargetSpec}/release/kindil $out/bin/kindil
 
             runHook postInstall
           '';
@@ -61,7 +61,7 @@
           meta = {
             description = "A single-process Rust shell for the first-generation Kindle Paperwhite";
             longDescription = ''
-              kindile owns the e-ink panel (via the Freescale EPDC framebuffer
+              kindil owns the e-ink panel (via the Freescale EPDC framebuffer
               driver) and the touch controller, and renders a small clock and
               menu shell. It is designed to run either as a KUAL extension
               alongside Amazon's own UI, or as PID 1 in a custom initramfs.
@@ -73,17 +73,17 @@
         };
 
       # The device build: static ARMv7 musl.
-      armv7Package = kindileFor armv7Pkgs;
+      armv7Package = kindilFor armv7Pkgs;
 
       hostPackages = nixpkgs.lib.genAttrs hostSystems (
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          kindile = kindileFor pkgs;
+          kindil = kindilFor pkgs;
         in
         {
-          inherit kindile;
-          default = kindile;
+          inherit kindil;
+          default = kindil;
         }
       );
 
@@ -112,7 +112,7 @@
     {
       packages = hostPackages // {
         ${armv7System} = {
-          kindile = armv7Package;
+          kindil = armv7Package;
           default = armv7Package;
         };
       };
@@ -120,11 +120,11 @@
       checks = {
         # Building the device binary is itself the meaningful check: it proves
         # the crate cross-compiles against the ARM32 ABI.
-        ${armv7System}.kindile = armv7Package;
+        ${armv7System}.kindil = armv7Package;
 
         # Run the unit tests on the host.
-        x86_64-linux.kindile-tests = nixpkgs.legacyPackages.x86_64-linux.rustPlatform.buildRustPackage {
-          pname = "kindile-tests";
+        x86_64-linux.kindil-tests = nixpkgs.legacyPackages.x86_64-linux.rustPlatform.buildRustPackage {
+          pname = "kindil-tests";
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;

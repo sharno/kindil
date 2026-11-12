@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build a minimal initramfs that runs kindile as PID 1, replacing the Kindle
+# Build a minimal initramfs that runs kindil as PID 1, replacing the Kindle
 # OS entirely.
 #
 # The kernel's command line then needs:
@@ -17,15 +17,15 @@ set -euo pipefail
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 readonly OUT_DIR="${1:-$PROJECT_DIR/result/initramfs}"
-readonly BINARY="$PROJECT_DIR/result/bin/kindile"
+readonly BINARY="$PROJECT_DIR/result/bin/kindil"
 
 if [[ ! -x "$BINARY" ]]; then
 	echo "error: $BINARY not found." >&2
-	echo "Build it first: nix build .#packages.armv7l-linux.kindile" >&2
+	echo "Build it first: nix build .#packages.armv7l-linux.kindil" >&2
 	exit 1
 fi
 
-# The Kindle's own init is not what we want; kindile *is* the system.
+# The Kindle's own init is not what we want; kindil *is* the system.
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR/sbin" "$OUT_DIR/dev" "$OUT_DIR/proc" "$OUT_DIR/sys" "$OUT_DIR/tmp"
 
@@ -35,7 +35,7 @@ install -m755 "$BINARY" "$OUT_DIR/sbin/init"
 mkdir -p "$OUT_DIR/etc"
 printf 'UTC\n' > "$OUT_DIR/etc/timezone"
 
-# A minimal /inittab is not needed: kindile is PID 1 and does not fork.
+# A minimal /inittab is not needed: kindil is PID 1 and does not fork.
 # But the kernel wants the directory entries to exist for devtmpfs.
 
 echo "initramfs written to $OUT_DIR"

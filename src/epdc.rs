@@ -12,7 +12,7 @@
 //!   is byte-identical to the one in the independent `fread-ink/fread-kernel-k4`
 //!   tree, so the ABI is not specific to one mirror.
 //! * The same struct layouts and ioctl numbers are described in
-//!   `NiLuJe/FBInk`'s `eink/mxcfb-kindle.h`, the reference user-space
+//!   `NiLuJe/FBInk`'s `eink/mxcfb-kindil.h`, the reference user-space
 //!   implementation for these devices.
 //!
 //! # Layout is load-bearing

@@ -1,4 +1,4 @@
-//! kindile: a single-process shell for the first-generation Kindle Paperwhite.
+//! kindil: a single-process shell for the first-generation Kindle Paperwhite.
 //!
 //! The program owns the e-ink panel (via the EPDC framebuffer driver) and
 //! the touch controller, and renders a small clock/menu shell. It is meant to
@@ -10,13 +10,13 @@
 //! # Usage
 //!
 //! ```text
-//! kindile [--fb /dev/fb0] [--touch /dev/input/event0]
+//! kindil [--fb /dev/fb0] [--touch /dev/input/event0]
 //! ```
 
-use kindile::epdc::Epdc;
-use kindile::fb::Framebuffer;
-use kindile::input::Touch;
-use kindile::shell::Shell;
+use kindil::epdc::Epdc;
+use kindil::fb::Framebuffer;
+use kindil::input::Touch;
+use kindil::shell::Shell;
 
 /// How long to wait for touch events before redrawing the clock.
 const TICK_MS: i32 = 1_000;
@@ -44,8 +44,8 @@ fn main() {
             },
             "--help" | "-h" => {
                 println!(
-                    "kindile - a shell for the first-generation Kindle Paperwhite\n\n\
-                     Usage: kindile [--fb /dev/fb0] [--touch /dev/input/event0]"
+                    "kindil - a shell for the first-generation Kindle Paperwhite\n\n\
+                     Usage: kindil [--fb /dev/fb0] [--touch /dev/input/event0]"
                 );
                 return;
             }
@@ -71,7 +71,7 @@ fn main() {
     let mut touch = match Touch::open(&touch_path) {
         Ok(t) => Some(t),
         Err(e) => {
-            eprintln!("kindile: touch unavailable ({e}); running clock-only");
+            eprintln!("kindil: touch unavailable ({e}); running clock-only");
             None
         }
     };
@@ -90,7 +90,7 @@ fn main() {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    eprintln!("kindile: touch error: {e}");
+                    eprintln!("kindil: touch error: {e}");
                     touch = None;
                 }
             }
@@ -105,6 +105,6 @@ fn main() {
 
 /// Print an error and exit.
 fn fail(msg: &str) -> ! {
-    eprintln!("kindile: {msg}");
+    eprintln!("kindil: {msg}");
     std::process::exit(1)
 }
