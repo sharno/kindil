@@ -4,8 +4,8 @@
 use crate::battery::{Battery, Charge};
 use crate::frontlight::Frontlight;
 use crate::host::{Brightness, DeviceInfo, Host, Memory, Power, Ssh, Storage, Wifi};
+use crate::lipc;
 use crate::wifi::{self, Credentials, Link, Network};
-use anyhow::Context;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -21,7 +21,7 @@ pub struct KindleHost {
 }
 
 impl KindleHost {
-    /// Opens the frontlight device; other services are reached per call.
+    /// Reads the front light's range; other services are reached per call.
     pub fn open() -> Self {
         Self {
             frontlight: Frontlight::open().map_err(|e| e.to_string()),
@@ -29,27 +29,8 @@ impl KindleHost {
     }
 }
 
-/// Amazon's IPC: `lipc-get-prop com.lab126.wifid enable` and friends.
-fn lipc_get(service: &str, property: &str) -> anyhow::Result<String> {
-    let output = Command::new("lipc-get-prop")
-        .args([service, property])
-        .output()
-        .context("lipc-get-prop")?;
-    anyhow::ensure!(output.status.success(), "lipc-get-prop {property} failed");
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-fn lipc_set(service: &str, property: &str, value: &str) -> anyhow::Result<()> {
-    let status = Command::new("lipc-set-prop")
-        .args([service, property, value])
-        .status()
-        .context("lipc-set-prop")?;
-    anyhow::ensure!(status.success(), "lipc-set-prop {property} failed");
-    Ok(())
-}
-
 fn wifi_power() -> anyhow::Result<Power> {
-    match lipc_get("com.lab126.wifid", "enable")?.as_str() {
+    match lipc::get("com.lab126.wifid", "enable")?.as_str() {
         "1" => Ok(Power::On),
         "0" => Ok(Power::Off),
         other => anyhow::bail!("unexpected wifid enable value {other:?}"),
@@ -58,8 +39,8 @@ fn wifi_power() -> anyhow::Result<Power> {
 
 /// powerd knows the PW1's fuel gauge, which has no `power_supply` class entry.
 fn powerd_battery() -> anyhow::Result<Battery> {
-    let percent: u8 = lipc_get("com.lab126.powerd", "battLevel")?.parse()?;
-    let charge = match lipc_get("com.lab126.powerd", "isCharging")?.as_str() {
+    let percent: u8 = lipc::get("com.lab126.powerd", "battLevel")?.parse()?;
+    let charge = match lipc::get("com.lab126.powerd", "isCharging")?.as_str() {
         "1" => Charge::Charging,
         _ => Charge::Discharging,
     };
@@ -75,7 +56,7 @@ impl Host for KindleHost {
             .frontlight
             .as_ref()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(Brightness::new(light.percent()?))
+        light.brightness()
     }
 
     fn set_brightness(&self, level: Brightness) -> anyhow::Result<()> {
@@ -83,7 +64,7 @@ impl Host for KindleHost {
             .frontlight
             .as_ref()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(light.set_percent(level.percent())?)
+        light.set(level)
     }
 
     fn wifi(&self) -> Wifi {
@@ -107,7 +88,7 @@ impl Host for KindleHost {
             Power::On => "1",
             Power::Off => "0",
         };
-        lipc_set("com.lab126.wifid", "enable", value)
+        lipc::set("com.lab126.wifid", "enable", value)
     }
 
     fn scan(&self) -> anyhow::Result<Vec<Network>> {

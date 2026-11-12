@@ -15,10 +15,6 @@ a replacement for the full transitive license inventory when distributing builds
 | html2text | https://github.com/jugglerchris/rust-html2text — MIT | XHTML-to-text conversion |
 | IBM Plex Sans Arabic | see `crates/miqat/assets/fonts/OFL.txt` — SIL OFL 1.1 | All typography: Miqat, the shell and the reader |
 
-The small PW1 frontlight adapter follows Amazon's `include/linux/yoshime_fl.h`
-and `drivers/misc/yoshime_fl.c` ioctl ABI. It calls the existing kernel driver;
-it does not drive PWM, change voltage limits, or replace a kernel module.
-
 kindil runs on Amazon's stock OS and uses its services (wifid, powerd, the
 USBNetwork hack's Dropbear). Syncthing, if used, is a separately supplied build
 under its own license.

@@ -101,7 +101,7 @@ weather and make no requests.
 | `ui.rs` | Wiring: callbacks, worker threads, timers, e-ink refresh policy |
 | `view.rs` | Pure domain → display text (units, wording) |
 | `host.rs` | The `Host` trait the UI uses, and the `Simulated` device |
-| `kindle.rs` | `Host` on the stock OS: lipc (wifid, powerd), USBNetwork, frontlight |
+| `kindle.rs` | `Host` on the stock OS: lipc (wifid, powerd front light and battery), USBNetwork |
 | `wifi.rs` | wpa_supplicant control socket, typed SSID/passphrase |
 | `sync.rs` | Syncthing as a typed state machine |
 | `reader.rs`, `files.rs`, `prefs.rs` | Books, Trash, persisted choices |
@@ -112,12 +112,21 @@ The build pins Slint 1.18.1 with its software renderer and full font shaping
 (Arabic joins correctly). IBM Plex Sans Arabic, from Miqat, is the only font.
 The device binary is static ARMv7 musl, linked by Zig for the 2.6.31 kernel.
 
-## Not yet validated on hardware
+## Validation status
 
 Rendering, touch, Arabic shaping and every UI flow are tested on the host with
-the real Slint component and renderer. Still to confirm on the PW1 itself:
-Linux 2.6.31 compatibility of the musl binary, panel refresh and touch through
-the backend, frontlight ioctls, lipc property names, memory use and boot time.
+the real Slint component and renderer.
+
+On a PW1 (firmware 5.6.1.1, kernel 2.6.31):
+
+- **Confirmed:** the static binary runs, and `kindil preview` renders every
+  screen identically to the host in 6 s, with about 13 MB peak memory. The
+  lipc properties kindil reads exist (`wifid enable`; powerd `battLevel`,
+  `isCharging`, `flIntensity`, `flMaxIntensity`), as do the wpa_supplicant
+  socket and the USBNetwork toggle.
+- **Still to confirm:** the interactive session (panel refresh and touch
+  through the backend), and every switch exercised on the device.
+
 See [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## Licensing
