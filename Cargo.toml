@@ -1,0 +1,20 @@
+[package]
+name = "kindile"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "A Rust userland shell for the first-generation Amazon Kindle Paperwhite"
+license = "MIT"
+publish = false
+
+# No external crates: the Kindle runs a 2.6.31-era kernel with a uClibc
+# userland, so every dependency would have to be vendored and cross-compiled
+# against an ancient toolchain. The syscalls we need are a thin FFI layer.
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
