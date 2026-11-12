@@ -31,7 +31,7 @@ jobs:
           ssh-key: ${{ secrets.MIQAT_READ_KEY }}
           persist-credentials: false
       - run: git submodule init
-      - uses: DeterminateSystems/nix-installer-action@v27
+      - uses: DeterminateSystems/nix-installer-action@v23
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.kind }}
