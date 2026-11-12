@@ -1,152 +1,87 @@
-//! Frontlight control.
-//!
-//! On the Paperwhite 1 the driver is `drivers/misc/yoshime_fl.c`, which
-//! registers a misc device named `yoshime_fl` (minor 162) - so the node is
-//! `/dev/yoshime_fl`, as `include/linux/yoshime_fl.h` spells out. The
-//! Paperwhite 1 is the first Kindle with a frontlight; earlier models have none.
-//!
-//! All three ioctls take a **pointer to an `int`**: the handler does
-//! `get_user(val, argp)` / `put_user(val, argp)`. Passing the value directly
-//! looks plausible and always fails with `EFAULT`.
-
-use crate::sys::{self, ioc};
-use core::ffi::c_int;
-
-/// The ioctl type character used by the frontlight driver.
-pub const FL_MAGIC_NUMBER: core::ffi::c_uint = b'L' as core::ffi::c_uint;
-
-/// The frontlight device node on the Paperwhite 1.
-pub const FL_DEV_FILE: &str = "/dev/yoshime_fl";
-
-/// `_IOW('L', 0x01, int)`: set the intensity.
-pub const FL_IOCTL_SET_INTENSITY: sys::IoctlRequest = ioc::iow(FL_MAGIC_NUMBER, 0x01, 4);
-/// `_IOR('L', 0x02, int)`: get the current intensity.
-pub const FL_IOCTL_GET_INTENSITY: sys::IoctlRequest = ioc::ior(FL_MAGIC_NUMBER, 0x02, 4);
-/// `_IOR('L', 0x03, int)`: get the maximum intensity.
-pub const FL_IOCTL_GET_RANGE_MAX: sys::IoctlRequest = ioc::ior(FL_MAGIC_NUMBER, 0x03, 4);
-
-/// The frontlight, if it is available.
+//! Minimal PW1-only frontlight adapter. Linux owns PWM and electrical limits.
+//! ABI: Amazon include/linux/yoshime_fl.h and drivers/misc/yoshime_fl.c.
+//! All three ioctl handlers use get_user/put_user with an int pointer.
+use std::{
+    fs::{File, OpenOptions},
+    io,
+    os::fd::AsRawFd,
+};
 pub struct Frontlight {
-    fd: c_int,
+    file: File,
     max: i32,
 }
-
 impl Frontlight {
-    /// Open the frontlight device.
-    ///
-    /// # Errors
-    ///
-    /// Fails if `/dev/yoshime_fl` cannot be opened.
-    pub fn open() -> Result<Self, Error> {
-        let c_path = sys::to_cstring(FL_DEV_FILE).expect("constant path has no NUL");
-        // SAFETY: `c_path` is a NUL-terminated C string that outlives the call.
-        let fd = unsafe { sys::open(c_path.as_ptr() as *const core::ffi::c_char, sys::O_RDWR) };
-        if fd < 0 {
-            return Err(Error::Open {
-                path: FL_DEV_FILE.to_string(),
-                errno: sys::errno(),
-            });
-        }
-        let mut fl = Frontlight { fd, max: 0 };
-        fl.max = fl.max_intensity().unwrap_or(0);
-        Ok(fl)
-    }
-
-    /// The current intensity, in the driver's own units.
-    pub fn intensity(&self) -> Result<i32, Error> {
-        let mut value: c_int = 0;
-        // SAFETY: `value` is a live `int`, and the handler does `put_user` into
-        // the pointer we pass.
-        let rc = unsafe { sys::ioctl(self.fd, FL_IOCTL_GET_INTENSITY, &mut value as *mut c_int) };
-        if rc < 0 {
-            return Err(Error::Ioctl {
-                what: "FL_IOCTL_GET_INTENSITY",
-                errno: sys::errno(),
-            });
-        }
-        Ok(value)
-    }
-
-    /// The maximum intensity the panel supports.
-    pub fn max_intensity(&self) -> Result<i32, Error> {
-        let mut value: c_int = 0;
-        // SAFETY: as above.
-        let rc = unsafe { sys::ioctl(self.fd, FL_IOCTL_GET_RANGE_MAX, &mut value as *mut c_int) };
-        if rc < 0 {
-            return Err(Error::Ioctl {
-                what: "FL_IOCTL_GET_RANGE_MAX",
-                errno: sys::errno(),
-            });
-        }
-        Ok(value)
-    }
-
-    /// Set the intensity, clamped to `0..=max`.
-    pub fn set_intensity(&self, value: i32) -> Result<(), Error> {
-        let value = if self.max > 0 {
-            value.clamp(0, self.max)
-        } else {
-            value.max(0)
+    pub fn open() -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/yoshime_fl")?;
+        let mut max = 0i32;
+        let rc = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                libc::_IOR::<i32>(b'L' as _, 3) as _,
+                &mut max,
+            )
         };
-        // SAFETY: the handler does `get_user` from the pointer we pass, so it
-        // must point at a live `int` - not be the value itself.
-        let rc = unsafe { sys::ioctl(self.fd, FL_IOCTL_SET_INTENSITY, &value as *const c_int) };
         if rc < 0 {
-            return Err(Error::Ioctl {
-                what: "FL_IOCTL_SET_INTENSITY",
-                errno: sys::errno(),
-            });
+            return Err(io::Error::last_os_error());
+        }
+        if max <= 0 {
+            return Err(io::Error::other(
+                "invalid frontlight range; control disabled",
+            ));
+        }
+        Ok(Self { file, max })
+    }
+    pub fn percent(&self) -> io::Result<f32> {
+        let mut value = 0i32;
+        let rc = unsafe {
+            libc::ioctl(
+                self.file.as_raw_fd(),
+                libc::_IOR::<i32>(b'L' as _, 2) as _,
+                &mut value,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if !(0..=self.max).contains(&value) {
+            return Err(io::Error::other("out-of-range driver brightness"));
+        }
+        Ok(value as f32 * 100.0 / self.max as f32)
+    }
+    pub fn set_percent(&self, percent: f32) -> io::Result<()> {
+        let value = level(percent, self.max)?;
+        let rc = unsafe {
+            libc::ioctl(
+                self.file.as_raw_fd(),
+                libc::_IOW::<i32>(b'L' as _, 1) as _,
+                &value,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
         }
         Ok(())
     }
 }
-
-impl Drop for Frontlight {
-    fn drop(&mut self) {
-        // SAFETY: `fd` is owned by this value and closed exactly once.
-        unsafe {
-            sys::close(self.fd);
-        }
+fn level(percent: f32, max: i32) -> io::Result<i32> {
+    if !percent.is_finite() || !(0.0..=100.0).contains(&percent) || max <= 0 {
+        return Err(io::Error::other("invalid brightness"));
     }
+    Ok((f64::from(percent) * f64::from(max) / 100.0).round() as i32)
 }
-
-/// Errors from the frontlight layer.
-#[derive(Debug)]
-pub enum Error {
-    /// The device could not be opened.
-    Open { path: String, errno: i32 },
-    /// An ioctl failed.
-    Ioctl { what: &'static str, errno: i32 },
-}
-
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::Open { path, errno } => {
-                write!(
-                    f,
-                    "open({path}) failed: {} ({errno})",
-                    sys::strerror(*errno)
-                )
-            }
-            Error::Ioctl { what, errno } => {
-                write!(f, "{what} failed: {} ({errno})", sys::strerror(*errno))
-            }
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn ioctl_numbers_match_the_yoshime_driver() {
-        // From Amazon's <linux/frontlight.h>.
-        assert_eq!(FL_IOCTL_SET_INTENSITY, 0x4004_4c01);
-        assert_eq!(FL_IOCTL_GET_INTENSITY, 0x8004_4c02);
-        assert_eq!(FL_IOCTL_GET_RANGE_MAX, 0x8004_4c03);
+    fn values_never_exceed_driver_limits() {
+        assert_eq!(level(0.0, 255).unwrap(), 0);
+        assert_eq!(level(100.0, 255).unwrap(), 255);
+        assert_eq!(level(50.0, 255).unwrap(), 128);
+        assert!(level(f32::NAN, 255).is_err());
+        assert!(level(-1.0, 255).is_err());
+        assert!(level(101.0, 255).is_err());
     }
 }

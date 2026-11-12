@@ -1,0 +1,12 @@
+Welcome to kindil
+
+kindil means lantern: قنديل.
+
+This is the native text reader. Slint owns the interface and font rendering.
+Use Previous and Next to turn pages, and Dashboard to return to the clock.
+
+The reader supports UTF-8 plain text and basic EPUB text reflow, using maintained
+parsing libraries. PDF, DRM and full EPUB CSS/images are not supported.
+
+No physical Kindle has been boot-tested by this project yet. The desktop and
+software previews are for fast iteration without putting a device at risk.

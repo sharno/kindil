@@ -1,150 +1,150 @@
-# kindil
+# kindil · قنديل
 
-A single-process Rust shell for the **first-generation Amazon Kindle
-Paperwhite** (2012, model `EY21`, board "Celeste"/"Yoshime").
+A Rust/Slint userland for the first-generation Kindle Paperwhite: a Miqat wall
+dashboard, an EPUB/text reader, and basic user-file management.
 
-kindil owns the e-ink panel and the touch controller directly. There is no
-init, no window manager and no compositor: one process renders the screen,
-pushes it to the panel, and reacts to taps. It is meant to run either as a
-[KUAL](https://www.mobileread.com/forums/showthread.php?t=203326) extension
-alongside Amazon's own UI, or as PID 1 in a custom initramfs that replaces the
-Kindle OS entirely.
-
-## The device
-
-| | |
-|---|---|
-| SoC | Freescale i.MX50 (i.MX508), single Cortex-A8 @ 800 MHz |
-| RAM | 256 MiB |
-| Panel | 6" E Ink, 212 DPI, 4-LED frontlight |
-| Framebuffer | `/dev/fb0`, `mxc_epdc_fb`, **758x1024 portrait**, 8 bpp, stride 768 |
-| Touch | Cypress `cyttsp` on `/dev/input/event0`, axes X 0..758 / Y 0..1024 |
-| Wi-Fi | Atheros AR6003 (SDIO) |
-| Kernel | Amazon lab126 `2.6.31-rt11-lab126` |
-| Bootloader | U-Boot 2009.08-lab126 (no secure boot; serial console) |
-| Frontlight | misc device `/dev/yoshime_fl` (minor 162) |
-
-The stock userland is uClibc, so **kindil is built as a static ARMv7 musl
-binary**: no dynamic loader, no shared libraries, nothing to install.
-
-The panel geometry is read from the kernel at runtime rather than hard-coded:
-the Paperwhite 1's framebuffer is portrait, while the later Paperwhites are
-landscape, and one code path serves both.
-
-## Build
-
-```bash
-# The device binary (static ARMv7 musl)
-nix build .#packages.armv7l-linux.kindil
-
-# A native build, for running the tests and developing the UI
-nix build .#kindil
-
-# Run the unit tests
-nix build .#checks.x86_64-linux.kindil-tests
-
-# A dev shell with cargo, rustc, rustfmt and clippy
-nix develop
-```
+**Experimental, not a device-validated replacement OS. No flash/install command
+is provided.** Host software rendering and QEMU user-mode tests do not establish
+that an image boots on the PW1's Linux 2.6.31 kernel. Nothing in the development
+commands opens the framebuffer, changes brightness, stops Amazon services, or
+modifies a bootloader. `--kindle` explicitly selects the hardware backend.
 
 ## Design
 
-The kernel keeps the parts that are genuinely hard - E Ink waveform and
-ghosting management, the touch controller, the PMIC, frontlight PWM, suspend
-and resume, and the Wi-Fi stack. Everything above that is Rust.
+- **Slint 1.18.1** owns widgets, layout, touch dispatch and software rendering.
+  Full runtime font shaping is retained: bitmap-font-only rendering breaks
+  Arabic contextual joining. Bundled DejaVu Sans is used for the shell.
+- **Miqat is reused, not recreated.** `crates/miqat` is a pinned submodule of
+  [sharno/miqat](https://github.com/sharno/miqat). Its existing Rust renderer,
+  IBM Plex Sans Arabic fonts, prayer settings, Hijri calendar, weather, radar
+  and contrast correction produce the same 758×1024 dashboard. Slint displays
+  the frame 1:1 without a surrounding toolbar. A regression test compares every
+  displayed pixel with Miqat's output. Tap the **top-right corner** for controls.
+- Miqat and a simple clock are selectable dashboard views. Miqat refreshes on a
+  single background worker using its existing weather/radar cache. UI input
+  does not wait for network requests. Supply your real Miqat TOML unchanged.
+- **slint-backend-kindle 0.7.1** is the pinned experimental hardware adapter,
+  reported tested on PW1 upstream. Amazon's Linux drivers still own the EPDC,
+  touch controller, Wi-Fi firmware and electrical limits. We do not replace
+  those drivers or install our own waveform tables.
+- **rbook**, **html2text** and **textwrap** provide the basic EPUB/text reading
+  path. This is text reflow, not a full CSS/image EPUB engine. DRM, PDF, MOBI
+  and AZW are not supported. EPUBs are checked against compressed/expanded-size
+  limits before parsing to fit a 256 MiB device.
+- SSH is **Dropbear**, Wi-Fi authentication is **wpa_supplicant**, and DHCP is
+  **BusyBox udhcpc**, supervised only in standalone PID-1 mode. We do not
+  reimplement cryptography or Wi-Fi drivers. SSH is key-only, on by policy;
+  the runtime image must actually supply the server, keys and account files.
 
-| Module | Responsibility |
-|---|---|
-| `epdc` | The Freescale EPDC ioctl ABI: waveform modes, update regions, the panel refresh handshake. |
-| `fb` | Mapping `/dev/fb0`, reading the panel geometry and pixel format. |
-| `input` | Touch events via evdev. |
-| `render` | Text and shapes into the framebuffer. |
-| `time` | The wall clock, without a date/time crate. |
-| `shell` | Screens, transitions and update scheduling. |
+## Fast development
 
-### Why the ABI is spelled out by hand
-
-The EPDC ioctl numbers encode the *size* of their argument struct, so a
-mismatch between our layout and the kernel's is not a compile error - it is an
-`ENOTTY` at runtime. The structs are therefore `#[repr(C)]` mirrors of the
-kernel's `include/linux/mxcfb.h`, and their sizes and offsets are asserted in
-tests against values measured from the real header.
-
-Two details that are easy to get wrong, and that the tests pin down:
-
-* `struct mxcfb_update_data` in the 2.6.31 kernel is **72 bytes** and still
-  carries the Lab126 `hist_bw_waveform_mode` / `hist_gray_waveform_mode`
-  fields. Later kernels dropped them and use different struct sizes, hence
-  different ioctl numbers.
-* `struct fb_fix_screeninfo` contains two `unsigned long` fields, so it is
-  **68 bytes on the 32-bit ARM target** and 80 on a 64-bit host. We spell them
-  as `u32` so the layout matches the target.
-
-### Two device quirks that matter
-
-* **The panel is inverted grayscale.** At 8bpp, `0` is black and `0xFF` is
-  white. The driver flips the PxP LUT internally, so we write the panel's
-  native encoding directly.
-* **The waveform table starts out zeroed.** The driver maps the waveform we
-  request through a table that we must install with
-  `MXCFB_SET_WAVEFORM_MODES`. Without it, asking for `GC16` resolves to mode 0
-  (`INIT`), which flashes the whole panel to white on every update.
-
-### Touch coordinates need no correction
-
-The `cyttsp` driver reports raw controller values with no rescaling, and on
-the Paperwhite 1 they already land in the framebuffer's coordinate space:
-the panel is 758x1024 portrait and the touch axes are X 0..758, Y 0..1024.
-No axis swap or inversion is needed - which is the opposite of the Kindle
-Touch, whose 600x800 panel *does* need one.
-
-### The frontlight is a character device
-
-Not a sysfs `brightness` node. On the Paperwhite 1 it is a misc device,
-`/dev/yoshime_fl` (minor 162), driven by the ioctls in
-`include/linux/yoshime_fl.h`. The same driver exposes an `fl_intensity`
-attribute under the `fl_tps6116x` sysfs class, which we fall back to.
-
-## Deploying
-
-kindil is a single static binary. Two ways to run it:
-
-### As a KUAL extension, alongside Amazon's UI
-
-```bash
-nix build .#packages.armv7l-linux.kindil
-./scripts/make-kual-extension.sh
-```
-
-That writes a KUAL extension (a `config.xml` plus the binary) to
-`result/kual-extension/`. Copy it onto the Kindle's user partition:
-
-```bash
-cp -r result/kual-extension/kindil /mnt/us/extensions/
-chmod 755 /mnt/us/extensions/kindil/kindil
-```
-
-It then appears in the KUAL menu.
-
-### As PID 1, replacing the Kindle OS
-
-```bash
-nix build .#packages.armv7l-linux.kindil
-./scripts/make-initramfs.sh
-```
-
-That writes a minimal initramfs whose `/sbin/init` is kindil. Boot it with
-`kexec`:
+Both repositories are private; use an account/SSH key with access:
 
 ```sh
-kexec -l /boot/uImage \
-  --initrd=/mnt/us/initramfs.cpio.gz \
-  --append='root=/dev/ram0 rootfstype=ramfs rdinit=/sbin/init'
+git clone --recurse-submodules git@github.com:sharno/kindil.git
+cd kindil
+nix develop
+
+scripts/dev.sh sim       # actual Slint screens → dist/sim/*.ppm (+ PNG with ffmpeg)
+scripts/dev.sh desktop   # interactive software-rendered desktop window
+scripts/dev.sh check     # host tests, formatting, clippy
+scripts/dev.sh test-arm  # run actual ARM test binaries under qemu-arm
+scripts/dev.sh device    # experimental static ARM binary → dist/kindil
 ```
 
-This is the shape Quill OS uses on the same hardware family.
+The flake uses official **prebuilt Rust + ARM musl std** and a cached **Zig**
+compiler/linker. It does not build cross GCC/rustc from source. Cargo caches the
+first Slint/library compilation; subsequent UI edits rebuild the application.
+`nix build .#kindil` builds the host package; `nix build .#kindil-device` builds
+the pinned device binary. Do not use the old `packages.armv7l-linux.kindile`
+attribute or stale manually selected GCC paths.
 
-## Licence
+For plain Cargo, Rust ≥1.92 and the ARM musl target are required. The Nix shell
+supplies the pinned toolchain, link driver, QEMU and archive tools.
 
-MIT - see [LICENSE](LICENSE). The bundled 8x8 font (`src/font.rs`) is in the
-public domain, from <https://github.com/dhepper/font8x8>.
+## Use
+
+```sh
+cargo run -- --preview dist/preview --config examples/kindil.toml --books examples/books
+cargo run --features desktop -- --desktop --config examples/kindil.toml --books examples/books
+# Only after emulator/hardware compatibility checks and a recovery plan:
+# ./kindil --kindle --config /mnt/us/kindil.toml
+```
+
+`examples/miqat.toml` is Miqat's example, **not your personal configuration**.
+Use `miqat_config` in Kindil's TOML (or `--miqat-config FILE`) to select the
+current Miqat configuration. Previews use fixture weather and make no requests.
+Desktop/device Miqat mode fetches weather/radar as the existing Miqat engine does.
+Missing configuration is shown as an error, never silently replaced by another
+city's prayer times. The clock dashboard has its own explicit timezone setting.
+
+### Reader, files and controls
+
+- The library lists up to 256 regular `.txt`/`.epub` files in the configured
+  `books` directory, without following symlinks or scanning system directories.
+- Open a book, turn pages, and use **Aa / ☀** for font-size and brightness
+  sliders. Font changes repaginate; the reader can scroll a page as needed.
+  These preferences are currently session-local.
+- Preview brightness is explicitly simulated. Hardware control queries the
+  PW1 driver's maximum first, clamps percentages to that range and debounces
+  writes. If discovery/read/write fails, the slider is disabled. The tiny
+  `/dev/yoshime_fl` adapter is the only project-owned device ioctl surface.
+- **⋮** opens rename/Trash actions. Trash requires confirmation, retains bytes
+  in `.kindil-trash`, and supports undo of the last move. Existing files are
+  never overwritten. No recursive deletion or filesystem formatting exists.
+- Wi-Fi search/connect uses wpa_supplicant's control socket on a worker thread.
+  WPA2 passphrases are not logged; interactive credentials are session-local.
+  Previews do not launch daemons. On-device touch typing is a future task;
+  a physical keyboard/SSH config is needed where Slint has no virtual keyboard.
+
+## Standalone runtime (not boot-validated)
+
+`scripts/make-initramfs.sh RUNTIME_OVERLAY NEW_OUTPUT.cpio.gz` only stages an
+experimental **RAM image**. It refuses missing helpers, wrong-architecture or
+dynamically linked binaries, absent SSH authorized keys, and existing outputs.
+It neither downloads random helper executables nor writes a device partition.
+
+The overlay must provide matching static ARM BusyBox (`/bin/sh`, `ip`, udhcpc),
+Dropbear, wpa_supplicant, account files, SSH host keys/authorized_keys, your
+`/etc/kindil.toml`, Miqat config and any books. Exact kernel modules, panel
+waveforms, firmware, Wi-Fi board calibration and storage mounts are **not**
+guessed or provisioned by this project. A valid archive alone does not prove
+that those prerequisites exist or that the OS boots.
+
+PID 1 mounts proc/sysfs/devtmpfs (static-node fallback), devpts and volatile
+runtime directories, supervises services and reaps orphans. It does not mount
+or rewrite eMMC partitions. Fatal startup errors leave PID 1 alive for serial
+diagnosis rather than deliberately panicking the kernel.
+
+SSH is reachable only once networking, accounts, PTYs, keys and compatible
+helper binaries are present. No default password is supplied. Syncthing is
+optional/off by default; no claim of PW1 compatibility or memory usage is made.
+
+## Hardware validation boundary
+
+1. Host Slint rendering/UI tests: safe, no hardware involved.
+2. ARM tests under `qemu-arm`: validate instruction/ABI behavior on the host's
+   kernel, **not** EPDC, old-kernel syscalls, boot, Wi-Fi or suspend behavior.
+3. Full-system testing: use [eink-emulator](https://github.com/katadelos/eink-emulator)
+   with the **PW1/Celeste** model and an owned firmware image. It needs a patched
+   QEMU; its upstream currently does not publish a ready-made release binary.
+4. Only then consider a reversible, RAM-only boot on real hardware, with tested
+   recovery. Do not flash eMMC/bootloader or copy another model's waveforms.
+
+Modern Rust/musl libraries can assume a newer Linux than the PW1's 2.6.31. The
+linker targets that kernel version, but this does **not** remove every library's
+minimum-kernel requirement. This remains a release blocker until a matching
+full-system boot is tested. No guarantee against bricking is possible.
+
+Deep suspend/RTC wake is deliberately **not enabled**. Sleeping in an event loop
+is not suspend-to-RAM, and continuous Wi-Fi/SSH/sync prevents e-reader-like
+battery-life claims. Battery-mode scheduling must be validated against recovery,
+RTC wake and actual power measurements; plugged-in dashboard use is the initial
+target.
+
+## Licensing
+
+Project-owned code is MIT. Dependencies retain their own licenses: in particular
+Slint has GPL/commercial/other alternative terms which must be reviewed before
+distributing an embedded product. See `THIRD_PARTY.md`, the pinned crate licenses,
+and the font license files. The old public-domain bitmap font was removed.

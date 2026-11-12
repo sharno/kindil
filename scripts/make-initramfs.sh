@@ -1,64 +1,56 @@
 #!/usr/bin/env bash
-#
-# Build a minimal initramfs that runs kindil as PID 1, replacing the Kindle OS.
-#
-# The kernel's command line then needs:
-#
-#   root=/dev/ram0 rootfstype=ramfs rdinit=/sbin/init
-#
-# which is what Quill OS does for the same hardware family. Boot it with
-# `kexec` from the stock firmware, or from the U-Boot prompt.
-#
-# kindil mounts devtmpfs on /dev and creates the device nodes itself when it is
-# started with `--init`, so the initramfs does not need udev.
-#
-# Usage: scripts/make-initramfs.sh [OUTPUT_DIR]
-
+# Stage an EXPERIMENTAL RAM-only userspace image. Never installs or flashes it.
+# Usage: make-initramfs.sh RUNTIME_OVERLAY OUTPUT.cpio.gz
+# Supply a matched PW1 runtime, including prebuilt static helper binaries,
+# modules/firmware and SSH authorized_keys. This script does not download
+# arbitrary executable binaries or guess kernel/module/partition identities.
 set -euo pipefail
-
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-readonly OUT_DIR="${1:-$PROJECT_DIR/result/initramfs}"
-
-for candidate in "$PROJECT_DIR/dist/kindil" "$PROJECT_DIR/result/bin/kindil"; do
-	if [[ -x "$candidate" ]]; then
-		readonly BINARY="$candidate"
-		break
-	fi
+project=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+[[ $# == 2 ]] || { echo "usage: $0 RUNTIME_OVERLAY NEW_OUTPUT.cpio.gz" >&2; exit 1; }
+runtime=$(realpath "$1")
+output=$(realpath -m "$2")
+[[ ! -e "$output" && ! -L "$output" ]] || { echo "refusing to overwrite $output" >&2; exit 1; }
+[[ -x "$project/dist/kindil" ]] || { echo 'run scripts/dev.sh device first' >&2; exit 1; }
+for tool in bin/busybox sbin/dropbear sbin/wpa_supplicant sbin/udhcpc bin/sh; do
+    [[ -f "$runtime/$tool" || -L "$runtime/$tool" ]] || { echo "runtime missing $tool" >&2; exit 1; }
 done
-if [[ -z "${BINARY:-}" ]]; then
-	echo "error: no device binary found." >&2
-	echo "Build it first: scripts/dev.sh device (or nix build .#packages.armv7l-linux.kindil)" >&2
-	exit 1
-fi
-
-rm -rf "$OUT_DIR"
-mkdir -p "$OUT_DIR/sbin" "$OUT_DIR/dev" "$OUT_DIR/proc" "$OUT_DIR/sys" "$OUT_DIR/tmp" "$OUT_DIR/etc"
-
-install -m755 "$BINARY" "$OUT_DIR/sbin/init"
-
-# kindil reads the timezone from $TZ, /etc/TZ or /etc/localtime. There is no tz
-# database here, so the POSIX string is the only option; adjust it as needed.
-printf 'UTC0\n' >"$OUT_DIR/etc/TZ"
-
-# The kernel needs the mount points to exist; kindil mounts devtmpfs itself.
-chmod 1777 "$OUT_DIR/tmp"
-
-readonly ARCHIVE="$OUT_DIR.cpio.gz"
-if command -v cpio >/dev/null 2>&1 && command -v gzip >/dev/null 2>&1; then
-	(cd "$OUT_DIR" && find . | cpio -o -H newc 2>/dev/null | gzip -9) >"$ARCHIVE"
-	echo "initramfs written to $OUT_DIR"
-	echo "gzipped cpio:      $ARCHIVE"
-else
-	echo "initramfs tree written to $OUT_DIR"
-	echo "(install cpio and gzip to produce the .cpio.gz automatically)"
-fi
-
-echo
-echo "To boot it:"
-echo "  1. Copy the tree onto the device, e.g. as /mnt/us/initramfs"
-echo "  2. From a root shell on the Kindle:"
-echo "       kexec -l <kernel> --initrd=<initramfs.cpio.gz> --append='root=/dev/ram0 rootfstype=ramfs rdinit=/sbin/init'"
-echo
-echo "kindil notices it is PID 1 and mounts devtmpfs / creates the device nodes"
-echo "itself, so no udev or init script is needed."
+[[ -s "$runtime/root/.ssh/authorized_keys" ]] || { echo 'supply root/.ssh/authorized_keys (no default passwords)' >&2; exit 1; }
+[[ -s "$runtime/etc/kindil.toml" ]] || { echo 'supply etc/kindil.toml with YOUR Miqat config path/network settings' >&2; exit 1; }
+[[ -s "$runtime/etc/passwd" ]] || { echo 'supply compatible account files (etc/passwd)' >&2; exit 1; }
+stage=$(mktemp -d)
+trap 'rm -rf -- "$stage"' EXIT
+archive=$(mktemp "${output}.tmp.XXXXXX")
+trap 'rm -rf -- "$stage"; rm -f -- "$archive"' EXIT
+cp -a "$runtime/." "$stage/"
+# Never follow overlay symlinks when installing files or changing permissions.
+for dir in bin sbin dev proc sys run tmp mnt mnt/us mnt/us/books var var/log var/log/kindil etc etc/dropbear root root/.ssh; do
+    [[ ! -L "$stage/$dir" ]] || { echo "unsafe runtime directory symlink: $dir" >&2; exit 1; }
+done
+for file in init sbin/kindil-dhcp root/.ssh/authorized_keys; do
+    [[ ! -L "$stage/$file" ]] || { echo "unsafe runtime file symlink: $file" >&2; exit 1; }
+done
+install -m755 "$project/dist/kindil" "$stage/init"
+mkdir -p "$stage/sbin" "$stage/dev" "$stage/proc" "$stage/sys" "$stage/run" "$stage/tmp" "$stage/mnt/us/books" "$stage/var/log/kindil" "$stage/etc/dropbear"
+ln -s ../init "$stage/sbin/kindil-dhcp"
+chmod 700 "$stage/root/.ssh"
+chmod 600 "$stage/root/.ssh/authorized_keys"
+chmod 1777 "$stage/tmp"
+# Reject dynamic/wrong-architecture helper binaries rather than silently
+# producing an archive which cannot run. Follow only expected applet symlinks.
+for tool in init bin/sh bin/busybox sbin/dropbear sbin/wpa_supplicant sbin/udhcpc; do
+    path="$stage/$tool"
+    if [[ -L "$path" ]]; then
+        target=$(readlink "$path")
+        if [[ "$target" == /* ]]; then path="$stage/$target"; fi
+    fi
+    binary=$(realpath "$path")
+    [[ "$binary" == "$stage/"* ]] || { echo "unsafe runtime symlink: $tool" >&2; exit 1; }
+    [[ -x "$binary" ]] || { echo "$tool is not executable" >&2; exit 1; }
+    readelf -h "$binary" | grep -q 'Machine:.*ARM' || { echo "$tool is not ARM" >&2; exit 1; }
+    if readelf -l "$binary" | grep -q INTERP; then echo "$tool requires a dynamic loader" >&2; exit 1; fi
+done
+(cd "$stage" && find . -print0 | sort -z | cpio --quiet --null -o -H newc --owner=0:0 | gzip -n) > "$archive"
+# Atomic no-clobber publication; mktemp's 0600 mode protects bundled credentials.
+ln "$archive" "$output"
+echo "Experimental RAM image: $output"
+echo 'NOT boot-validated. Kernel drivers, exact modules/firmware, storage and recovery must be verified on PW1 before booting.'

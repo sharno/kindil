@@ -1,17 +1,44 @@
 [package]
 name = "kindil"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.92"
 description = "A single-process Rust shell for the first-generation Amazon Kindle Paperwhite"
 license = "MIT"
 publish = false
 
-# No external crates: every dependency would have to be vendored and
-# cross-compiled for the device. The C library surface we need is small and
-# declared by hand in `sys.rs`, and the ABI is checked by tests that run on the
-# real ARM target under qemu.
+# Keep application code small: delegate ABI, timezone, solar math and UI to
+# maintained libraries. Cargo.lock and the Nix flake pin the dependency graph.
 [dependencies]
+libc = "0.2"
+anyhow = "1.0"
+tz-rs = "0.7.3"
+miqat = { path = "crates/miqat" }
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.2"
+tempfile = "3.27"
+textwrap = { version = "0.16", default-features = false }
+rbook = { version = "0.7.12", default-features = false }
+zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+html2text = "0.17.4"
+slint = { version = "=1.18.1", default-features = false, features = ["std", "compat-1-18", "renderer-software"] }
+# Slint's public image-default-formats feature enables every image codec but
+# does not itself enable embedded decoding on a custom platform. Enable only
+# core decoding/SVG for standard-widget assets; keep full font shaping at runtime.
+i-slint-core = { version = "=1.18.1", default-features = false, features = ["image-decoders", "svg"] }
+slint-backend-kindle = { version = "=0.7.1", optional = true }
+# Slint's font stack must not link a host fontconfig into the ARM binary.
+fontique = { version = "0.11", default-features = false, features = ["std", "fontconfig-dlopen"] }
+fontdb = { version = "0.24", default-features = false, features = ["std", "fs", "memmap"] }
+
+[features]
+default = []
+desktop = ["slint/backend-winit"]
+kindle = ["dep:slint-backend-kindle"]
+
+[build-dependencies]
+slint-build = "=1.18.1"
 
 [profile.release]
 opt-level = "z"

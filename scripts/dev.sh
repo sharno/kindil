@@ -2,14 +2,9 @@
 #
 # The development loop for kindil.
 #
-# The interesting command is `device`: it cross-compiles the real ARM binary in
-# a few seconds, using rustup's prebuilt `armv7-unknown-linux-musleabihf` std and
-# a cached Nix cross GCC purely as the link driver. (Rust's musl targets are
-# self-contained, so the driver's own libc is never used.)
-#
-# `nix build .#packages.armv7l-linux.kindil` is the reproducible build, but it
-# compiles a dedicated static cross GCC the first time, which takes most of an
-# hour. Use it for releases, not for iteration.
+# Both build paths use prebuilt Rust/ARM std and cached Zig, not a source-built
+# cross toolchain. First Slint builds take longer; incremental work reuses Cargo
+# artifacts. `nix build .#kindil-device` is the pinned release build.
 #
 # Usage: scripts/dev.sh <command>
 #
@@ -17,8 +12,7 @@
 #   test-arm    run the test suite on the ARM target under qemu-arm
 #   device      build dist/kindil (static ARMv7 musl)
 #   sim         render the screens to dist/sim/*.png
-#   kual        package the KUAL extension into dist/
-#   initramfs   package an initramfs tree into dist/
+#   desktop     interactive Slint preview (never opens Kindle devices)
 #   fmt         format the Rust and Nix sources
 #   check       test + clippy + fmt --check
 #   help        this text
@@ -36,31 +30,27 @@ die() {
 	exit 1
 }
 
-# The cross GCC used as a link driver for the device build.
+# Resolve the current flake's musl-aware link driver; do not reuse a stale cache
+# path after changing toolchains.
 arm_linker() {
 	if [[ -n "${ARM_CC:-}" ]]; then
 		printf '%s' "$ARM_CC"
 		return
 	fi
-	local cached="$PROJECT_DIR/.cache/arm-cc"
-	if [[ -s "$cached" ]]; then
-		cat "$cached"
-		return
-	fi
 	local out cc
-	out=$(nix eval --raw ".#armv7-linker.outPath" 2>/dev/null || true)
+	out=$(nix eval --raw ".#armv7-linker.outPath")
 	cc="$out/bin/armv7l-unknown-linux-gnueabihf-gcc"
+	if [[ ! -x "$cc" ]]; then nix build --no-link .#armv7-linker >&2; fi
 	[[ -x "$cc" ]] || die "no ARM link driver; run 'nix build .#armv7-linker' or set ARM_CC"
-	mkdir -p "$(dirname "$cached")"
-	printf '%s' "$cc" >"$cached"
 	printf '%s' "$cc"
 }
 
 device_build() {
 	local cc
 	cc=$(arm_linker)
-	RUSTFLAGS="-C linker=$cc -C target-feature=+crt-static" \
-		cargo build --release --target "$TARGET"
+	export CC_armv7_unknown_linux_musleabihf="$cc"
+	RUSTFLAGS="-C linker=$cc -C target-feature=+crt-static -C link-self-contained=no" \
+		cargo build --locked --release --features kindle --target "$TARGET"
 	mkdir -p "$DIST"
 	install -m755 "target/$TARGET/release/kindil" "$DIST/kindil"
 
@@ -74,10 +64,10 @@ device_build() {
 
 sim() {
 	mkdir -p "$DIST/sim"
-	cargo run --quiet -- --sim "$DIST/sim"
+	cargo run --quiet -- --preview "$DIST/sim" --config examples/kindil.toml --books examples/books
 	if command -v ffmpeg >/dev/null 2>&1; then
-		for pgm in "$DIST"/sim/*.pgm; do
-			ffmpeg -loglevel error -y -i "$pgm" "${pgm%.pgm}.png"
+		for pgm in "$DIST"/sim/*.ppm; do
+			ffmpeg -loglevel error -y -i "$pgm" "${pgm%.ppm}.png"
 		done
 		echo "PNGs in $DIST/sim"
 	else
@@ -88,9 +78,10 @@ sim() {
 arm_tests() {
 	local cc
 	cc=$(arm_linker)
-	RUSTFLAGS="-C linker=$cc -C target-feature=+crt-static" \
+	export CC_armv7_unknown_linux_musleabihf="$cc"
+	RUSTFLAGS="-C linker=$cc -C target-feature=+crt-static -C link-self-contained=no" \
 		CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUNNER=qemu-arm \
-		cargo test --target "$TARGET"
+		cargo test --locked --target "$TARGET"
 }
 
 case "${1:-help}" in
@@ -98,8 +89,7 @@ test) cargo test ;;
 test-arm) arm_tests ;;
 device) device_build ;;
 sim) sim ;;
-kual) device_build && ./scripts/make-kual-extension.sh "$DIST/kual" ;;
-initramfs) device_build && ./scripts/make-initramfs.sh "$DIST/initramfs" ;;
+desktop) cargo run --features desktop -- --desktop --config examples/kindil.toml --books examples/books ;;
 fmt)
 	cargo fmt
 	nix fmt
@@ -109,5 +99,6 @@ check)
 	cargo clippy --all-targets -- -D warnings
 	cargo test
 	;;
-help | *) sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//' ;;
+help) sed -n '3,23p' "$0" | sed 's/^# \{0,1\}//' ;;
+*) die "unknown command: $1" ;;
 esac

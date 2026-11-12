@@ -1,0 +1,9 @@
+dashboard = "miqat"
+miqat_config = "examples/miqat.toml"
+books = "examples/books"
+timezone = "UTC0"
+interface = "wlan0"
+ssh = true
+sync = false
+# wifi_ssid = "your-home"
+# wifi_psk = "your-passphrase"

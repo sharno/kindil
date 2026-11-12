@@ -1,58 +1,60 @@
 name: CI
-
 on:
   push:
     branches: [main]
   pull_request:
-
+  workflow_dispatch:
+permissions:
+  contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
-  host:
-    name: Host build, tests and lint
+  check:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      matrix:
+        kind: [host, arm]
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v27
-
-      - uses: cachix/install-nix-action@v27
+      - name: Read pinned Miqat revision
+        id: miqat
+        run: echo "rev=$(git ls-tree HEAD crates/miqat | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+      - name: Fetch private Miqat library with its dedicated read-only key
+        uses: actions/checkout@v4
         with:
-          name: kindil
-
-      - name: Build and run the unit tests
-        run: nix build .#checks.x86_64-linux.kindil-tests
-
-      - name: Check formatting
-        run: nix fmt -- --fail-on-change
-
-      - name: Clippy
-        run: nix develop --command cargo clippy --all-targets -- -D warnings
-
-  device:
-    name: Static ARMv7 musl binary
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v27
-
-      - uses: cachix/install-nix-action@v27
+          repository: sharno/miqat
+          ref: ${{ steps.miqat.outputs.rev }}
+          path: crates/miqat
+          ssh-key: ${{ secrets.MIQAT_READ_KEY }}
+          persist-credentials: false
+      - run: git submodule init
+      - uses: DeterminateSystems/nix-installer-action@v27
+      - uses: Swatinem/rust-cache@v2
         with:
-          name: kindil
-
-      - name: Build the device binary
-        run: nix build .#packages.armv7l-linux.kindil
-
-      - name: Check that the binary is a static ARM executable
+          key: ${{ matrix.kind }}
+      - name: Host regression and lint
+        if: matrix.kind == 'host'
         run: |
-          binary=$(nix build .#packages.armv7l-linux.kindil --no-link --print-out-paths)/bin/kindil
-          readelf -h "$binary" | grep -E "Class|Machine"
-          readelf -l "$binary" | grep -q INTERP && {
-            echo "error: the binary is dynamically linked"; exit 1;
-          }
-          echo "static ARM binary: ok"
+          nix flake check --no-build
+          nix develop --command bash -euo pipefail -c '
+            cargo fmt --check
+            cargo test --locked
+            cargo clippy --locked --all-targets --features kindle -- -D warnings
+          '
+      - name: ARM runtime tests and static device artifact
+        if: matrix.kind == 'arm'
+        run: |
+          nix develop --command bash -euo pipefail -c '
+            scripts/dev.sh test-arm
+            scripts/dev.sh device
+            qemu-arm dist/kindil --version
+            bash scripts/test-initramfs.sh
+          '
+      - uses: actions/upload-artifact@v4
+        if: matrix.kind == 'arm'
+        with:
+          name: kindil-arm-experimental
+          path: dist/kindil
