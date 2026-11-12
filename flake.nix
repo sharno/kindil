@@ -107,9 +107,7 @@
 
       # A formatter per host system. Nix expects `formatter.<system>` to be a
       # derivation.
-      formatter = nixpkgs.lib.genAttrs hostSystems (
-        system: nixpkgs.legacyPackages.${system}.nixfmt-tree
-      );
+      formatter = nixpkgs.lib.genAttrs hostSystems (system: nixpkgs.legacyPackages.${system}.nixfmt-tree);
     in
     {
       packages = hostPackages // {
@@ -125,24 +123,23 @@
         ${armv7System}.kindile = armv7Package;
 
         # Run the unit tests on the host.
-        x86_64-linux.kindile-tests =
-          nixpkgs.legacyPackages.x86_64-linux.rustPlatform.buildRustPackage {
-            pname = "kindile-tests";
-            version = "0.1.0";
-            src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
-            buildAndInstallSubcommand = "cargo";
-            buildPhase = ''
-              runHook preBuild
-              cargo test --offline
-              runHook postBuild
-            '';
-            installPhase = ''
-              runHook preInstall
-              touch $out
-              runHook postInstall
-            '';
-          };
+        x86_64-linux.kindile-tests = nixpkgs.legacyPackages.x86_64-linux.rustPlatform.buildRustPackage {
+          pname = "kindile-tests";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+          buildAndInstallSubcommand = "cargo";
+          buildPhase = ''
+            runHook preBuild
+            cargo test --offline
+            runHook postBuild
+          '';
+          installPhase = ''
+            runHook preInstall
+            touch $out
+            runHook postInstall
+          '';
+        };
       };
 
       inherit devShells;
