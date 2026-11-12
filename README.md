@@ -98,6 +98,13 @@ the panel is 758x1024 portrait and the touch axes are X 0..758, Y 0..1024.
 No axis swap or inversion is needed - which is the opposite of the Kindle
 Touch, whose 600x800 panel *does* need one.
 
+### The frontlight is a character device
+
+Not a sysfs `brightness` node. On the Paperwhite 1 it is a misc device,
+`/dev/yoshime_fl` (minor 162), driven by the ioctls in
+`include/linux/yoshime_fl.h`. The same driver exposes an `fl_intensity`
+attribute under the `fl_tps6116x` sysfs class, which we fall back to.
+
 ## Deploying
 
 kindile is a single static binary. Two ways to run it:
@@ -139,9 +146,5 @@ This is the shape Quill OS uses on the same hardware family.
 
 ## Licence
 
-MIT. The bundled 8x8 font (`font.rs`) is public domain, from
-<https://github.com/dhepper/font8x8>.
-
-## Licence
-
-MIT - see [LICENSE](LICENSE). The bundled 8x8 font is public domain.
+MIT - see [LICENSE](LICENSE). The bundled 8x8 font (`src/font.rs`) is in the
+public domain, from <https://github.com/dhepper/font8x8>.
