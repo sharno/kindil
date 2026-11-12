@@ -340,16 +340,23 @@ fn every_printable_ascii_key_exists() {
 }
 
 #[test]
-fn lists_move_a_page_per_swipe_without_redrawing_mid_drag() {
+fn lists_follow_the_swipe_with_few_panel_updates() {
     use slint::platform::{PointerEventButton, WindowAdapter, WindowEvent};
     let f = Fixture::new(Arc::new(Simulated::default()));
     f.tap(SETTINGS_TAB, TAB_Y);
-    let before = pixels(&f.window);
     let at = |y| slint::LogicalPosition::new(380.0, y);
     let send = |event| {
         f.window.window().dispatch_event(event);
         slint::platform::update_timers_and_animations();
     };
+    // The list, left of the scroll bar, below the header.
+    let list = |frame: &[slint::Rgb8Pixel], y: usize| frame[y * 758..y * 758 + 740].to_vec();
+    let bar = |frame: &[slint::Rgb8Pixel]| {
+        (152..932)
+            .map(|y| frame[y * 758 + 740..y * 758 + 758].to_vec())
+            .collect::<Vec<_>>()
+    };
+    let before = pixels(&f.window);
     send(WindowEvent::PointerPressed {
         position: at(800.0),
         button: PointerEventButton::Left,
@@ -357,21 +364,33 @@ fn lists_move_a_page_per_swipe_without_redrawing_mid_drag() {
     [700.0, 550.0, 400.0]
         .into_iter()
         .for_each(|y| send(WindowEvent::PointerMoved { position: at(y) }));
+    let moving = pixels(&f.window);
     assert!(
-        pixels(&f.window) == before,
-        "an e-ink panel must not redraw while the finger moves"
+        (152..932).all(|y| list(&moving, y) == list(&before, y)),
+        "the list must not redraw on every finger movement"
+    );
+    assert!(
+        bar(&moving) != bar(&before),
+        "the scroll bar follows the finger"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(450));
+    let caught_up = pixels(&f.window);
+    assert!(
+        (152..532).all(|y| list(&caught_up, y) == list(&before, y + 400)),
+        "the list catches up with the finger while it is down"
     );
     send(WindowEvent::PointerReleased {
         position: at(400.0),
         button: PointerEventButton::Left,
     });
+    let after = pixels(&f.window);
     assert!(
-        pixels(&f.window) != before,
-        "release moves to the next page"
+        (152..532).all(|y| list(&after, y) == list(&before, y + 400)),
+        "release settles the list where the finger lifted"
     );
     drag(&f.window, 380.0, 300.0, 800.0);
     assert!(
         pixels(&f.window) == before,
-        "swiping down returns to the first page"
+        "swiping back down returns to the top"
     );
 }

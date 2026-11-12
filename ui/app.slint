@@ -105,7 +105,7 @@ export global Kindil {
     in-out property <bool> notice-undo: false;
 
     callback navigated(Page);
-    /// A list moved by a page.
+    /// A list moved by a swipe.
     callback scrolled();
     callback choose-dashboard(DashboardKind);
     callback open-book(int);
@@ -403,49 +403,71 @@ component ProgressBar {
     }
 }
 
-/// A list that moves a page at a time. Nothing moves while the finger drags;
-/// on release the panel updates once. A scrolling Flickable redraws on every
-/// finger movement and animates a fling, and each frame is an e-ink update.
-component Paged inherits Rectangle {
+/// A list moved by swiping, drawn for e-ink. Redrawing the list on every finger
+/// movement floods the panel with updates, so while the finger is down only the
+/// scroll bar follows it (a thin strip, cheap to update), the list catches up a
+/// few times a second, and it settles where the finger lifts.
+component SwipeScroll inherits Rectangle {
     in property <length> content-height;
-    in-out property <int> page: 0;
-    callback turned();
-    // A tenth of the previous page stays visible, for context.
-    property <length> step: max(1px, root.height * 0.9);
-    property <int> pages: root.content-height <= root.height
-        ? 1 : 1 + ceil((root.content-height - root.height) / root.step);
-    property <length> offset: min(root.page * root.step, max(0px, root.content-height - root.height));
+    in-out property <length> offset: 0;
+    /// The swipe ended and the list settled.
+    callback moved();
+    property <length> max-offset: max(0px, root.content-height - root.height);
+    // Clamped here too, so a list that shrinks never shows empty space.
+    property <length> shown: min(root.offset, root.max-offset);
+    // Where the list sat when the finger went down.
+    property <length> start;
+    // Where the finger puts the list now.
+    property <length> target: clamp(
+        root.start + touch.pressed-position.y - touch.current-position.y,
+        0px, root.max-offset);
     clip: true;
-    SwipeGestureHandler {
-        handle-swipe-up: root.page < root.pages - 1;
-        handle-swipe-down: root.page > 0;
-        swiped => {
-            if self.current-position.y < self.pressed-position.y {
-                root.page += 1;
-            } else {
-                root.page -= 1;
+    touch := SwipeGestureHandler {
+        handle-swipe-up: root.shown < root.max-offset;
+        handle-swipe-down: root.shown > 0;
+        // The first movement of a swipe anchors it.
+        moved => {
+            if !root.dragging {
+                root.start = root.shown;
+                root.dragging = true;
             }
-            root.turned();
+        }
+        swiped => {
+            root.offset = root.target;
+            root.dragging = false;
+            root.moved();
+        }
+        cancelled => {
+            root.offset = root.start;
+            root.dragging = false;
         }
         Rectangle {
-            y: -root.offset;
+            y: -root.shown;
             height: root.content-height;
             @children
         }
     }
-    // Where this page sits in the list; only changes on a page turn.
-    if root.pages > 1: Rectangle {
-        x: parent.width - 7px;
+    property <bool> dragging;
+    // Each catch-up is one partial panel update; faster turns into a smear.
+    Timer {
+        interval: 400ms;
+        running: root.dragging;
+        triggered => { root.offset = root.target; }
+    }
+    // Where the view sits in the list. Darker and wider while the finger is
+    // down, and following it live: the cue that the list is moving.
+    if root.max-offset > 0: Rectangle {
+        x: parent.width - (root.dragging ? 10px : 7px);
         y: 8px;
-        width: 4px;
+        width: root.dragging ? 7px : 4px;
         height: parent.height - 16px;
-        border-radius: 2px;
+        border-radius: self.width / 2;
         background: Theme.surface;
         Rectangle {
-            y: parent.height * min(root.page, root.pages - 1) / root.pages;
-            height: parent.height / root.pages;
-            border-radius: 2px;
-            background: Theme.ink-2;
+            y: parent.height * (root.dragging ? root.target : root.shown) / root.content-height;
+            height: parent.height * root.height / root.content-height;
+            border-radius: parent.border-radius;
+            background: root.dragging ? Theme.ink : Theme.ink-2;
         }
     }
 }
@@ -807,10 +829,10 @@ component LibraryPage {
                 horizontal-alignment: center;
             }
         }
-        if Kindil.books.length > 0: Paged {
+        if Kindil.books.length > 0: SwipeScroll {
             vertical-stretch: 1;
             content-height: list.preferred-height;
-            turned => { Kindil.scrolled(); }
+            moved => { Kindil.scrolled(); }
             list := VerticalLayout {
                 width: parent.width;
                 alignment: start;
@@ -916,12 +938,12 @@ component ReaderPage {
                 }
             }
         // Pagination plans conservatively; if a page still overflows, swipe up.
-        pager := Paged {
+        pager := SwipeScroll {
             width: parent.width;
             height: parent.height;
             content-height: max(self.height, body.preferred-height + 40px);
             property <string> text: Kindil.book-text;
-            changed text => { self.page = 0; }
+            changed text => { self.offset = 0; }
             // Classic e-reader zones: the left third goes back, the rest forward.
             TouchArea {
                 clicked => {
@@ -1033,10 +1055,10 @@ component Group {
 component SettingsPage {
     VerticalLayout {
         PageHeader { title: "Settings"; trailing: Kindil.version; }
-        Paged {
+        SwipeScroll {
             vertical-stretch: 1;
             content-height: content.preferred-height;
-            turned => { Kindil.scrolled(); }
+            moved => { Kindil.scrolled(); }
             content := VerticalLayout {
                 width: parent.width;
                 alignment: start;
@@ -1220,10 +1242,10 @@ component NetworksPage {
             height: 32px;
             vertical-alignment: center;
         }
-        Paged {
+        SwipeScroll {
             vertical-stretch: 1;
             content-height: rows.preferred-height;
-            turned => { Kindil.scrolled(); }
+            moved => { Kindil.scrolled(); }
             rows := VerticalLayout {
                 width: parent.width;
                 alignment: start;
