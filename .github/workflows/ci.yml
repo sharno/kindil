@@ -27,7 +27,7 @@ jobs:
         run: nix build .#checks.x86_64-linux.kindile-tests
 
       - name: Check formatting
-        run: nix fmt -- --check
+        run: nix fmt -- --fail-on-change
 
       - name: Clippy
         run: nix develop --command cargo clippy --all-targets -- -D warnings
