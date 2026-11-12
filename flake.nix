@@ -62,12 +62,14 @@
             common
             // {
               pname = "kindil-device";
-              cargoBuildFlags = [
-                "--target"
-                target
-                "--features"
-                "kindle"
-              ];
+              # The native buildRustPackage hook always adds its host --target.
+              # Adding another target builds BOTH and applies the ARM linker to
+              # the native executable too. Select only the prebuilt ARM target.
+              buildPhase = ''
+                runHook preBuild
+                cargo build --locked --offline --release --target ${target} --features kindle --jobs "$NIX_BUILD_CORES"
+                runHook postBuild
+              '';
               RUSTFLAGS = "-C linker=${linker}/bin/armv7l-unknown-linux-gnueabihf-gcc -C target-feature=+crt-static -C link-self-contained=no";
               CC_armv7_unknown_linux_musleabihf = "${linker}/bin/armv7l-unknown-linux-gnueabihf-gcc";
               preBuild = ''
@@ -77,6 +79,9 @@
                 export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
               '';
               doCheck = false;
+              # Cargo's release profile strips the ARM binary; do not run a
+              # host-only strip tool on it during native stdenv fixup.
+              dontStrip = true;
               installPhase = ''
                 mkdir -p $out/bin
                 install -m755 target/${target}/release/kindil $out/bin/kindil
