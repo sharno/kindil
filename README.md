@@ -141,3 +141,7 @@ This is the shape Quill OS uses on the same hardware family.
 
 MIT. The bundled 8x8 font (`font.rs`) is public domain, from
 <https://github.com/dhepper/font8x8>.
+
+## Licence
+
+MIT - see [LICENSE](LICENSE). The bundled 8x8 font is public domain.

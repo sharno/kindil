@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host:
+    name: Host build, tests and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v27
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          name: kindile
+
+      - name: Build and run the unit tests
+        run: nix build .#checks.x86_64-linux.kindile-tests
+
+      - name: Check formatting
+        run: nix fmt -- --check
+
+      - name: Clippy
+        run: nix develop --command cargo clippy --all-targets -- -D warnings
+
+  device:
+    name: Static ARMv7 musl binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v27
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          name: kindile
+
+      - name: Build the device binary
+        run: nix build .#packages.armv7l-linux.kindile
+
+      - name: Check that the binary is a static ARM executable
+        run: |
+          binary=$(nix build .#packages.armv7l-linux.kindile --no-link --print-out-paths)/bin/kindile
+          readelf -h "$binary" | grep -E "Class|Machine"
+          readelf -l "$binary" | grep -q INTERP && {
+            echo "error: the binary is dynamically linked"; exit 1;
+          }
+          echo "static ARM binary: ok"
