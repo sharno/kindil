@@ -44,6 +44,7 @@ jobs:
         if: matrix.kind == 'host'
         run: |
           nix flake check --no-build
+          nix build --no-link .#kindil
           nix develop --command bash -euo pipefail -c '
             cargo fmt --check
             cargo test --locked
@@ -54,7 +55,9 @@ jobs:
         run: |
           nix develop --command bash -euo pipefail -c '
             scripts/dev.sh test-arm
-            scripts/dev.sh device
+            device=$(nix build --no-link --print-out-paths .#kindil-device)
+            mkdir -p dist
+            cp "$device/bin/kindil" dist/kindil
             qemu-arm dist/kindil --version
             bash scripts/test-initramfs.sh
           '

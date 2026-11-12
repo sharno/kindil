@@ -70,6 +70,12 @@
               ];
               RUSTFLAGS = "-C linker=${linker}/bin/armv7l-unknown-linux-gnueabihf-gcc -C target-feature=+crt-static -C link-self-contained=no";
               CC_armv7_unknown_linux_musleabihf = "${linker}/bin/armv7l-unknown-linux-gnueabihf-gcc";
+              preBuild = ''
+                # Nix's sandbox HOME is intentionally unwritable. Zig needs a
+                # writable cache for its musl/CRT artifacts as well as ring C.
+                export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
+                export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
+              '';
               doCheck = false;
               installPhase = ''
                 mkdir -p $out/bin
