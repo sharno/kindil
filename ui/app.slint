@@ -1,4 +1,6 @@
-import { Button, LineEdit, ScrollView, VerticalBox, Slider } from "std-widgets.slint";
+import { Button, LineEdit, ScrollView, VerticalBox, Slider, Palette } from "std-widgets.slint";
+import { VirtualKeyboard, VirtualKeyboardHandler } from "vendor/slint-keyboard/virtual_keyboard.slint";
+export { VirtualKeyboardHandler }
 import "../assets/DejaVuSans.ttf";
 
 export component AppWindow inherits Window {
@@ -8,6 +10,10 @@ export component AppWindow inherits Window {
     background: white;
     default-font-family: "DejaVu Sans";
     default-font-size: 22px;
+    init => { Palette.color-scheme = ColorScheme.light; }
+    out property <bool> keyboard-visible: TextInputInterface.text-input-focused;
+    callback dismiss-keyboard();
+    dismiss-keyboard => { keyboard-focus-sink.focus(); }
     in-out property <int> page: 0;
     in-out property <string> brand: "kindil · قنديل";
     in property <string> clock;
@@ -20,10 +26,12 @@ export component AppWindow inherits Window {
     in property <[string]> books;
     in property <[string]> networks;
     in property <string> network-status: "Not connected";
+    in property <bool> network-busy: false;
     in-out property <string> ssid;
     in property <string> book-title;
     in property <string> book-text;
     in property <string> book-page;
+    in-out property <length> reader-offset: 0px;
     in property <string> wifi-state: "not monitored";
     in property <string> ssh-state: "not managed";
     in property <string> sync-state: "not managed";
@@ -55,6 +63,10 @@ export component AppWindow inherits Window {
             clicked => {root.page = 4; root.controls-open = true;} }
     }
     VerticalLayout {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height - (root.keyboard-visible ? keyboard.height : 0px);
         visible: root.page != 0 || root.dashboard-mode != 0;
         padding: 28px;
         spacing: 18px;
@@ -63,7 +75,7 @@ export component AppWindow inherits Window {
             Text { text: root.status; color: black; font-size: 17px; horizontal-alignment: right; }
             Button { text: "Aa / ☀"; clicked => {root.controls-open = !root.controls-open;} }
         }
-        if root.controls-open: VerticalLayout {
+        if root.controls-open && !root.keyboard-visible: VerticalLayout {
             Text { text: "Reading font: " + round(root.reading-font-size) + " px"; color: black; }
             Slider { minimum: 16; maximum: 40; value <=> root.reading-font-size;
                 changed(value) => {root.font-size-changed(round(value));} }
@@ -82,14 +94,17 @@ export component AppWindow inherits Window {
         }
         if root.page == 1: VerticalLayout {
             Text { text: "Library — EPUB / text"; font-size: 30px; color: black; }
-            ScrollView { VerticalBox {
+            library-scroll := ScrollView { vertical-stretch: 1; mouse-drag-pan-enabled: true; content-width: self.visible-width; VerticalBox {
+                width: library-scroll.visible-width;
+                alignment: start;
                 for title[index] in root.books: HorizontalLayout {
+                    height: 60px;
                     Button { text: title; clicked => { root.open-book(index); } }
-                    Button { text: "⋮"; clicked => {root.selected-file = index; root.new-filename = title; root.confirm-trash = false;} }
+                    Button { width: 64px; text: "⋮"; clicked => {root.selected-file = index; root.new-filename = title; root.confirm-trash = false;} }
                 }
             } }
             if root.selected-file >= 0: VerticalLayout {
-                LineEdit { text <=> root.new-filename; }
+                filename-input := LineEdit { text <=> root.new-filename; placeholder-text: "New filename"; accepted => { root.dismiss-keyboard(); } }
                 HorizontalLayout {
                     Button { text: "Rename"; clicked => { root.rename-file(root.selected-file, root.new-filename); } }
                     Button { text: root.confirm-trash ? "Confirm move to Trash" : "Move to Trash"; clicked => {
@@ -102,7 +117,17 @@ export component AppWindow inherits Window {
         }
         if root.page == 2: VerticalLayout {
             Text { text: root.book-title; font-size: 28px; color: black; overflow: elide; }
-            ScrollView { Text { width: root.width - 80px; text: root.book-text; color: black; font-size: root.reading-font-size * 1px; wrap: word-wrap; } }
+            reader-scroll := ScrollView {
+                vertical-stretch: 1;
+                mouse-drag-pan-enabled: true;
+                content-width: self.visible-width;
+                content-y <=> root.reader-offset;
+                in property <string> current-page: root.book-text;
+                changed current-page => { self.content-y = 0px; }
+                VerticalBox {
+                width: reader-scroll.visible-width;
+                Text { text: root.book-text; color: black; font-size: root.reading-font-size * 1px; wrap: word-wrap; vertical-alignment: top; }
+            } }
             HorizontalLayout {
                 Button { text: "Previous"; clicked => { root.turn-page(false); } }
                 Text { text: root.book-page; color: black; horizontal-alignment: center; }
@@ -112,15 +137,18 @@ export component AppWindow inherits Window {
         if root.page == 3: VerticalLayout {
             Text { text: "Wi-Fi"; color: black; font-size: 30px; }
             Text { text: root.network-status; color: black; wrap: word-wrap; }
-            Button { text: "Search networks"; clicked => { root.scan-wifi(); } }
-            ScrollView { VerticalBox {
-                for network in root.networks: Button { text: network; clicked => { root.ssid = network; } }
-            } }
-            LineEdit { text <=> root.ssid; placeholder-text: "Network name"; }
-            password := LineEdit { input-type: InputType.password; placeholder-text: "WPA2 passphrase"; }
-            Button { text: "Connect"; clicked => {
+            Button { text: "Search networks"; enabled: !root.network-busy; clicked => { root.scan-wifi(); } }
+            ssid-input := LineEdit { text <=> root.ssid; placeholder-text: "Network name"; accepted => { password.focus(); } }
+            password := LineEdit { input-type: InputType.password; placeholder-text: "WPA2 passphrase"; accepted => { root.dismiss-keyboard(); } }
+            Button { text: "Connect"; enabled: !root.network-busy; clicked => {
                 root.connect-wifi(root.ssid, password.text);
                 password.text = "";
+                root.dismiss-keyboard();
+            } }
+            networks-scroll := ScrollView { vertical-stretch: 1; mouse-drag-pan-enabled: true; content-width: self.visible-width; VerticalBox {
+                width: networks-scroll.visible-width;
+                alignment: start;
+                for network in root.networks: Button { height: 60px; text: network; clicked => { root.ssid = network; } }
             } }
         }
         if root.page == 4: VerticalLayout {
@@ -131,12 +159,19 @@ export component AppWindow inherits Window {
             Text { text: "Settings & diagnostics"; color: black; font-size: 30px; }
             Text { text: root.settings; color: black; wrap: word-wrap; vertical-stretch: 1; }
         }
-        Rectangle { vertical-stretch: 1; }
+        if root.page == 0: Rectangle { vertical-stretch: 1; }
         HorizontalLayout {
             Button { text: "Dashboard"; clicked => { root.page = 0; } }
             Button { text: "Library"; clicked => { root.page = 1; } }
             Button { text: "Wi-Fi"; clicked => { root.page = 3; } }
             Button { text: "Settings"; clicked => { root.page = 4; } }
         }
+    }
+    keyboard-focus-sink := FocusScope { width: 0px; height: 0px; }
+    keyboard := VirtualKeyboard {
+        visible: root.keyboard-visible;
+        y: root.height - self.height;
+        height: 320px;
+        close => { root.dismiss-keyboard(); }
     }
 }

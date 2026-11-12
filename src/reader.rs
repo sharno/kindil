@@ -123,8 +123,10 @@ impl Reader {
         let mut new = Self::from_text(
             &self.title,
             &self.source,
-            (620 / (font_px.max(16))) as usize,
-            (560 / (font_px.max(16) * 3 / 2)) as usize,
+            // Textwrap estimates columns; Slint does final pixel wrapping.
+            // A Latin glyph averages roughly 0.6em, not a whole font-size.
+            (650 * 5 / (font_px.max(16) * 3)) as usize,
+            (620 / (font_px.max(16) * 3 / 2)) as usize,
         );
         new.page = ((progress * new.pages() as f64) as usize).min(new.pages() - 1);
         *self = new;

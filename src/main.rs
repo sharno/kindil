@@ -42,7 +42,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             "--help" | "-h" => {
-                println!("kindil · قنديل\n\n--preview DIR  Render Slint screens without touching hardware\n--desktop      Interactive preview (build --features desktop)\n--kindle       Experimental device UI (build --features kindle)\n--config FILE  Configuration file\n--books DIR    UTF-8 .txt library\n\nNo flashing, bootloader modification, or automatic suspend.");
+                println!("kindil · قنديل\n\n--preview DIR  Render Slint screens without touching hardware\n--desktop      Interactive preview (build --features desktop)\n--kindle       Experimental device UI (build --features kindle)\n--config FILE  Configuration file\n--miqat-config FILE  Existing Miqat configuration\n--books DIR    UTF-8 .txt / EPUB library\n\nNo flashing, bootloader modification, or automatic suspend.");
                 return Ok(());
             }
             other => return Err(format!("unknown argument: {other}").into()),
@@ -90,6 +90,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         app.window.set_controls_open(true);
         ui::preview::snapshot(&window, &dir.join("controls.ppm"))?;
+        app.window.set_controls_open(false);
+        app.window.set_page(3);
+        let _ = ui::preview::pixels(&window);
+        ui::preview::tap(&window, 140.0, 250.0);
+        ui::preview::snapshot(&window, &dir.join("keyboard.ppm"))?;
+        if !app.window.get_keyboard_visible() {
+            return Err("touch keyboard failed to open in preview".into());
+        }
+        app.window.invoke_dismiss_keyboard();
+        if app.window.get_books().row_count() > 0 {
+            app.window.set_page(1);
+            app.window.set_selected_file(0);
+            app.window.set_new_filename("renamed.txt".into());
+            ui::preview::snapshot(&window, &dir.join("file-actions.ppm"))?;
+        }
         println!("Slint software previews: {}", dir.display());
         return Ok(());
     }

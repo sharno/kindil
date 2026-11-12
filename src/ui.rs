@@ -31,6 +31,24 @@ pub fn refresh_at(ui: &AppWindow, config: &Config, unix: i64) {
 
 pub fn create(config: Config, book_dir: &Path) -> Result<App, slint::PlatformError> {
     let window = AppWindow::new()?;
+    // Reuse Slint's MIT virtual-keyboard example and route its keys through the
+    // normal input pipeline. Slint owns selection, UTF-8, password masking and
+    // cursor editing; no second text editor or input-method implementation.
+    let weak = window.as_weak();
+    window
+        .global::<VirtualKeyboardHandler>()
+        .on_key_pressed(move |key| {
+            if let Some(ui) = weak.upgrade() {
+                if key == slint::SharedString::from(slint::platform::Key::Escape) {
+                    ui.invoke_dismiss_keyboard();
+                    return;
+                }
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::KeyPressed { text: key.clone() });
+                ui.window()
+                    .dispatch_event(slint::platform::WindowEvent::KeyReleased { text: key });
+            }
+        });
     refresh_at(&window, &config, crate::time::unix_seconds());
     window.set_status("Preview / no hardware".into());
     window.set_dashboard_mode(if config.dashboard == crate::config::Dashboard::Miqat {
@@ -83,7 +101,8 @@ pub fn create(config: Config, book_dir: &Path) -> Result<App, slint::PlatformErr
             return;
         };
         match Reader::open(&path, 48, 23) {
-            Ok(book) => {
+            Ok(mut book) => {
+                book.resize_font(ui.get_reading_font_size().round().clamp(16.0, 40.0) as u32);
                 show_page(&ui, &book);
                 *book_state.borrow_mut() = Some(book);
                 ui.set_page(2);
@@ -110,6 +129,10 @@ pub fn create(config: Config, book_dir: &Path) -> Result<App, slint::PlatformErr
         let Some(ui) = weak.upgrade() else {
             return;
         };
+        if ui.get_network_busy() {
+            return;
+        }
+        ui.set_network_busy(true);
         ui.set_network_status("Searching…".into());
         let weak = weak.clone();
         let interface = interface.clone();
@@ -119,24 +142,36 @@ pub fn create(config: Config, book_dir: &Path) -> Result<App, slint::PlatformErr
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 wpa.scan_results()
             });
-            let _ = weak.upgrade_in_event_loop(move |ui| match result {
-                Ok(networks) => {
-                    ui.set_network_status(format!("{} networks found", networks.len()).into());
-                    ui.set_networks(strings(networks.into_iter().map(|n| n.ssid).collect()));
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                ui.set_network_busy(false);
+                match result {
+                    Ok(networks) => {
+                        ui.set_network_status(format!("{} networks found", networks.len()).into());
+                        ui.set_networks(strings(networks.into_iter().map(|n| n.ssid).collect()));
+                    }
+                    Err(error) => ui.set_network_status(error.to_string().into()),
                 }
-                Err(error) => ui.set_network_status(error.to_string().into()),
             });
         });
     });
     let weak = window.as_weak();
     let interface = config.interface.clone();
     window.on_connect_wifi(move |ssid, passphrase| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_network_busy() {
+            return;
+        }
+        ui.set_network_busy(true);
+        ui.set_network_status("Connecting…".into());
         let weak = weak.clone();
         let interface = interface.clone();
         std::thread::spawn(move || {
             let result = crate::wifi::open(&interface)
                 .and_then(|wpa| wpa.connect_network(&ssid, &passphrase));
             let _ = weak.upgrade_in_event_loop(move |ui| {
+                ui.set_network_busy(false);
                 ui.set_network_status(match result {
                     Ok(()) => "Connection requested; DHCP runs in standalone mode".into(),
                     Err(error) => error.to_string().into(),
@@ -408,5 +443,21 @@ pub mod preview {
             renderer.render(&mut pixels, 758);
         });
         pixels
+    }
+    /// Exercise the same pointer path the Kindle backend uses, without devices.
+    pub fn tap(window: &MinimalSoftwareWindow, x: f32, y: f32) {
+        use slint::platform::{PointerEventButton, WindowEvent};
+        let position = slint::LogicalPosition::new(x, y);
+        window.window().dispatch_event(WindowEvent::PointerPressed {
+            position,
+            button: PointerEventButton::Left,
+        });
+        window
+            .window()
+            .dispatch_event(WindowEvent::PointerReleased {
+                position,
+                button: PointerEventButton::Left,
+            });
+        slint::platform::update_timers_and_animations();
     }
 }

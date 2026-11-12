@@ -92,10 +92,18 @@ city's prayer times. The clock dashboard has its own explicit timezone setting.
 - **⋮** opens rename/Trash actions. Trash requires confirmation, retains bytes
   in `.kindil-trash`, and supports undo of the last move. Existing files are
   never overwritten. No recursive deletion or filesystem formatting exists.
+- Text fields open an on-screen keyboard adapted from Slint's MIT example.
+  Use the globe key to cycle **Latin → symbols → Arabic**, Shift for capitals
+  or alternate symbols, arrows to move the cursor, and Backspace to delete.
+  Esc, Return (where appropriate), or the down-arrow dismisses it; tapping the
+  field opens it again. The form stays above the keyboard. All printable ASCII
+  characters are available for WPA2 credentials; passwords remain masked and
+  are cleared on submission. Slint owns editing and Arabic contextual shaping.
 - Wi-Fi search/connect uses wpa_supplicant's control socket on a worker thread.
   WPA2 passphrases are not logged; interactive credentials are session-local.
-  Previews do not launch daemons. On-device touch typing is a future task;
-  a physical keyboard/SSH config is needed where Slint has no virtual keyboard.
+  Previews do not launch daemons. Repeated network actions are disabled while a
+  request is in flight. Touch typing is covered by actual pointer-event tests,
+  not just callback/property tests; physical PW1 touch remains a release gate.
 
 ## Standalone runtime (not boot-validated)
 
@@ -130,6 +138,10 @@ optional/off by default; no claim of PW1 compatibility or memory usage is made.
    QEMU; its upstream currently does not publish a ready-made release binary.
 4. Only then consider a reversible, RAM-only boot on real hardware, with tested
    recovery. Do not flash eMMC/bootloader or copy another model's waveforms.
+
+See [the release-gate checklist](docs/VALIDATION.md) for exact missing inputs,
+safe emulator preparation and the evidence still needed. No hardware milestone
+is considered complete merely because a preview, build or archive succeeds.
 
 Modern Rust/musl libraries can assume a newer Linux than the PW1's 2.6.31. The
 linker targets that kernel version, but this does **not** remove every library's
