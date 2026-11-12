@@ -1,11 +1,11 @@
-//! Software rendering into the EPDC framebuffer.
+//! Software rendering into the shadow canvas.
 //!
-//! The panel is 8-bit inverted grayscale, so we work in a single "ink" value
-//! space where `0` is black and `0xFF` is white, matching the framebuffer's
-//! native encoding. That keeps the renderer free of any colour-space
-//! conversion: what we draw is what the panel shows.
+//! The canvas is 8-bit "ink": `0` is black and `0xFF` is white, matching the
+//! panel's native inverted grayscale. The renderer therefore needs no
+//! colour-space conversion; the framebuffer layer handles the RGB565 variant at
+//! blit time.
 
-use crate::fb::Framebuffer;
+use crate::canvas::Canvas;
 use crate::font::FONT8X8_BASIC;
 
 /// Ink value for black.
@@ -18,24 +18,24 @@ pub const GLYPH_HEIGHT: u32 = 8;
 /// Width of a font cell in unscaled pixels.
 pub const GLYPH_WIDTH: u32 = 8;
 
-/// The font scale used by the shell. The panel is 1024x758 at 212 DPI, so a
-/// scale of 2 gives a 16x16 cell, which is roughly a 11pt text size.
+/// The base text scale used by the shell. On the Paperwhite's 212 DPI panel a
+/// scale of 2 gives a 16x16 cell, roughly 11 pt.
 pub const FONT_SCALE: u32 = 2;
 
-/// A text renderer bound to a framebuffer.
+/// A text renderer bound to a canvas.
 pub struct Renderer<'a> {
-    fb: &'a mut Framebuffer,
+    canvas: &'a mut Canvas,
 }
 
 impl<'a> Renderer<'a> {
-    /// Wrap a framebuffer for drawing.
-    pub fn new(fb: &'a mut Framebuffer) -> Self {
-        Renderer { fb }
+    /// Wrap a canvas for drawing.
+    pub fn new(canvas: &'a mut Canvas) -> Self {
+        Renderer { canvas }
     }
 
-    /// The framebuffer being drawn into.
-    pub fn framebuffer(&mut self) -> &mut Framebuffer {
-        self.fb
+    /// The canvas being drawn into.
+    pub fn canvas(&mut self) -> &mut Canvas {
+        self.canvas
     }
 
     /// Draw a string with the top-left corner at `(x, y)`.
@@ -52,24 +52,25 @@ impl<'a> Renderer<'a> {
 
     /// Draw a single character; returns the x coordinate after it.
     pub fn draw_char(&mut self, x: u32, y: u32, ch: char, ink: u8, scale: u32) -> u32 {
-        // The font only covers ASCII; anything else becomes a box.
+        // The font only covers ASCII; anything else becomes a hollow box.
         let glyph = if (ch as u32) < 128 {
             FONT8X8_BASIC[ch as usize]
         } else {
-            // A hollow box, drawn as the 0xNN glyph row pattern.
             [0x7e, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x7e]
         };
 
+        let scale = scale.max(1);
         for (row, bits) in glyph.iter().enumerate() {
             for col in 0..GLYPH_WIDTH {
                 if bits & (1 << col) == 0 {
                     continue;
                 }
-                for dy in 0..scale {
-                    for dx in 0..scale {
-                        self.fb
-                            .set_pixel(x + col * scale + dx, y + row as u32 * scale + dy, ink);
-                    }
+                let px = x + col * scale;
+                let py = y + row as u32 * scale;
+                if scale == 1 {
+                    self.canvas.set_pixel(px, py, ink);
+                } else {
+                    self.canvas.fill_rect(px, py, scale, scale, ink);
                 }
             }
         }
@@ -78,14 +79,10 @@ impl<'a> Renderer<'a> {
 
     /// Fill a rectangle.
     pub fn fill_rect(&mut self, x: u32, y: u32, w: u32, h: u32, ink: u8) {
-        for dy in 0..h {
-            for dx in 0..w {
-                self.fb.set_pixel(x + dx, y + dy, ink);
-            }
-        }
+        self.canvas.fill_rect(x, y, w, h, ink);
     }
 
-    /// Draw a 1-pixel-wide rectangle outline.
+    /// Draw a 1-pixel rectangle outline.
     pub fn stroke_rect(&mut self, x: u32, y: u32, w: u32, h: u32, ink: u8) {
         if w == 0 || h == 0 {
             return;
@@ -137,25 +134,39 @@ mod tests {
 
     #[test]
     fn font_glyphs_are_sane() {
-        // 'A' in the font8x8_basic font.
         assert_eq!(
             FONT8X8_BASIC['A' as usize],
             [0x0c, 0x1e, 0x33, 0x33, 0x3f, 0x33, 0x33, 0x00]
         );
-        // 'W'
         assert_eq!(
             FONT8X8_BASIC['W' as usize],
             [0x63, 0x63, 0x63, 0x6b, 0x7f, 0x77, 0x63, 0x00]
         );
-        // Space is blank, '!' is not.
         assert_eq!(FONT8X8_BASIC[' ' as usize], [0x00; 8]);
         assert_ne!(FONT8X8_BASIC['!' as usize], [0x00; 8]);
     }
 
     #[test]
-    fn all_glyph_rows_have_eight_bytes() {
-        for (i, g) in FONT8X8_BASIC.iter().enumerate() {
-            assert_eq!(g.len(), 8, "glyph {i} has wrong length");
-        }
+    fn drawing_text_dirties_only_its_box() {
+        let mut canvas = Canvas::new(40, 24);
+        let mut r = Renderer::new(&mut canvas);
+        let end = r.draw_text(4, 4, "A", BLACK, 2);
+        assert_eq!(end, 4 + 16);
+        let painted = Canvas::new(40, 24);
+        let dirty = r.canvas().diff(&painted).unwrap();
+        assert!(dirty.x >= 4 && dirty.y >= 4);
+        assert!(dirty.right() <= 20 && dirty.bottom() <= 20);
+    }
+
+    #[test]
+    fn non_ascii_is_a_box() {
+        let mut canvas = Canvas::new(24, 16);
+        let mut r = Renderer::new(&mut canvas);
+        r.draw_text(0, 0, "\u{0642}", BLACK, 1);
+        // The box is 0x7e on the top row: columns 1..=6 are inked, 0 and 7 are not.
+        assert_eq!(r.canvas().pixel(0, 0), WHITE);
+        assert_eq!(r.canvas().pixel(1, 0), BLACK);
+        assert_eq!(r.canvas().pixel(6, 0), BLACK);
+        assert_eq!(r.canvas().pixel(7, 0), WHITE);
     }
 }

@@ -1,31 +1,37 @@
 //! Touch input via evdev.
 //!
 //! The Paperwhite 1's touch controller is a Cypress `cyttsp` on I2C, driven by
-//! the lab126 `drivers/input/touchscreen/cyttsp.c`. That driver reports
-//! **protocol A** multitouch: `ABS_MT_POSITION_X`/`ABS_MT_POSITION_Y` carry
-//! the coordinates (mirrored by `ABS_X`/`ABS_Y`), `BTN_TOUCH` marks contact
-//! and release, and `ABS_MT_SLOT` selects the finger.
+//! the lab126 `drivers/input/touchscreen/cyttsp.c`. It reports **protocol A**
+//! multitouch: `ABS_MT_POSITION_X`/`ABS_MT_POSITION_Y` (mirrored by
+//! `ABS_X`/`ABS_Y`) carry the coordinates, and `BTN_TOUCH` marks contact and
+//! release. We track a single contact, which is all a tap-driven shell needs.
 //!
-//! We therefore track a single primary contact, which is all a shell needs:
-//! read `ABS_X`/`ABS_Y` while `BTN_TOUCH` is down and report the release
-//! position as a tap.
+//! # The layout that bit us
+//!
+//! `struct input_event` embeds a `struct timeval`, whose `time_t`/`suseconds_t`
+//! are 4 bytes on the ARM32 target and 8 on the x86_64 host. A struct spelled
+//! with `i64` therefore compiles and tests fine on the host at 24 bytes, while
+//! the device's kernel writes **16 bytes per event**. Every `read` then returns
+//! a short count and the old code discarded the event: touch was dead on
+//! hardware and the host tests still passed.
+//!
+//! The fields are `c_long` here, so the struct is 16 bytes on ARM32 and 24 on
+//! the host, matching each C library's `struct input_event` exactly.
 
-use crate::sys::{self, PollFd};
-use core::ffi::c_int;
+use crate::sys::{self, ioc, PollFd};
+use core::ffi::{c_int, c_long};
 
-/// `EV_ABS`
-pub const EV_ABS: u16 = 0x03;
-/// `EV_KEY`
-pub const EV_KEY: u16 = 0x01;
 /// `EV_SYN`
 pub const EV_SYN: u16 = 0x00;
+/// `EV_KEY`
+pub const EV_KEY: u16 = 0x01;
+/// `EV_ABS`
+pub const EV_ABS: u16 = 0x03;
 
 /// `ABS_X`
 pub const ABS_X: u16 = 0x00;
 /// `ABS_Y`
 pub const ABS_Y: u16 = 0x01;
-/// `ABS_MT_SLOT`
-pub const ABS_MT_SLOT: u16 = 0x2f;
 /// `ABS_MT_POSITION_X`
 pub const ABS_MT_POSITION_X: u16 = 0x35;
 /// `ABS_MT_POSITION_Y`
@@ -33,50 +39,38 @@ pub const ABS_MT_POSITION_Y: u16 = 0x36;
 /// `BTN_TOUCH`
 pub const BTN_TOUCH: u16 = 0x14a;
 
-/// `input_event` type.
-pub const EV_MAX: usize = 0x1f;
+/// `EVIOCGVERSION`
+pub const EVIOCGVERSION: sys::IoctlRequest = ioc::ior(b'E' as _, 0x01, 4);
+/// `EVIOCGID`
+pub const EVIOCGID: sys::IoctlRequest = ioc::ior(b'E' as _, 0x02, 8);
 
-/// The `input_event` structure, as the kernel defines it.
+/// `EVIOCGNAME(len)` for a 128-byte buffer.
+pub const fn eviocgname(len: u32) -> sys::IoctlRequest {
+    ioc::ior(b'E' as _, 0x06, len)
+}
+
+/// `EVIOCGBIT(ev, len)`: the bitmap of codes the device supports for `ev`.
+pub const fn eviocgbit(ev: u16, len: u32) -> sys::IoctlRequest {
+    ioc::ior(b'E' as _, 0x20 + ev as u32, len)
+}
+
+/// The `input_event` structure, exactly as the kernel defines it.
 ///
-/// On 32-bit ARM `struct timeval` is two 32-bit words, so the layout matches
-/// the 64-bit host's `tv_sec`/`tv_usec` pair of `long`s only by accident.
-/// We therefore spell the fields out explicitly.
+/// `c_long` for the timeval fields is load-bearing: 4 bytes each on ARM32.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InputEvent {
-    pub time_sec: i64,
-    pub time_usec: i64,
+    pub time_sec: c_long,
+    pub time_usec: c_long,
     pub kind: u16,
     pub code: u16,
     pub value: i32,
 }
 
-/// The `input_id` structure returned by `EVIOCGID`.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct InputId {
-    pub bustype: u16,
-    pub vendor: u16,
-    pub product: u16,
-    pub version: u16,
-}
-
-/// `EVIOCGVERSION`
-pub const EVIOCGVERSION: sys::IoctlRequest = 0x8008_4501;
-/// `EVIOCGID`
-pub const EVIOCGID: sys::IoctlRequest = 0x8008_4502;
-/// `EVIOCGNAME`
-pub const EVIOCGNAME: sys::IoctlRequest = 0x8008_4506;
-
-/// A touch event.
-///
-/// The coordinates are the raw evdev values. On the Paperwhite 1 the `cyttsp`
-/// driver reports them in the framebuffer's own coordinate space - the panel
-/// is 758x1024 portrait and the touch axes are X 0..758, Y 0..1024 - so no
-/// rescaling or axis swap is needed.
+/// A touch event, in panel pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TouchEvent {
-    /// The finger went down at `(x, y)`, in panel pixels.
+    /// The finger went down at `(x, y)`.
     Press { x: i32, y: i32 },
     /// The finger lifted at `(x, y)`.
     Release { x: i32, y: i32 },
@@ -84,124 +78,33 @@ pub enum TouchEvent {
     Move { x: i32, y: i32 },
 }
 
-/// An evdev touch device.
-pub struct Touch {
-    fd: c_int,
+/// The protocol-A state machine, independent of any file descriptor.
+///
+/// Kept separate from [`Touch`] so it can be tested without a device.
+#[derive(Default)]
+pub struct Decoder {
     x: i32,
     y: i32,
     down: bool,
 }
 
-impl Touch {
-    /// Open an evdev device by path.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the device cannot be opened.
-    pub fn open(path: &str) -> Result<Self, Error> {
-        let fd = open_read(path)?;
-        Ok(Touch {
-            fd,
-            x: 0,
-            y: 0,
-            down: false,
-        })
-    }
-
-    /// The raw file descriptor, for `poll`.
-    pub fn fd(&self) -> c_int {
-        self.fd
-    }
-
-    /// The device name reported by `EVIOCGNAME`, if available.
-    pub fn name(&self) -> Option<String> {
-        let mut buf = [0u8; 128];
-        // SAFETY: `buf` is a live buffer of the size the ioctl expects.
-        let rc = unsafe { sys::ioctl(self.fd, EVIOCGNAME, buf.as_mut_ptr()) };
-        if rc < 0 {
-            return None;
-        }
-        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        Some(String::from_utf8_lossy(&buf[..end]).into_owned())
-    }
-
-    /// Block for up to `timeout_ms` and return the next touch event.
-    ///
-    /// Returns `Ok(None)` on timeout.
-    ///
-    /// # Errors
-    ///
-    /// Fails if `poll` or `read` fail.
-    pub fn read_event(&mut self, timeout_ms: i32) -> Result<Option<TouchEvent>, Error> {
-        let mut fds = PollFd {
-            fd: self.fd,
-            events: sys::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `fds` is a live, single-element array for the call.
-        let rc = unsafe { sys::poll(&mut fds, 1, timeout_ms) };
-        if rc < 0 {
-            return Err(Error::Poll {
-                errno: sys::errno(),
-            });
-        }
-        if rc == 0 {
-            return Ok(None);
-        }
-
-        let mut ev = InputEvent::default();
-        // SAFETY: `ev` is a live `input_event`; the driver writes exactly its
-        // size into it.
-        let n = unsafe {
-            sys::read(
-                self.fd,
-                &mut ev as *mut InputEvent as *mut core::ffi::c_void,
-                core::mem::size_of::<InputEvent>(),
-            )
-        };
-        if n < 0 {
-            return Err(Error::Read {
-                errno: sys::errno(),
-            });
-        }
-        if n != core::mem::size_of::<InputEvent>() as isize {
-            // Short read: the device was closed or is not an evdev node.
-            return Ok(None);
-        }
-
-        Ok(self.translate(&ev))
-    }
-
-    /// Turn a raw evdev event into a [`TouchEvent`].
-    fn translate(&mut self, ev: &InputEvent) -> Option<TouchEvent> {
-        match ev.kind {
-            EV_ABS => match ev.code {
+impl Decoder {
+    /// Feed one evdev event, returning a touch event if it completes one.
+    pub fn feed(&mut self, kind: u16, code: u16, value: i32) -> Option<TouchEvent> {
+        match kind {
+            EV_ABS => match code {
                 ABS_X | ABS_MT_POSITION_X => {
-                    self.x = ev.value;
-                    if self.down {
-                        Some(TouchEvent::Move {
-                            x: self.x,
-                            y: self.y,
-                        })
-                    } else {
-                        None
-                    }
+                    self.x = value;
+                    self.moved()
                 }
                 ABS_Y | ABS_MT_POSITION_Y => {
-                    self.y = ev.value;
-                    if self.down {
-                        Some(TouchEvent::Move {
-                            x: self.x,
-                            y: self.y,
-                        })
-                    } else {
-                        None
-                    }
+                    self.y = value;
+                    self.moved()
                 }
                 _ => None,
             },
-            EV_KEY if ev.code == BTN_TOUCH => {
-                if ev.value != 0 {
+            EV_KEY if code == BTN_TOUCH => {
+                if value != 0 {
                     self.down = true;
                     Some(TouchEvent::Press {
                         x: self.x,
@@ -218,18 +121,157 @@ impl Touch {
             _ => None,
         }
     }
+
+    fn moved(&self) -> Option<TouchEvent> {
+        if self.down {
+            Some(TouchEvent::Move {
+                x: self.x,
+                y: self.y,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// An open evdev touch device.
+pub struct Touch {
+    fd: c_int,
+    decoder: Decoder,
+}
+
+/// The default evdev path, used when no scan succeeds.
+pub const DEFAULT_TOUCH: &str = "/dev/input/event0";
+
+impl Touch {
+    /// Open an evdev device by path.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the device cannot be opened.
+    pub fn open(path: &str) -> Result<Self, Error> {
+        Ok(Touch {
+            fd: open_read(path)?,
+            decoder: Decoder::default(),
+        })
+    }
+
+    /// Open the touchscreen, scanning `/dev/input/event*`.
+    ///
+    /// There is no udev in the initramfs and probe order is not guaranteed, so
+    /// picking `event0` blindly can select the power button instead. Each
+    /// candidate is checked for `BTN_TOUCH` and an absolute X axis.
+    pub fn open_default() -> Result<Self, Error> {
+        let mut last = Error::Open {
+            path: DEFAULT_TOUCH.to_string(),
+            errno: sys::ENOENT,
+        };
+        for index in 0..16 {
+            let path = std::format!("/dev/input/event{index}");
+            match Touch::open(&path) {
+                Ok(touch) => {
+                    if touch.is_touchscreen() {
+                        return Ok(touch);
+                    }
+                }
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    /// The raw file descriptor, for `poll`.
+    pub fn fd(&self) -> c_int {
+        self.fd
+    }
+
+    /// The device name reported by `EVIOCGNAME`.
+    pub fn name(&self) -> Option<String> {
+        let mut buf = [0u8; 128];
+        // SAFETY: `buf` is a live 128-byte buffer, and the request number
+        // encodes that same length.
+        let rc = unsafe { sys::ioctl(self.fd, eviocgname(buf.len() as u32), buf.as_mut_ptr()) };
+        if rc < 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+    }
+
+    /// True if the device reports `BTN_TOUCH` and `ABS_X`.
+    fn is_touchscreen(&self) -> bool {
+        self.has_bit(EV_KEY, BTN_TOUCH) && self.has_bit(EV_ABS, ABS_X)
+    }
+
+    fn has_bit(&self, kind: u16, code: u16) -> bool {
+        let mut bits = [0u8; 96];
+        // SAFETY: `bits` outlives the call and the request encodes its length.
+        let rc = unsafe {
+            sys::ioctl(
+                self.fd,
+                eviocgbit(kind, bits.len() as u32),
+                bits.as_mut_ptr(),
+            )
+        };
+        if rc < 0 {
+            return false;
+        }
+        let byte = (code / 8) as usize;
+        let bit = (code % 8) as u8;
+        byte < bits.len() && bits[byte] & (1 << bit) != 0
+    }
+
+    /// Block for up to `timeout_ms` and return the next touch event.
+    ///
+    /// Returns `Ok(None)` on timeout or when the event was not a touch event
+    /// (a `SYN_REPORT`, for instance).
+    ///
+    /// # Errors
+    ///
+    /// Fails if `poll` or `read` fail.
+    pub fn read_event(&mut self, timeout_ms: i32) -> Result<Option<TouchEvent>, Error> {
+        let mut fds = PollFd {
+            fd: self.fd,
+            events: sys::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `fds` is a live single-element array; `nfds` is a `c_ulong`.
+        let rc = unsafe { sys::poll(&mut fds, 1, timeout_ms) };
+        if rc < 0 {
+            return Err(Error::Poll {
+                errno: sys::errno(),
+            });
+        }
+        if rc == 0 {
+            return Ok(None);
+        }
+
+        let mut ev = InputEvent::default();
+        let size = core::mem::size_of::<InputEvent>();
+        // SAFETY: `ev` is a live `input_event` of exactly the size the kernel
+        // writes for this architecture.
+        let n = unsafe { sys::read(self.fd, &mut ev as *mut InputEvent as *mut _, size) };
+        if n < 0 {
+            return Err(Error::Read {
+                errno: sys::errno(),
+            });
+        }
+        if n != size as isize {
+            // Short read: not an evdev node, or the device went away.
+            return Ok(None);
+        }
+
+        Ok(self.decoder.feed(ev.kind, ev.code, ev.value))
+    }
 }
 
 fn open_read(path: &str) -> Result<c_int, Error> {
-    let mut bytes = path.as_bytes().to_vec();
-    bytes.push(0);
-    // SAFETY: `bytes` is a NUL-terminated C string that outlives the call.
-    let fd = unsafe {
-        sys::open(
-            bytes.as_ptr() as *const core::ffi::c_char,
-            sys::O_RDONLY | sys::O_CLOEXEC,
-        )
-    };
+    let c_path = sys::to_cstring(path).ok_or_else(|| Error::Open {
+        path: path.to_string(),
+        errno: sys::EINVAL,
+    })?;
+    // SAFETY: `c_path` is a NUL-terminated C string that outlives the call.
+    let fd = unsafe { sys::open(c_path.as_ptr() as *const core::ffi::c_char, sys::O_RDONLY) };
     if fd < 0 {
         return Err(Error::Open {
             path: path.to_string(),
@@ -269,60 +311,77 @@ impl core::fmt::Display for Error {
                     sys::strerror(*errno)
                 )
             }
-            Error::Poll { errno } => {
-                write!(f, "poll failed: {} ({errno})", sys::strerror(*errno))
-            }
-            Error::Read { errno } => {
-                write!(f, "read failed: {} ({errno})", sys::strerror(*errno))
-            }
+            Error::Poll { errno } => write!(f, "poll failed: {} ({errno})", sys::strerror(*errno)),
+            Error::Read { errno } => write!(f, "read failed: {} ({errno})", sys::strerror(*errno)),
         }
     }
 }
+
+impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn input_event_layout_is_32_bit_clean() {
-        // 2x 32-bit timeval + u16 + u16 + i32 = 24 bytes on ARM32.
+    fn input_event_matches_the_libc_struct_size() {
+        // 16 bytes on ARM32 (`long` is 4), 24 on x86_64 (`long` is 8).
+        let expected = 2 * core::mem::size_of::<c_long>() + 8;
+        assert_eq!(core::mem::size_of::<InputEvent>(), expected);
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(core::mem::size_of::<InputEvent>(), 16);
+        #[cfg(target_pointer_width = "64")]
         assert_eq!(core::mem::size_of::<InputEvent>(), 24);
     }
 
     #[test]
-    fn press_and_release_are_reported() {
-        let mut t = Touch {
-            fd: -1,
-            x: 0,
-            y: 0,
-            down: false,
-        };
-
-        let down = InputEvent {
-            kind: EV_KEY,
-            code: BTN_TOUCH,
-            value: 1,
-            ..Default::default()
-        };
-        assert_eq!(t.translate(&down), Some(TouchEvent::Press { x: 0, y: 0 }));
-
-        let move_x = InputEvent {
-            kind: EV_ABS,
-            code: ABS_X,
-            value: 512,
-            ..Default::default()
-        };
+    fn press_move_release() {
+        let mut d = Decoder::default();
+        // Protocol A: coordinates arrive before BTN_TOUCH.
+        assert_eq!(d.feed(EV_ABS, ABS_X, 400), None);
+        assert_eq!(d.feed(EV_ABS, ABS_Y, 300), None);
         assert_eq!(
-            t.translate(&move_x),
-            Some(TouchEvent::Move { x: 512, y: 0 })
+            d.feed(EV_KEY, BTN_TOUCH, 1),
+            Some(TouchEvent::Press { x: 400, y: 300 })
         );
+        assert_eq!(
+            d.feed(EV_ABS, ABS_MT_POSITION_X, 410),
+            Some(TouchEvent::Move { x: 410, y: 300 })
+        );
+        assert_eq!(
+            d.feed(EV_KEY, BTN_TOUCH, 0),
+            Some(TouchEvent::Release { x: 410, y: 300 })
+        );
+        // A move after release is not reported.
+        assert_eq!(d.feed(EV_ABS, ABS_X, 1), None);
+    }
 
-        let up = InputEvent {
-            kind: EV_KEY,
-            code: BTN_TOUCH,
-            value: 0,
-            ..Default::default()
+    #[test]
+    fn syn_and_unknown_events_are_ignored() {
+        let mut d = Decoder::default();
+        assert_eq!(d.feed(EV_SYN, 0, 0), None);
+        assert_eq!(d.feed(EV_KEY, 0x74, 1), None); // KEY_POWER
+    }
+
+    #[test]
+    fn poll_waits_for_the_timeout() {
+        // A negative fd is ignored by poll, so this is a pure sleep. If the
+        // `nfds` argument were passed as a 64-bit value instead of `c_ulong`,
+        // the timeout would land in the wrong register on ARM32 and poll would
+        // return immediately.
+        let mut fds = PollFd {
+            fd: -1,
+            events: sys::POLLIN,
+            revents: 0,
         };
-        assert_eq!(t.translate(&up), Some(TouchEvent::Release { x: 512, y: 0 }));
+        let start = std::time::Instant::now();
+        // SAFETY: `fds` is a live single-element array for the call.
+        let rc = unsafe { sys::poll(&mut fds, 1, 60) };
+        let elapsed = start.elapsed();
+        assert_eq!(rc, 0);
+        assert!(
+            elapsed.as_millis() >= 45,
+            "poll returned after {elapsed:?}: the timeout was not passed correctly"
+        );
     }
 }

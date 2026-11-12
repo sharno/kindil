@@ -1,16 +1,26 @@
 //! Raw system-call bindings.
 //!
 //! The Kindle Paperwhite 1 runs a 2.6.31-era kernel with a uClibc userland, so
-//! we avoid `libc` as a crate dependency and declare the handful of syscalls we
-//! need directly. Everything here is `unsafe` by construction: the caller is
-//! responsible for upholding the invariants.
+//! we avoid the `libc` crate (which would have to be vendored) and declare the
+//! handful of functions we need directly. They are the C library's symbols, not
+//! raw `syscall(2)` numbers, so the C library's own ABI decides the layouts -
+//! see the type notes on each item.
+//!
+//! # The rule that matters
+//!
+//! `long`, `unsigned long`, `size_t`, `time_t` and `nfds_t` are **4 bytes on the
+//! ARM32 target and 8 bytes on the x86_64 host**. Every declaration here uses
+//! `core::ffi::c_long` / `c_ulong` / `usize` for those, never `i64`/`u64`.
+//!
+//! Getting this wrong does not fail to compile: the host build is happy, and on
+//! the device the arguments silently land in the wrong registers. `poll` with a
+//! `u64` count, for instance, makes the timeout read as zero and turns the main
+//! loop into a busy loop.
 
-use core::ffi::{c_int, c_uint, c_ulong, c_void};
+use core::ffi::{c_char, c_int, c_long, c_ulong, c_void};
 
 extern "C" {
-    /// `open(2)`. The path argument is `*const i8` to match the C library's
-    /// `const char *`; we cast at the call site.
-    pub fn open(path: *const core::ffi::c_char, flags: c_int, ...) -> c_int;
+    pub fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     pub fn close(fd: c_int) -> c_int;
     pub fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     pub fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
@@ -24,9 +34,20 @@ extern "C" {
         offset: i64,
     ) -> *mut c_void;
     pub fn munmap(addr: *mut c_void, length: usize) -> c_int;
-    pub fn poll(fds: *mut PollFd, nfds: u64, timeout: c_int) -> c_int;
+    /// `nfds_t` is `unsigned long`: 4 bytes on the device, 8 on the host.
+    pub fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
     pub fn clock_gettime(clk_id: c_int, tp: *mut Timespec) -> c_int;
+    pub fn getpid() -> c_int;
     pub fn __errno_location() -> *mut c_int;
+    pub fn mount(
+        source: *const c_char,
+        target: *const c_char,
+        fstype: *const c_char,
+        flags: c_ulong,
+        data: *const c_void,
+    ) -> c_int;
+    /// `dev_t` is 64-bit on every Linux libc, `mode_t` is 32-bit.
+    pub fn mknod(path: *const c_char, mode: u32, dev: u64) -> c_int;
 }
 
 /// `CLOCK_REALTIME`
@@ -34,13 +55,16 @@ pub const CLOCK_REALTIME: c_int = 0;
 
 /// `struct timespec`.
 ///
-/// `time_t` is 32-bit on the ARM32 target and 64-bit on the host, so we
-/// spell the fields out explicitly rather than relying on `libc`'s layout.
+/// `tv_sec` is `time_t` and `tv_nsec` is `long`; both are 4 bytes on the 32-bit
+/// ARM target and 8 on the 64-bit host, so they are spelled `c_long` rather
+/// than `i64`. With `i64` the host build passes, and on the device the kernel
+/// writes 4 bytes into an 8-byte field, so `tv_sec` reads the nanoseconds as its
+/// high half.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Timespec {
-    pub tv_sec: i64,
-    pub tv_nsec: i64,
+    pub tv_sec: c_long,
+    pub tv_nsec: c_long,
 }
 
 /// `open(2)` flags.
@@ -48,12 +72,22 @@ pub const O_RDONLY: c_int = 0;
 pub const O_RDWR: c_int = 2;
 pub const O_CLOEXEC: c_int = 0o2000000;
 
+/// Error numbers we compare against.
+pub const ENOENT: c_int = 2;
+pub const EINVAL: c_int = 22;
+pub const EBUSY: c_int = 16;
+pub const EEXIST: c_int = 17;
+
 /// `mmap(2)` protection flags.
 pub const PROT_READ: c_int = 1;
 pub const PROT_WRITE: c_int = 2;
 
 /// `mmap(2)` mapping flags.
 pub const MAP_SHARED: c_int = 1;
+
+/// `mount(2)` flags.
+pub const MS_NOSUID: c_ulong = 2;
+pub const MS_NOEXEC: c_ulong = 8;
 
 /// `poll(2)` events.
 pub const POLLIN: i16 = 0x001;
@@ -73,12 +107,6 @@ pub fn errno() -> c_int {
     unsafe { *__errno_location() }
 }
 
-/// A human-readable description of the last error.
-pub fn last_error() -> String {
-    let e = errno();
-    format!("{e} ({})", strerror(e))
-}
-
 /// `strerror(3)` for the error codes we realistically hit.
 ///
 /// The Kindle's C library is uClibc, whose `strerror` returns short static
@@ -87,17 +115,21 @@ pub fn strerror(code: c_int) -> &'static str {
     match code {
         1 => "EPERM",
         2 => "ENOENT",
+        4 => "EINTR",
         5 => "EIO",
+        6 => "ENXIO",
         9 => "EBADF",
         11 => "EAGAIN",
         12 => "ENOMEM",
         13 => "EACCES",
         14 => "EFAULT",
         16 => "EBUSY",
+        17 => "EEXIST",
         19 => "ENODEV",
         22 => "EINVAL",
         25 => "ENOTTY",
         28 => "ENOSPC",
+        30 => "EROFS",
         38 => "ENOSYS",
         110 => "ETIMEDOUT",
         _ => "unknown error",
@@ -111,10 +143,9 @@ pub fn strerror(code: c_int) -> &'static str {
 /// (`_IOW`), 2 for read-only (`_IOR`) and 3 for read/write (`_IOWR`), and `size`
 /// is the size of the argument struct.
 ///
-/// The argument size is part of the number, so these must be computed against
-/// the *target's* struct layout, not the host's. We therefore always derive
-/// them from [`crate::epdc`]'s `#[repr(C)]` structs, which mirror the 32-bit
-/// ARM layout of the Kindle kernel exactly.
+/// The size is part of the number, so the argument structs must match the
+/// kernel's 32-bit ARM layout. The numbers themselves are the same on every
+/// architecture and on both pointer widths.
 pub mod ioc {
     use core::ffi::{c_uint, c_ulong};
 
@@ -162,10 +193,12 @@ pub const IOC_TYPE_F: core::ffi::c_uint = b'F' as core::ffi::c_uint;
 
 /// Read a file into `buf`, returning the number of bytes read (0 on error).
 pub fn read_file(path: &str, buf: &mut [u8]) -> usize {
-    let mut p = path.as_bytes().to_vec();
-    p.push(0);
-    // SAFETY: `p` is a NUL-terminated C string that outlives the call.
-    let fd = unsafe { open(p.as_ptr() as *const core::ffi::c_char, O_RDONLY | O_CLOEXEC) };
+    let c_path = match to_cstring(path) {
+        Some(p) => p,
+        None => return 0,
+    };
+    // SAFETY: `c_path` is a NUL-terminated C string that outlives the call.
+    let fd = unsafe { open(c_path.as_ptr() as *const c_char, O_RDONLY | O_CLOEXEC) };
     if fd < 0 {
         return 0;
     }
@@ -182,13 +215,56 @@ pub fn read_file(path: &str, buf: &mut [u8]) -> usize {
     }
 }
 
-/// `c_uint` is used for the `mode_t`/`unsigned int` arguments of `open`.
-pub type CUInt = c_uint;
+/// Encode a path as a NUL-terminated C string.
+///
+/// Returns `None` if the path contains an interior NUL, which cannot be
+/// represented and would silently truncate the path.
+pub fn to_cstring(path: &str) -> Option<Vec<u8>> {
+    if path.as_bytes().contains(&0) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(path.len() + 1);
+    bytes.extend_from_slice(path.as_bytes());
+    bytes.push(0);
+    Some(bytes)
+}
 
 /// The type of an ioctl request number.
 ///
-/// On the 32-bit ARM target `unsigned long` is 4 bytes, so an ioctl request
-/// is passed in a 32-bit register. The request *numbers* are the same on
-/// every architecture, but the type they are passed in is not - so we always
-/// use `c_ulong` and never widen a request to `u64` by hand.
+/// On the 32-bit ARM target `unsigned long` is 4 bytes, so an ioctl request is
+/// passed in a 32-bit register. The request *numbers* are the same on every
+/// architecture, but the type they are passed in is not.
 pub type IoctlRequest = c_ulong;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::size_of;
+
+    #[test]
+    fn timespec_matches_the_c_long_abi() {
+        // 8 bytes on ARM32, 16 on x86_64 - but always two `long`s.
+        assert_eq!(size_of::<Timespec>(), 2 * size_of::<c_long>());
+    }
+
+    #[test]
+    fn ioctl_request_is_pointer_sized() {
+        // The request goes into a register, so it must be `unsigned long`.
+        assert_eq!(size_of::<IoctlRequest>(), size_of::<usize>());
+    }
+
+    #[test]
+    fn ioc_encoding_matches_the_kernel() {
+        // `_IOW('F', 0x2E, struct mxcfb_update_data)` with a 72-byte struct.
+        assert_eq!(ioc::iow(IOC_TYPE_F, 0x2E, 72), 0x4048_462e);
+        // `_IOR('E', 0x02, struct input_id)` with an 8-byte struct.
+        assert_eq!(ioc::ior(b'E' as core::ffi::c_uint, 0x02, 8), 0x8008_4502);
+    }
+
+    #[test]
+    fn cstring_rejects_interior_nul() {
+        assert!(to_cstring("/dev/fb0").is_some());
+        assert!(to_cstring("/dev/fb\0").is_none());
+        assert_eq!(to_cstring("/a").unwrap(), b"/a\0");
+    }
+}

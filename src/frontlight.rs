@@ -1,18 +1,13 @@
 //! Frontlight control.
 //!
-//! Amazon's Kindle kernels expose the frontlight as a character device driven
-//! with the ioctls in `<linux/frontlight.h>` (FBInk vendors the same header as
-//! `eink/frontlight-kindil.h`). There is no sysfs `brightness` node on these
-//! devices, so the ioctl interface is the only way in.
-//!
 //! On the Paperwhite 1 the driver is `drivers/misc/yoshime_fl.c`, which
 //! registers a misc device named `yoshime_fl` (minor 162) - so the node is
-//! `/dev/yoshime_fl`, as `include/linux/yoshime_fl.h` spells out. The same
-//! driver also exposes a read/write `fl_intensity` attribute under the
-//! `fl_tps6116x` sysfs class, which we use as a fallback.
+//! `/dev/yoshime_fl`, as `include/linux/yoshime_fl.h` spells out. The
+//! Paperwhite 1 is the first Kindle with a frontlight; earlier models have none.
 //!
-//! The Paperwhite 1 is the first Kindle with a frontlight; earlier models have
-//! none.
+//! All three ioctls take a **pointer to an `int`**: the handler does
+//! `get_user(val, argp)` / `put_user(val, argp)`. Passing the value directly
+//! looks plausible and always fails with `EFAULT`.
 
 use crate::sys::{self, ioc};
 use core::ffi::c_int;
@@ -22,12 +17,6 @@ pub const FL_MAGIC_NUMBER: core::ffi::c_uint = b'L' as core::ffi::c_uint;
 
 /// The frontlight device node on the Paperwhite 1.
 pub const FL_DEV_FILE: &str = "/dev/yoshime_fl";
-
-/// The sysfs class the same driver registers.
-pub const FL_SYSFS_CLASS: &str = "/sys/class/fl_tps6116x";
-
-/// The sysfs attribute holding the intensity.
-pub const FL_SYSFS_INTENSITY: &str = "/sys/class/fl_tps6116x/fl_intensity";
 
 /// `_IOW('L', 0x01, int)`: set the intensity.
 pub const FL_IOCTL_SET_INTENSITY: sys::IoctlRequest = ioc::iow(FL_MAGIC_NUMBER, 0x01, 4);
@@ -47,9 +36,17 @@ impl Frontlight {
     ///
     /// # Errors
     ///
-    /// Fails if `/dev/frontlight` cannot be opened.
+    /// Fails if `/dev/yoshime_fl` cannot be opened.
     pub fn open() -> Result<Self, Error> {
-        let fd = open_device(FL_DEV_FILE)?;
+        let c_path = sys::to_cstring(FL_DEV_FILE).expect("constant path has no NUL");
+        // SAFETY: `c_path` is a NUL-terminated C string that outlives the call.
+        let fd = unsafe { sys::open(c_path.as_ptr() as *const core::ffi::c_char, sys::O_RDWR) };
+        if fd < 0 {
+            return Err(Error::Open {
+                path: FL_DEV_FILE.to_string(),
+                errno: sys::errno(),
+            });
+        }
         let mut fl = Frontlight { fd, max: 0 };
         fl.max = fl.max_intensity().unwrap_or(0);
         Ok(fl)
@@ -58,8 +55,9 @@ impl Frontlight {
     /// The current intensity, in the driver's own units.
     pub fn intensity(&self) -> Result<i32, Error> {
         let mut value: c_int = 0;
-        // SAFETY: `value` is a live `int`, which is what the ioctl writes to.
-        let rc = unsafe { sys::ioctl(self.fd, FL_IOCTL_GET_INTENSITY, &mut value) };
+        // SAFETY: `value` is a live `int`, and the handler does `put_user` into
+        // the pointer we pass.
+        let rc = unsafe { sys::ioctl(self.fd, FL_IOCTL_GET_INTENSITY, &mut value as *mut c_int) };
         if rc < 0 {
             return Err(Error::Ioctl {
                 what: "FL_IOCTL_GET_INTENSITY",
@@ -73,7 +71,7 @@ impl Frontlight {
     pub fn max_intensity(&self) -> Result<i32, Error> {
         let mut value: c_int = 0;
         // SAFETY: as above.
-        let rc = unsafe { sys::ioctl(self.fd, FL_IOCTL_GET_RANGE_MAX, &mut value) };
+        let rc = unsafe { sys::ioctl(self.fd, FL_IOCTL_GET_RANGE_MAX, &mut value as *mut c_int) };
         if rc < 0 {
             return Err(Error::Ioctl {
                 what: "FL_IOCTL_GET_RANGE_MAX",
@@ -83,13 +81,16 @@ impl Frontlight {
         Ok(value)
     }
 
-    /// Set the intensity.
-    ///
-    /// The value is clamped to `0..=max`.
+    /// Set the intensity, clamped to `0..=max`.
     pub fn set_intensity(&self, value: i32) -> Result<(), Error> {
-        let value = value.clamp(0, self.max);
-        // SAFETY: `value` is an `int` passed by pointer, matching the ioctl.
-        let rc = unsafe { sys::ioctl(self.fd, FL_IOCTL_SET_INTENSITY, value) };
+        let value = if self.max > 0 {
+            value.clamp(0, self.max)
+        } else {
+            value.max(0)
+        };
+        // SAFETY: the handler does `get_user` from the pointer we pass, so it
+        // must point at a live `int` - not be the value itself.
+        let rc = unsafe { sys::ioctl(self.fd, FL_IOCTL_SET_INTENSITY, &value as *const c_int) };
         if rc < 0 {
             return Err(Error::Ioctl {
                 what: "FL_IOCTL_SET_INTENSITY",
@@ -100,20 +101,6 @@ impl Frontlight {
     }
 }
 
-/// Read the frontlight intensity from sysfs, if the device is present.
-///
-/// The same `yoshime_fl` driver exposes a read/write `fl_intensity` attribute
-/// under its `fl_tps6116x` sysfs class.
-pub fn sysfs_intensity() -> Option<i32> {
-    let mut buf = [0u8; 32];
-    let n = sys::read_file(FL_SYSFS_INTENSITY, &mut buf);
-    if n == 0 {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&buf[..n]);
-    text.trim().parse::<i32>().ok()
-}
-
 impl Drop for Frontlight {
     fn drop(&mut self) {
         // SAFETY: `fd` is owned by this value and closed exactly once.
@@ -121,25 +108,6 @@ impl Drop for Frontlight {
             sys::close(self.fd);
         }
     }
-}
-
-fn open_device(path: &str) -> Result<c_int, Error> {
-    let mut bytes = path.as_bytes().to_vec();
-    bytes.push(0);
-    // SAFETY: `bytes` is a NUL-terminated C string that outlives the call.
-    let fd = unsafe {
-        sys::open(
-            bytes.as_ptr() as *const core::ffi::c_char,
-            sys::O_RDWR | sys::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(Error::Open {
-            path: path.to_string(),
-            errno: sys::errno(),
-        });
-    }
-    Ok(fd)
 }
 
 /// Errors from the frontlight layer.
@@ -168,14 +136,15 @@ impl core::fmt::Display for Error {
     }
 }
 
+impl std::error::Error for Error {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn ioctl_numbers_match_amazon_header() {
-        // From Amazon's <linux/frontlight.h>:
-        //   _IOW('L', 0x01, int), _IOR('L', 0x02, int), _IOR('L', 0x03, int)
+    fn ioctl_numbers_match_the_yoshime_driver() {
+        // From Amazon's <linux/frontlight.h>.
         assert_eq!(FL_IOCTL_SET_INTENSITY, 0x4004_4c01);
         assert_eq!(FL_IOCTL_GET_INTENSITY, 0x8004_4c02);
         assert_eq!(FL_IOCTL_GET_RANGE_MAX, 0x8004_4c03);

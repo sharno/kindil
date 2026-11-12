@@ -1,15 +1,16 @@
 [package]
 name = "kindil"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
-description = "A Rust userland shell for the first-generation Amazon Kindle Paperwhite"
+description = "A single-process Rust shell for the first-generation Amazon Kindle Paperwhite"
 license = "MIT"
 publish = false
 
-# No external crates: the Kindle runs a 2.6.31-era kernel with a uClibc
-# userland, so every dependency would have to be vendored and cross-compiled
-# against an ancient toolchain. The syscalls we need are a thin FFI layer.
+# No external crates: every dependency would have to be vendored and
+# cross-compiled for the device. The C library surface we need is small and
+# declared by hand in `sys.rs`, and the ABI is checked by tests that run on the
+# real ARM target under qemu.
 [dependencies]
 
 [profile.release]
