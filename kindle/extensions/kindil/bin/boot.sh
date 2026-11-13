@@ -101,9 +101,6 @@ if [ -f "$SKIP" ]; then
   stop early_progress
   await answers com.lab126.powerd state || log "powerd isn't answering"
   await answers com.lab126.wifid enable || log "wifid isn't answering"
-  # After powerd answers: deviced starts once powerd has.
-  log "stopping Amazon's services kindil doesn't use"
-  services stop
   # What X's language picker does at boot to set up the front light.
   lipc-set-prop com.lab126.powerd flStartup 1
 else
@@ -116,6 +113,12 @@ fi
 rm -f "$PIDFILE"
 log "starting kindil"
 "$START"
+if [ -f "$SKIP" ]; then
+  # After kindil starts, which these 8 s would otherwise hold up, and after
+  # powerd answers: deviced starts once powerd has.
+  log "stopping Amazon's services kindil doesn't use"
+  services stop
+fi
 sleep "$SETTLE"
 if kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
   rm -f "$TRIES"
