@@ -34,6 +34,7 @@ jobs:
             cargo fmt --check
             cargo test --locked
             tests/launcher.sh
+            tests/boot.sh
             cargo clippy --locked --all-targets --features kindle -- -D warnings
           '
       - name: ARM runtime tests and static device artifact

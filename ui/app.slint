@@ -101,6 +101,8 @@ export global Kindil {
     in property <string> wifi-detail;
     in property <Switch> ssh: Switch.unavailable;
     in property <Switch> ssh-at-boot: Switch.unavailable;
+    in property <Switch> boot-start: Switch.unavailable;
+    in property <string> boot-start-detail;
     in property <string> ssh-detail;
     in property <Switch> sync: Switch.unavailable;
     in property <string> sync-detail;
@@ -136,6 +138,7 @@ export global Kindil {
     callback join-network(string, string);
     callback toggle-ssh();
     callback toggle-ssh-at-boot();
+    callback toggle-boot-start();
     callback toggle-sync();
     callback exit-app();
     in property <System> system: System.app;
@@ -1427,6 +1430,15 @@ component SettingsPage {
                             color: Theme.ink;
                             vertical-alignment: center;
                         }
+                    }
+                }
+                Group {
+                    title: "STARTUP";
+                    SwitchRow {
+                        title: "Start kindil at boot";
+                        detail: Kindil.boot-start-detail;
+                        state: Kindil.boot-start;
+                        toggled => { Kindil.toggle-boot-start(); }
                     }
                 }
                 Group {

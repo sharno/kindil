@@ -64,6 +64,9 @@ impl Fixture {
             },
             execution: Execution::Inline,
             touches: Touches::default(),
+            // Half a minute from the next one: dozing always naps, and the
+            // minute never turns mid-test.
+            now: || chrono::DateTime::from_timestamp(1_794_398_430, 0).unwrap(),
         })
         .unwrap();
         app.refresh_now();
@@ -416,6 +419,20 @@ fn auto_sleep_is_a_saved_choice() {
 }
 
 #[test]
+fn start_at_boot_is_a_switch_once_the_boot_job_is_installed() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    f.k().invoke_navigated(Page::Settings);
+    assert_eq!(f.k().get_boot_start(), Switch::Off);
+    f.k().invoke_toggle_boot_start();
+    assert_eq!(f.k().get_boot_start(), Switch::On);
+    assert_eq!(
+        host.boot_start(),
+        kindil::host::BootStart::Installed(kindil::host::Power::On)
+    );
+}
+
+#[test]
 fn an_empty_battery_sleeps_with_a_charge_screen() {
     let host = Arc::new(Simulated::default());
     let f = Fixture::new(host.clone());
@@ -505,6 +522,12 @@ impl Host for Recording {
     }
     fn set_ssh_at_boot(&self, power: kindil::host::Power) -> anyhow::Result<()> {
         self.device.set_ssh_at_boot(power)
+    }
+    fn boot_start(&self) -> kindil::host::BootStart {
+        self.device.boot_start()
+    }
+    fn set_boot_start(&self, power: kindil::host::Power) -> anyhow::Result<()> {
+        self.device.set_boot_start(power)
     }
     fn info(&self) -> kindil::host::DeviceInfo {
         self.device.info()

@@ -81,6 +81,14 @@ pub enum Ssh {
     },
 }
 
+/// Whether kindil starts at boot instead of Amazon's UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootStart {
+    /// The boot job isn't in the system yet: a one-time install over SSH.
+    NotInstalled,
+    Installed(Power),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Memory {
     pub total_kib: u64,
@@ -117,6 +125,9 @@ pub trait Host: Send + Sync {
     fn ssh(&self) -> Ssh;
     fn set_ssh(&self, power: Power) -> anyhow::Result<()>;
     fn set_ssh_at_boot(&self, power: Power) -> anyhow::Result<()>;
+    fn boot_start(&self) -> BootStart;
+    /// Fails while the boot job isn't installed.
+    fn set_boot_start(&self, power: Power) -> anyhow::Result<()>;
     fn info(&self) -> DeviceInfo;
     /// Starts the threads that report the power button and USB drive mode.
     fn listen(&self, deliver: Deliver);
@@ -149,6 +160,7 @@ struct SimulatedState {
     wifi: Power,
     ssh: Power,
     ssh_at_boot: Power,
+    boot_start: BootStart,
 }
 
 impl Default for Simulated {
@@ -165,6 +177,7 @@ impl Default for Simulated {
                 wifi: Power::On,
                 ssh: Power::On,
                 ssh_at_boot: Power::On,
+                boot_start: BootStart::Installed(Power::Off),
             }),
         }
     }
@@ -237,6 +250,18 @@ impl Host for Simulated {
     fn set_ssh_at_boot(&self, power: Power) -> anyhow::Result<()> {
         self.with(|s| s.ssh_at_boot = power);
         Ok(())
+    }
+    fn boot_start(&self) -> BootStart {
+        self.with(|s| s.boot_start)
+    }
+    fn set_boot_start(&self, power: Power) -> anyhow::Result<()> {
+        self.with(|s| match s.boot_start {
+            BootStart::NotInstalled => anyhow::bail!("the boot job is not installed"),
+            BootStart::Installed(_) => {
+                s.boot_start = BootStart::Installed(power);
+                Ok(())
+            }
+        })
     }
     fn info(&self) -> DeviceInfo {
         DeviceInfo {

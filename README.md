@@ -8,8 +8,9 @@ Paperwhite (PW1), in Rust and Slint.
 kindil runs **as an app on Amazon's stock OS**, started from KUAL. While it
 runs, Amazon's UI steps aside; when it exits, Amazon's UI comes back. A crash
 restarts it; a version that keeps crashing makes way for the previous one, and
-then for Amazon's UI. It never flashes, never replaces init or the bootloader, and changes no
-system file. A reboot always returns the Kindle to stock.
+then for Amazon's UI. It never flashes or replaces init or the bootloader.
+Unless you opt into [start at boot](#start-at-boot), it changes no system file
+and a reboot always returns the Kindle to stock.
 
 ## What it does
 
@@ -109,6 +110,29 @@ release tagged `vX.Y.Z`. The Release workflow builds, signs and attaches
 `kindil` and `kindil.minisig`. The signing key is the `MINISIGN_SECRET_KEY`
 repository secret.
 
+## Start at boot
+
+Optional, and off until you turn it on. It needs one boot job,
+`/etc/upstart/kindil.conf`: the only system file kindil ever adds. Install it
+once over SSH:
+
+```sh
+sh /mnt/us/extensions/kindil/boot/install.sh install
+```
+
+Then KUAL → **kindil → Start at boot: on**. The job runs whenever Amazon's UI
+starts and hands over to `bin/boot.sh` on the user storage, which starts
+kindil once per boot while `/mnt/us/kindil/BOOT` exists. Amazon's UI still
+starts first and is there whenever kindil exits (Exit to Kindle, or crashes
+it can't recover from); it doesn't start kindil again until the next boot.
+
+- **Failed boots:** if kindil doesn't stay up for 2 minutes in two boots in a
+  row, the next boots go to Amazon's UI. **Start at boot: on** resets that.
+- **Off:** KUAL → **Start at boot: off**, or delete `/mnt/us/kindil/BOOT` over
+  USB. The job stays and does nothing.
+- **Undo:** `sh /mnt/us/extensions/kindil/boot/install.sh remove` removes the
+  job.
+
 ## Files on the device
 
 | Path | What |
@@ -118,6 +142,8 @@ repository secret.
 | `/mnt/us/kindil/kindil.toml` | Optional settings (every key has a default) |
 | `/mnt/us/kindil/miqat.toml` | Miqat's own settings: location, prayer method |
 | `/mnt/us/kindil/prefs.toml` | Choices made on the device; safe to delete |
+| `/mnt/us/kindil/BOOT` | Present: start kindil at boot (see [Start at boot](#start-at-boot)) |
+| `/etc/upstart/kindil.conf` | Only if you installed start at boot |
 | `/mnt/us/books/` | Books |
 | `/mnt/us/books/.kindil-trash/` | Trashed books, recoverable |
 

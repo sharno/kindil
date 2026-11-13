@@ -1,7 +1,7 @@
 //! Domain state → what the screen shows. Pure, so wording and units are tested
 //! without a window.
 use crate::battery::{Battery, Charge};
-use crate::host::{DeviceInfo, Power, Ssh, Wifi};
+use crate::host::{BootStart, DeviceInfo, Power, Ssh, Wifi};
 use crate::prefs::Progress;
 use crate::reader::Book;
 use crate::sync::Service;
@@ -90,6 +90,22 @@ pub fn ssh(ssh: Ssh, ip: Option<Ipv4Addr>) -> (Switch, Switch, String) {
                 (Power::On, Some(ip)) => format!("ssh root@{ip} · keys only"),
                 (Power::On, None) => "Listening on port 22 · keys only".into(),
                 (Power::Off, _) => "Off".into(),
+            },
+        ),
+    }
+}
+
+pub fn boot_start(boot: BootStart) -> (Switch, String) {
+    match boot {
+        BootStart::NotInstalled => (
+            Switch::Unavailable,
+            "Needs a one-time install over SSH; see the README".into(),
+        ),
+        BootStart::Installed(power) => (
+            switch(power),
+            match power {
+                Power::On => "Instead of Amazon's UI, which stays one Exit away".into(),
+                Power::Off => "Off: the Kindle starts with Amazon's UI".into(),
             },
         ),
     }

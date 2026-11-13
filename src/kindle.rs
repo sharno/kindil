@@ -3,7 +3,9 @@
 //! except the documented USBNetwork "SSH at boot" flag file.
 use crate::battery::{Battery, Charge};
 use crate::frontlight::Frontlight;
-use crate::host::{Brightness, Deliver, DeviceInfo, Host, Memory, Power, Ssh, Storage, Wifi};
+use crate::host::{
+    BootStart, Brightness, Deliver, DeviceInfo, Host, Memory, Power, Ssh, Storage, Wifi,
+};
 use crate::lipc;
 use crate::system::{self, Event};
 use crate::uevent::Uevent;
@@ -20,6 +22,13 @@ const INTERFACE: &str = "wlan0";
 const USBNET_TOGGLE: &str = "/mnt/us/usbnet/bin/usbnetwork";
 const USBNET_AT_BOOT: &str = "/mnt/us/usbnet/auto";
 const USER_STORAGE: &str = "/mnt/us";
+/// The boot job, installed by `boot/install.sh` in the extension.
+const BOOT_JOB: &str = "/etc/upstart/kindil.conf";
+/// Present: the boot job starts kindil (`bin/boot.sh`).
+const BOOT_FLAG: &str = "/mnt/us/kindil/BOOT";
+/// Boots in a row where kindil didn't stay up; turning start at boot on
+/// gives it a fresh start.
+const BOOT_TRIES: &str = "/var/local/kindil/boot-tries";
 /// The KUAL extension's binaries: the current one, a staged update, the one
 /// on trial and the previous one (see `bin/session.sh`).
 const EXTENSION_BIN: &str = "/mnt/us/extensions/kindil/bin";
@@ -142,13 +151,33 @@ impl Host for KindleHost {
 
     fn set_ssh_at_boot(&self, power: Power) -> anyhow::Result<()> {
         match power {
-            Power::On => std::fs::write(USBNET_AT_BOOT, b"")?,
-            Power::Off => match std::fs::remove_file(USBNET_AT_BOOT) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
-            },
+            Power::On => Ok(std::fs::write(USBNET_AT_BOOT, b"")?),
+            Power::Off => remove_if_present(USBNET_AT_BOOT),
         }
-        Ok(())
+    }
+
+    fn boot_start(&self) -> BootStart {
+        match (
+            Path::new(BOOT_JOB).is_file(),
+            Path::new(BOOT_FLAG).is_file(),
+        ) {
+            (false, _) => BootStart::NotInstalled,
+            (true, flag) => BootStart::Installed(if flag { Power::On } else { Power::Off }),
+        }
+    }
+
+    fn set_boot_start(&self, power: Power) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.boot_start() != BootStart::NotInstalled,
+            "the boot job is not installed"
+        );
+        match power {
+            Power::On => {
+                std::fs::write(BOOT_FLAG, b"")?;
+                remove_if_present(BOOT_TRIES)
+            }
+            Power::Off => remove_if_present(BOOT_FLAG),
+        }
     }
 
     fn info(&self) -> DeviceInfo {
@@ -331,6 +360,13 @@ fn storage(path: &Path) -> Option<Storage> {
         total_bytes: stats.f_blocks as u64 * block,
         free_bytes: stats.f_bavail as u64 * block,
     })
+}
+
+fn remove_if_present(path: &str) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]

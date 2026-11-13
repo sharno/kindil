@@ -4,7 +4,7 @@
 use crate::config::{Config, Dashboard};
 use crate::files::{FileName, Files, Trashed};
 use crate::ghosting::{Ghosting, Refresh, Update};
-use crate::host::{Brightness, DeviceInfo, Host, Power, Ssh, Wifi};
+use crate::host::{BootStart, Brightness, DeviceInfo, Host, Power, Ssh, Wifi};
 use crate::prefs::Store;
 use crate::reader::{self, Book, Layout, Reader};
 use crate::sync::Service;
@@ -54,6 +54,8 @@ pub struct Options {
     pub execution: Execution,
     /// Touches seen by the panel, for auto-sleep.
     pub touches: Touches,
+    /// The wall clock: `Utc::now`, or a fixed instant in tests.
+    pub now: fn() -> DateTime<Utc>,
 }
 
 /// The e-ink ghosting policy applied to a panel. Send, so workers can use it.
@@ -163,6 +165,7 @@ struct Ctx {
     exit: Arc<Mutex<Exit>>,
     /// Timers under [`Execution::Inline`]: tests fire them one round at a time.
     timers: Rc<RefCell<Vec<DeviceEvent>>>,
+    now: fn() -> DateTime<Utc>,
 }
 
 pub struct App {
@@ -194,6 +197,7 @@ impl From<DashboardKind> for Dashboard {
 struct Snapshot {
     wifi: Wifi,
     ssh: Ssh,
+    boot_start: BootStart,
     info: DeviceInfo,
     brightness: Option<Brightness>,
 }
@@ -203,6 +207,7 @@ impl Snapshot {
         Self {
             wifi: host.wifi(),
             ssh: host.ssh(),
+            boot_start: host.boot_start(),
             info: host.info(),
             brightness: host.brightness().ok(),
         }
@@ -222,6 +227,9 @@ impl Snapshot {
         k.set_ssh(server);
         k.set_ssh_at_boot(at_boot);
         k.set_ssh_detail(detail.into());
+        let (boot, detail) = view::boot_start(self.boot_start);
+        k.set_boot_start(boot);
+        k.set_boot_start_detail(detail.into());
         k.set_facts(model(view::facts(&self.info, env!("CARGO_PKG_VERSION"))));
         k.set_brightness(self.brightness.map_or(-1, |b| i32::from(b.percent())));
     }
@@ -279,6 +287,7 @@ impl App {
             },
             config: Rc::new(options.config),
             execution: options.execution,
+            now: options.now,
             events: Events {
                 sender,
                 queue: Rc::new(queue),
@@ -424,6 +433,7 @@ fn wire(window: &AppWindow, ctx: &Ctx) {
     on!(on_join_network => join_network(ssid, password));
     on!(on_toggle_ssh => toggle_ssh());
     on!(on_toggle_ssh_at_boot => toggle_ssh_at_boot());
+    on!(on_toggle_boot_start => toggle_boot_start());
     on!(on_toggle_sync => toggle_sync());
     on!(on_exit_app => exit_app());
     on!(on_device_events => device_events());
@@ -437,7 +447,7 @@ fn arm_clock(timer: Rc<slint::Timer>, ctx: Ctx) {
     let next = timer.clone();
     timer.start(
         slint::TimerMode::SingleShot,
-        until_next_minute(Utc::now()),
+        until_next_minute((ctx.now)()),
         move || {
             ctx.tick_clock();
             ctx.refresh_status();
@@ -488,7 +498,7 @@ impl Ctx {
 
     fn tick_clock(&self) {
         let Some(ui) = self.ui() else { return };
-        let (clock, date) = view::clock(&Utc::now().with_timezone(&self.config.timezone));
+        let (clock, date) = view::clock(&(self.now)().with_timezone(&self.config.timezone));
         let k = ui.global::<Kindil>();
         k.set_clock(clock.into());
         k.set_date(date.into());
@@ -802,6 +812,15 @@ impl Ctx {
         );
     }
 
+    fn toggle_boot_start(&self) {
+        let Some(ui) = self.ui() else { return };
+        self.switch_service(
+            ui.global::<Kindil>().get_boot_start(),
+            "Start at boot",
+            |host, power| host.set_boot_start(power),
+        );
+    }
+
     fn scan_networks(&self) {
         let Some(ui) = self.ui() else { return };
         let k = ui.global::<Kindil>();
@@ -955,7 +974,7 @@ impl Ctx {
             }),
             Effect::Nap => {
                 // On the minute, plus a second so the clock has turned.
-                let nap = until_next_minute(Utc::now()) + Duration::from_secs(1);
+                let nap = until_next_minute((self.now)()) + Duration::from_secs(1);
                 if nap < MIN_NAP {
                     self.after(nap, DeviceEvent::Resumed);
                 } else {
@@ -969,7 +988,7 @@ impl Ctx {
                 }
             }
             Effect::Redraw => {
-                let now = Utc::now();
+                let now = (self.now)();
                 let window = {
                     let mut state = self.state.borrow_mut();
                     let window = Window::after_nap(state.online, now);

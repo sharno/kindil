@@ -75,6 +75,7 @@ fn preview(cli: &Cli, dir: &std::path::Path) -> anyhow::Result<()> {
         panel: Panel::Lcd,
         execution: Execution::Inline,
         touches: Touches::default(),
+        now: chrono::Utc::now,
     })?;
     app.refresh_now();
     if miqat_config.is_file() {
@@ -98,6 +99,7 @@ fn desktop(cli: &Cli) -> anyhow::Result<()> {
         panel: Panel::Lcd,
         execution: Execution::Background,
         touches: Touches::default(),
+        now: chrono::Utc::now,
     })?;
     app.start();
     kindil::signals::quit_on_termination()?;
@@ -113,7 +115,6 @@ fn kindle(cli: &Cli) -> anyhow::Result<Exit> {
         include_bytes!("../crates/miqat/assets/fonts/IBMPlexSansArabic-Regular.ttf");
     let config = cli.config()?;
     let backend = slint_backend_kindle::install(REGULAR)?;
-    // Suspend stays with Amazon's powerd; kindil never arms a wake alarm.
     let app = App::new(Options {
         config,
         host: Arc::new(KindleHost::open()),
@@ -123,6 +124,7 @@ fn kindle(cli: &Cli) -> anyhow::Result<Exit> {
         },
         execution: Execution::Background,
         touches: Touches::new(backend.touch_counter()),
+        now: chrono::Utc::now,
     })?;
     app.start();
     kindil::signals::quit_on_termination()?;
