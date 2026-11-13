@@ -6,8 +6,9 @@ A prayer-time wall dashboard and e-reader for the first-generation Kindle
 Paperwhite (PW1), in Rust and Slint.
 
 kindil runs **as an app on Amazon's stock OS**, started from KUAL. While it
-runs, Amazon's UI steps aside; when it exits or crashes, Amazon's UI comes
-back. It never flashes, never replaces init or the bootloader, and changes no
+runs, Amazon's UI steps aside; when it exits, Amazon's UI comes back. A crash
+restarts it; a version that keeps crashing makes way for the previous one, and
+then for Amazon's UI. It never flashes, never replaces init or the bootloader, and changes no
 system file. A reboot always returns the Kindle to stock.
 
 ## What it does
@@ -47,6 +48,11 @@ system file. A reboot always returns the Kindle to stock.
     computer has `/mnt/us`; unplugging reloads the library and resumes
     Syncthing. A cable that keeps dropping doesn't flash the screen: kindil
     returns only once the storage has stayed back for 3 s.
+  - **Low battery**: at 5% and not charging, kindil sleeps with a screen that
+    asks for a charge. Suspended, the last few percent last for days.
+  - **Crash restart**: the launcher restarts kindil after a crash. After 3
+    crashes within 5 minutes it runs the previous version (kept by the last
+    update), and after 3 more it returns to Amazon's UI.
 - **E-ink care**: while a finger drags a list, the list follows it in fast
   black-and-white frames (the A2 waveform), each sent only once the panel has
   finished the last, so motion doesn't smear. Every 8 frames of a long drag
@@ -93,6 +99,8 @@ downloads it. Nothing installs without a tap.
   two minutes.
 - **Rollback:** if it exits or crashes before then, or the Kindle reboots
   mid-trial, the launcher runs the previous binary again.
+- **Launcher:** once kept, the new version also installs the KUAL launcher
+  files it was built with; they take effect at the next start.
 - **Scope:** only kindil's own files change; the bootloader, kernel and system
   partition are never touched.
 

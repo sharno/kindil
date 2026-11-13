@@ -145,6 +145,7 @@ struct SimulatedState {
     brightness: Brightness,
     suspends: u32,
     naps: u32,
+    battery: Battery,
     wifi: Power,
     ssh: Power,
     ssh_at_boot: Power,
@@ -157,6 +158,10 @@ impl Default for Simulated {
                 brightness: Brightness::new(40),
                 suspends: 0,
                 naps: 0,
+                battery: Battery::Known {
+                    percent: 82,
+                    charge: crate::battery::Charge::Charging,
+                },
                 wifi: Power::On,
                 ssh: Power::On,
                 ssh_at_boot: Power::On,
@@ -169,6 +174,10 @@ impl Simulated {
     /// How many times the device was put to sleep.
     pub fn suspends(&self) -> u32 {
         self.with(|s| s.suspends)
+    }
+
+    pub fn set_battery(&self, battery: Battery) {
+        self.with(|s| s.battery = battery);
     }
 
     /// How many times the device napped while dozing.
@@ -231,10 +240,7 @@ impl Host for Simulated {
     }
     fn info(&self) -> DeviceInfo {
         DeviceInfo {
-            battery: Battery::Known {
-                percent: 82,
-                charge: crate::battery::Charge::Charging,
-            },
+            battery: self.with(|s| s.battery),
             memory: Some(Memory {
                 total_kib: 255_000,
                 available_kib: 171_000,

@@ -26,6 +26,31 @@ pub const RESTART_EXIT_CODE: u8 = 75;
 /// The binary's file name in the extension's `bin` folder.
 const BINARY: &str = "kindil";
 const SIGNATURE: &str = "kindil.minisig";
+/// The KUAL extension this binary was built with, relative to its folder,
+/// with each file's mode. A settled update installs them, so launcher fixes
+/// arrive over the air too; they take effect at the next start from KUAL.
+const LAUNCHER: [(&str, &[u8], u32); 4] = [
+    (
+        "bin/session.sh",
+        include_bytes!("../kindle/extensions/kindil/bin/session.sh"),
+        0o755,
+    ),
+    (
+        "bin/start.sh",
+        include_bytes!("../kindle/extensions/kindil/bin/start.sh"),
+        0o755,
+    ),
+    (
+        "menu.json",
+        include_bytes!("../kindle/extensions/kindil/menu.json"),
+        0o644,
+    ),
+    (
+        "config.xml",
+        include_bytes!("../kindle/extensions/kindil/config.xml"),
+        0o644,
+    ),
+];
 /// A release binary is about 16 MB; anything far larger is not ours.
 const MAX_DOWNLOAD: u64 = 64 << 20;
 
@@ -283,7 +308,34 @@ impl Slots {
         }
         std::fs::rename(&trying, &current)?;
         std::fs::remove_file(&self.trial)?;
+        // The new binary is kept either way; an old launcher still runs it.
+        if let Err(error) = self.install_launcher() {
+            eprintln!("kindil: launcher: {error}");
+        }
         Ok(Commit::Committed)
+    }
+
+    /// Writes the launcher files that differ, each replaced in one rename so
+    /// a cut-off write never leaves half a script for KUAL to run.
+    fn install_launcher(&self) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = self
+            .bin
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{} has no parent", self.bin.display()))?;
+        LAUNCHER
+            .iter()
+            .filter(|(name, bytes, _)| {
+                std::fs::read(root.join(name)).ok().as_deref() != Some(*bytes)
+            })
+            .try_for_each(|(name, bytes, mode)| {
+                let path = root.join(name);
+                let part = path.with_extension("part");
+                std::fs::write(&part, bytes)?;
+                std::fs::set_permissions(&part, std::fs::Permissions::from_mode(*mode))?;
+                std::fs::rename(&part, &path)?;
+                Ok(())
+            })
     }
 }
 
@@ -366,6 +418,13 @@ SW/I/JX/SBpxgS4DThvhL91wP3EJoH7taYJoyf43DW8zZZ3wB65CwRxKLqoEs5+fTbZ4yzLmtSU3WMSU
         assert_eq!(read("kindil"), "new");
         assert_eq!(read("kindil.previous"), "old");
         assert!(!trial.exists() && !bin.join("kindil.trying").exists());
+        LAUNCHER.iter().for_each(|(name, bytes, _)| {
+            assert_eq!(
+                std::fs::read(dir.path().join(name)).unwrap(),
+                *bytes,
+                "{name}"
+            );
+        });
         assert_eq!(slots.commit().unwrap(), Commit::Nothing);
         std::fs::write(&trial, "").unwrap();
         assert_eq!(slots.commit().unwrap(), Commit::Nothing);

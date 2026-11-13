@@ -6,6 +6,7 @@
 //! minute clock (idle) and kindil's own workers and timers, so this is a
 //! reducer: a pure `step` from (mode, event) to the next mode and the effects
 //! to run. The UI runs the effects.
+use crate::battery::{Battery, Charge};
 use crate::host::Brightness;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,20 @@ pub const ONLINE_WINDOW: Duration = Duration::from_secs(45);
 pub const FETCH_AFTER: Duration = Duration::from_secs(25);
 /// Shorter naps aren't worth a suspend: kindil waits for the minute awake.
 pub const MIN_NAP: Duration = Duration::from_secs(5);
+/// At or below this level on battery, kindil sleeps with a charge screen:
+/// suspended, the last few percent last for days instead of an hour.
+pub const BATTERY_EMPTY: u8 = 5;
+
+/// [`Event::BatteryEmpty`] when the battery is that low and not charging.
+pub fn battery_event(battery: Battery) -> Option<Event> {
+    match battery {
+        Battery::Known {
+            percent,
+            charge: Charge::Discharging,
+        } if percent <= BATTERY_EMPTY => Some(Event::BatteryEmpty),
+        Battery::Known { .. } | Battery::Unknown => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -44,6 +59,8 @@ pub enum Event {
     Idle,
     /// Nobody touched the screen for [`DOZE_AFTER`], and kindil dozes.
     Doze,
+    /// See [`battery_event`].
+    BatteryEmpty,
     /// The front light is off; this was its level, if it could be read.
     LightOff(Option<Brightness>),
     /// The sleep screen, or a dozing redraw, has had time to reach the panel.
@@ -180,7 +197,7 @@ impl Mode {
             (M::Awake { since }, E::PowerButton) if now.duration_since(since) < WAKING_PRESS => {
                 Err(Ignored::WakingPress)
             }
-            (M::Awake { .. }, E::PowerButton | E::Idle) => {
+            (M::Awake { .. }, E::PowerButton | E::Idle | E::BatteryEmpty) => {
                 to(M::Asleep(Sleep::DimmingLight), FALL_ASLEEP)
             }
             (M::Awake { .. }, E::Doze) => to(M::Dozing(Doze::DimmingLight), [Effect::LightOff]),
@@ -198,6 +215,14 @@ impl Mode {
             (M::Dozing(doze), E::PowerButton) => to(
                 awake,
                 std::iter::once(Effect::Rouse).chain(doze.light().map(Effect::RestoreLight)),
+            ),
+            // The light is already off, or on its way: LightOff carries its level.
+            (M::Dozing(Doze::DimmingLight), E::BatteryEmpty) => {
+                to(M::Asleep(Sleep::DimmingLight), [Effect::ShowSleep])
+            }
+            (M::Dozing(Doze::Settling { light } | Doze::Drawing { light }), E::BatteryEmpty) => to(
+                M::Asleep(Sleep::Settling { light }),
+                [Effect::ShowSleep, Effect::AwaitPanel],
             ),
             (M::Dozing(doze), E::Drive(Drive::Computer)) => to(
                 M::UsbDrive,
@@ -237,6 +262,10 @@ impl Mode {
                 E::Drive(Drive::Kindle) | E::DriveSettled(_),
             )
             | (M::Asleep(_) | M::Dozing(_), E::Idle | E::Doze)
+            | (M::Asleep(_), E::BatteryEmpty)
+            // The nap's own wake would follow and wake the app; the next
+            // redraw reads the battery again.
+            | (M::Dozing(Doze::Napping { .. }), E::BatteryEmpty)
             | (
                 M::Dozing(Doze::Settling { .. } | Doze::Napping { .. } | Doze::Drawing { .. }),
                 E::LightOff(_),
@@ -258,6 +287,7 @@ impl Mode {
                 M::UsbDrive | M::Returning { .. },
                 E::Idle
                 | E::Doze
+                | E::BatteryEmpty
                 | E::LightOff(_)
                 | E::PanelSettled
                 | E::Resumed
@@ -524,6 +554,51 @@ mod tests {
                 Effect::RestoreLight(light),
             ]
         );
+    }
+
+    #[test]
+    fn an_empty_battery_sleeps_from_awake_or_dozing() {
+        let light = Brightness::new(40);
+        let (mode, effects) = run(&[(Event::BatteryEmpty, 10_000)]);
+        assert_eq!(mode, Mode::Asleep(Sleep::DimmingLight));
+        assert_eq!(effects, FALL_ASLEEP);
+        let (mode, effects) = run(&[
+            (Event::Doze, 10_000),
+            (Event::LightOff(Some(light)), 10_100),
+            (Event::PanelSettled, 11_600),
+            (Event::BatteryEmpty, 11_700),
+            (Event::Resumed, 12_000),
+            (Event::BatteryEmpty, 12_500),
+            (Event::PanelSettled, 14_000),
+        ]);
+        assert_eq!(mode, Mode::Asleep(Sleep::Suspended { light: Some(light) }));
+        assert_eq!(
+            effects,
+            [
+                Effect::LightOff,
+                Effect::AwaitPanel,
+                Effect::Nap,
+                Effect::Redraw,
+                Effect::ShowSleep,
+                Effect::AwaitPanel,
+                Effect::Suspend,
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_low_battery_on_its_own_power_is_empty() {
+        let battery = |percent, charge| Battery::Known { percent, charge };
+        assert_eq!(
+            battery_event(battery(BATTERY_EMPTY, Charge::Discharging)),
+            Some(Event::BatteryEmpty)
+        );
+        assert_eq!(
+            battery_event(battery(BATTERY_EMPTY + 1, Charge::Discharging)),
+            None
+        );
+        assert_eq!(battery_event(battery(1, Charge::Charging)), None);
+        assert_eq!(battery_event(Battery::Unknown), None);
     }
 
     #[test]

@@ -13,6 +13,15 @@ CONFIG=/mnt/us/kindil/kindil.toml
 TRYING="$RUN/trying"
 # kindil's exit code after staging an update: run again.
 RESTART=75
+# A crash restarts kindil, unless it crashed this often within this many
+# seconds: then that version is broken, and the one before it (kept by the
+# last update) gets the same chances before Amazon's UI comes back.
+CRASHES=3
+WINDOW=300
+crashes=""
+# The slot that runs: kindil, or kindil.previous once kindil kept crashing.
+# Only for this session, so the slots on disk never change behind an update.
+SLOT="$EXT/kindil"
 
 log() { echo "$(date '+%F %T') $*"; }
 
@@ -28,6 +37,13 @@ restore() {
 # Copies the binary to run into /var/local, which stays when a computer takes
 # /mnt/us. A staged update (kindil.next, written by kindil after checking its
 # signature) gets one trial run; otherwise the current binary runs.
+# Records a crash; fails once there were too many lately.
+crashed() {
+  now=$(date +%s)
+  crashes="$(for t in $crashes; do [ $((now - t)) -lt $WINDOW ] && echo "$t"; done) $now"
+  [ "$(echo "$crashes" | wc -w)" -lt "$CRASHES" ]
+}
+
 pick() {
   if [ -f "$EXT/kindil.next" ] && mv -f "$EXT/kindil.next" "$EXT/kindil.trying"; then
     if cp "$EXT/kindil.trying" "$BIN"; then
@@ -37,8 +53,8 @@ pick() {
     fi
     rm -f "$EXT/kindil.trying"
   fi
-  if [ -f "$EXT/kindil" ]; then
-    cmp -s "$EXT/kindil" "$BIN" || cp "$EXT/kindil" "$BIN"
+  if [ -f "$SLOT" ]; then
+    cmp -s "$SLOT" "$BIN" || cp "$SLOT" "$BIN"
   fi
 }
 
@@ -86,8 +102,25 @@ while :; do
     rm -f "$TRYING" "$EXT/kindil.trying"
     log "the update ended early; back to the previous version"
     [ "$status" -eq 0 ] && break
-  elif [ "$status" -ne "$RESTART" ]; then
-    break
+  else
+    case "$status" in
+    "$RESTART") ;;
+    # Exit to Kindle, or stopped on purpose (Ctrl-C, kill).
+    0 | 130 | 143) break ;;
+    *)
+      if crashed; then
+        log "restarting after a crash"
+      elif [ "$SLOT" = "$EXT/kindil" ] && [ -f "$EXT/kindil.previous" ]; then
+        SLOT="$EXT/kindil.previous"
+        crashes=""
+        log "crashed $CRASHES times in $WINDOW s; trying the previous version"
+      else
+        log "crashed $CRASHES times in $WINDOW s; giving up"
+        break
+      fi
+      sleep 2
+      ;;
+    esac
   fi
   pick
 done

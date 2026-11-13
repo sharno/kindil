@@ -73,6 +73,8 @@ export global Kindil {
     in property <string> date;
     in property <int> battery-level: -1;
     in property <string> battery-label: "—";
+    /// Low enough that kindil sleeps until it is charged.
+    in property <bool> battery-empty;
     in property <int> wifi-bars: -1;
 
     // Dashboard
@@ -1273,7 +1275,7 @@ component SystemScreen inherits Rectangle {
             horizontal-alignment: center;
         }
         Text {
-            text: Kindil.system == System.asleep ? "Asleep"
+            text: Kindil.system == System.asleep ? (Kindil.battery-empty ? "Battery low" : "Asleep")
                 : Kindil.system == System.usb-drive ? "USB drive" : "Off";
             font-size: 44px;
             font-weight: 600;
@@ -1281,7 +1283,8 @@ component SystemScreen inherits Rectangle {
             horizontal-alignment: center;
         }
         Text {
-            text: Kindil.system == System.asleep ? "Press the power button to wake."
+            text: Kindil.system == System.asleep
+                    ? (Kindil.battery-empty ? "Plug in the cable to charge, then press the power button." : "Press the power button to wake.")
                 : Kindil.system == System.usb-drive
                     ? "Your books are on the computer as a drive named Kindle. Eject it there, then unplug the cable."
                     : "Hold the power button for a few seconds to start.";

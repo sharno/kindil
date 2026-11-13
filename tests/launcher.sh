@@ -55,8 +55,36 @@ touch "$T/run/trying"
 run
 expect "a trial cut short by a reboot is dropped" "$(files)$("$T/run/kindil" --version)" "kindil kindil 1.0.0"
 
+runs() { wc -l <"$T/runs" | tr -d ' '; }
+
 reset
-fake "$T/ext/kindil" 1.0.0 "echo ran >>$T/runs; exit 1"
 rm -f "$T/runs"
+fake "$T/ext/kindil" 1.0.0 "echo ran >>$T/runs; [ \$(wc -l <$T/runs) -ge 2 ] && exit 0; exit 101"
 run
-expect "a crash without a trial returns to Amazon's UI" "$(wc -l <"$T/runs" | tr -d ' ')" "1"
+expect "a crash restarts kindil" "$(runs)" "2"
+
+reset
+rm -f "$T/runs"
+fake "$T/ext/kindil" 1.0.0 "echo ran >>$T/runs; exit 139"
+run
+expect "crashing over and over returns to Amazon's UI" "$(runs)" "3"
+
+reset
+rm -f "$T/runs"
+fake "$T/ext/kindil" 2.0.0 "echo ran >>$T/runs; exit 139"
+fake "$T/ext/kindil.previous" 1.0.0 "echo previous >>$T/runs; exit 0"
+run
+expect "a version that keeps crashing falls back to the previous one" "$(tr '\n' ' ' <"$T/runs")$(files)" "ran ran ran previous kindil kindil.previous "
+
+reset
+rm -f "$T/runs"
+fake "$T/ext/kindil" 2.0.0 "echo ran >>$T/runs; exit 139"
+fake "$T/ext/kindil.previous" 1.0.0 "echo previous >>$T/runs; exit 139"
+run
+expect "both versions crashing returns to Amazon's UI" "$(runs)" "6"
+
+reset
+rm -f "$T/runs"
+fake "$T/ext/kindil" 1.0.0 "echo ran >>$T/runs; exit 143"
+run
+expect "a kill returns to Amazon's UI" "$(runs)" "1"

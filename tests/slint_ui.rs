@@ -1,5 +1,6 @@
 //! The production window and renderer, driven by real taps on a simulated
 //! device. Coordinates are the 758×1024 panel's; see ui/app.slint for layout.
+use kindil::battery::{Battery, Charge};
 use kindil::config::Config;
 use kindil::host::{Host, Simulated};
 use kindil::preview::{self, drag, pixels, tap};
@@ -412,6 +413,25 @@ fn auto_sleep_is_a_saved_choice() {
     assert_eq!(f.k().get_auto_sleep(), 3);
     let prefs = std::fs::read_to_string(f.dir.path().join("prefs.toml")).unwrap();
     assert!(prefs.contains("minutes = 15"), "{prefs}");
+}
+
+#[test]
+fn an_empty_battery_sleeps_with_a_charge_screen() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    host.set_battery(Battery::Known {
+        percent: 4,
+        charge: Charge::Discharging,
+    });
+    f.k().invoke_navigated(Page::Settings);
+    f.k().invoke_device_events();
+    assert_eq!(f.k().get_system(), System::Asleep);
+    assert!(
+        f.k().get_battery_empty(),
+        "the sleep screen asks for a charge"
+    );
+    f.app.fire_timers();
+    assert_eq!(host.suspends(), 1);
 }
 
 #[test]

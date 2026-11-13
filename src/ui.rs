@@ -213,6 +213,7 @@ impl Snapshot {
         let (level, label) = view::battery(self.info.battery);
         k.set_battery_level(level);
         k.set_battery_label(label.into());
+        k.set_battery_empty(crate::system::battery_event(self.info.battery).is_some());
         k.set_wifi_bars(view::wifi_bars(&self.wifi));
         let (wifi, detail) = view::wifi(&self.wifi);
         k.set_wifi(wifi);
@@ -494,7 +495,12 @@ impl Ctx {
     }
 
     fn refresh_status(&self) {
-        self.background(Snapshot::read, |ui, snapshot| snapshot.apply(ui));
+        let deliver = self.deliver();
+        self.background(Snapshot::read, move |ui, snapshot| {
+            let empty = crate::system::battery_event(snapshot.info.battery);
+            snapshot.apply(ui);
+            empty.into_iter().for_each(&deliver);
+        });
     }
 
     /// Re-read the device after a switch, once the change has had time to land.
