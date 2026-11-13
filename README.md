@@ -142,8 +142,9 @@ faster.
   UI and its Java framework, since kindil draws to the screen itself, and
   stop Amazon's boot spinner and the services kindil doesn't use (connections,
   apps, archive, updates, sync and the like). Of Amazon's system only powerd,
-  wifid and volumd stay: kindil comes up about 20 s after the kernel, with
-  more memory free. Every way back to Amazon's UI removes the flag first and
+  wifid and volumd stay, and kindil sets the default route and name servers
+  each time Wi-Fi connects, as Amazon's connection manager would. kindil
+  comes up about 20 s after the kernel, with more memory free. Every way back to Amazon's UI removes the flag first and
   starts those services and X if they aren't running:
   leaving kindil (Exit to Kindle, a crash it gives up on, a kill), and any
   boot where kindil doesn't stay up for 2 minutes. After a boot kindil stays
