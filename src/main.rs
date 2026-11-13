@@ -37,6 +37,9 @@ enum Mode {
     /// restarts Amazon's UI around it
     #[cfg(feature = "kindle")]
     Kindle,
+    /// Print kernel uevents (power button, USB cable) as they arrive
+    #[cfg(target_os = "linux")]
+    Uevents,
 }
 
 impl Cli {
@@ -122,6 +125,14 @@ fn kindle(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn uevents() -> anyhow::Result<()> {
+    let listener = kindil::uevent::Listener::open()?;
+    loop {
+        println!("{}", listener.next()?);
+    }
+}
+
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let result = match &cli.mode {
@@ -130,6 +141,8 @@ fn main() -> std::process::ExitCode {
         Mode::Desktop => desktop(&cli),
         #[cfg(feature = "kindle")]
         Mode::Kindle => kindle(&cli),
+        #[cfg(target_os = "linux")]
+        Mode::Uevents => uevents(),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
