@@ -4,7 +4,7 @@
 // - black on white, a few solid grays, no animation or translucency (each frame
 //   costs a panel update, and dithered grays look dirty);
 // - every tap target is at least 64 px tall, row targets span the full width;
-// - the prayer dashboard stays full-bleed: tap it to reveal the top and tab bars.
+// - the prayer dashboard stays full-bleed: tap it to reveal the status row, quick panel and tab bar.
 import { VirtualKeyboard, VirtualKeyboardHandler } from "vendor/slint-keyboard/virtual_keyboard.slint";
 export { VirtualKeyboardHandler }
 import "../crates/miqat/assets/fonts/IBMPlexSansArabic-Regular.ttf";
@@ -56,10 +56,14 @@ global Theme {
 export global Kindil {
     in-out property <Page> page: Page.dashboard;
     in-out property <DashboardKind> dashboard: DashboardKind.miqat;
-    /// The top and tab bars over the full-bleed dashboard; other pages always show them.
+    /// The status row and tab bar over the full-bleed dashboard; other pages always show them.
     in-out property <bool> chrome-visible: false;
+    /// The quick panel (front light, text size) dropped down from the status row.
+    in-out property <bool> panel-open: false;
+    /// Bumped by every use of a panel control, to restart the hide timer.
+    in-out property <int> activity: 0;
 
-    // Top bar
+    // Status row
     in property <string> clock: "--:--";
     in property <string> date;
     in property <int> battery-level: -1;
@@ -142,6 +146,7 @@ export global Kindil {
     public function go(target: Page) {
         page = target;
         chrome-visible = false;
+        panel-open = false;
         navigated(target);
     }
 }
@@ -257,47 +262,49 @@ component SwitchRow {
 /// set about every 400 ms and once more on release, not on every movement.
 component LightSlider {
     in property <int> value;
+    /// The finger is on the slider.
+    callback touched();
     callback chosen(int);
     property <bool> enabled: root.value >= 0;
-    property <length> pad: 24px;
+    // Room for half the knob at each end of the track.
+    property <length> pad: 28px;
     property <length> span: root.width - 2 * root.pad;
     // The level under the finger.
     property <int> at: round(clamp(touch.mouse-x - root.pad, 0px, root.span) / root.span * 100);
     property <int> shown: touch.pressed ? root.at : max(root.value, 0);
-    // A fixed width in the top bar keeps the controls where they are; Settings stretches it.
-    min-width: 150px;
-    preferred-width: 190px;
-    max-width: 190px;
-    // Track: filled up to the knob.
+    min-width: 160px;
+    horizontal-stretch: 1;
+    // A thick track and a big knob, so it is plain on e-ink what is being slid.
     Rectangle {
         x: root.pad;
         y: (parent.height - self.height) / 2;
         width: root.span;
-        height: 8px;
-        border-radius: 4px;
+        height: 22px;
+        border-radius: 11px;
         background: root.enabled ? Theme.line : Theme.surface;
     }
     Rectangle {
         x: root.pad;
         y: (parent.height - self.height) / 2;
         width: root.span * root.shown / 100;
-        height: 8px;
-        border-radius: 4px;
+        height: 22px;
+        border-radius: 11px;
         background: root.enabled ? Theme.ink : Theme.line;
     }
     Rectangle {
         x: root.pad + root.span * root.shown / 100 - self.width / 2;
         y: (parent.height - self.height) / 2;
-        width: 36px;
-        height: 36px;
-        border-radius: 18px;
-        border-width: 3px;
+        width: 48px;
+        height: 48px;
+        border-radius: 24px;
+        border-width: 5px;
         border-color: root.enabled ? Theme.ink : Theme.line;
         background: touch.pressed ? Theme.ink : Theme.paper;
     }
     touch := TouchArea {
         enabled: root.enabled;
         pointer-event(event) => {
+            root.touched();
             if event.kind == PointerEventKind.up && root.at != root.value {
                 root.chosen(root.at);
             }
@@ -310,6 +317,58 @@ component LightSlider {
             if root.at != root.value {
                 root.chosen(root.at);
             }
+        }
+    }
+}
+
+/// A sun for the ends of the light slider: a dim, small one and a bright, big one.
+component Sun {
+    in property <bool> bright;
+    width: 44px;
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: root.bright ? 22px : 12px;
+        height: self.width;
+        border-radius: self.width / 2;
+        border-width: 3px;
+        border-color: root.bright ? Theme.ink : Theme.ink-3;
+        background: root.bright ? Theme.ink : transparent;
+    }
+    // Four rays: up, down, left, right.
+    for ray[i] in 4: Rectangle {
+        visible: root.bright;
+        property <bool> vertical: mod(i, 2) == 0;
+        width: self.vertical ? 3px : 8px;
+        height: self.vertical ? 8px : 3px;
+        x: root.width / 2 - self.width / 2 + (self.vertical ? 0px : (i == 1 ? 18px : -18px));
+        y: root.height / 2 - self.height / 2 + (self.vertical ? (i == 0 ? -18px : 18px) : 0px);
+        background: Theme.ink;
+    }
+}
+
+/// The front light: dim sun, slider, bright sun, level. The same row in the
+/// quick panel and in Settings.
+component LightRow {
+    callback touched();
+    min-height: 88px;
+    HorizontalLayout {
+        spacing: 0px;
+        Sun { }
+        LightSlider {
+            value: Kindil.brightness;
+            touched => { root.touched(); }
+            chosen(percent) => { Kindil.choose-brightness(percent); }
+        }
+        Sun { bright: true; }
+        Text {
+            text: Kindil.brightness >= 0 ? Kindil.brightness + "%" : "—";
+            width: 70px;
+            font-size: 23px;
+            font-weight: 700;
+            color: Kindil.brightness >= 0 ? Theme.ink : Theme.ink-3;
+            horizontal-alignment: right;
+            vertical-alignment: center;
         }
     }
 }
@@ -531,14 +590,14 @@ component BatteryStatus {
     }
 }
 
-/// Quick controls: clock, front light and battery everywhere; text size in the
-/// reader. Shown with the tab bar, so one tap reveals both over the dashboard.
-component TopBar inherits Rectangle {
-    height: 68px;
+/// Clock on the left, Wi-Fi and battery on the right. A tap drops the quick
+/// panel down from it, or puts it away again.
+component StatusRow inherits Rectangle {
+    height: 56px;
     background: Theme.paper;
     HorizontalLayout {
-        padding-left: 20px;
-        padding-right: 20px;
+        padding-left: Theme.gutter;
+        padding-right: Theme.gutter;
         spacing: 10px;
         Text {
             text: Kindil.clock;
@@ -546,45 +605,88 @@ component TopBar inherits Rectangle {
             font-weight: 700;
             color: Theme.ink;
             vertical-alignment: center;
-        }
-        if Kindil.page != Page.reader: Rectangle { horizontal-stretch: 1; }
-        if Kindil.page == Page.reader: HorizontalLayout {
             horizontal-stretch: 1;
-            alignment: end;
-            spacing: 10px;
-            VerticalLayout {
-                alignment: center;
-                BarButton { text: "A"; font-size: 20px; clicked => { Kindil.font-smaller(); } }
-            }
-            VerticalLayout {
-                alignment: center;
-                BarButton { text: "A"; font-size: 34px; clicked => { Kindil.font-larger(); } }
-            }
         }
-        LightSlider {
-            value: Kindil.brightness;
-            chosen(percent) => { Kindil.choose-brightness(percent); }
-        }
-        Text {
-            text: Kindil.brightness >= 0 ? Kindil.brightness + "%" : "—";
-            width: 52px;
-            font-size: 20px;
-            font-weight: 600;
-            color: Kindil.brightness >= 0 ? Theme.ink : Theme.ink-3;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
-        Rectangle { width: 8px; }
         if Kindil.wifi-bars >= 0: VerticalLayout {
             alignment: center;
             WifiBars { bars: Kindil.wifi-bars; }
         }
+        Rectangle { width: 6px; }
         BatteryStatus { }
+    }
+    // A grip: the row can be pulled open.
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: parent.height - 12px;
+        width: 44px;
+        height: 5px;
+        border-radius: 2px;
+        background: Kindil.panel-open ? Theme.ink : Theme.ink-3;
     }
     Rectangle {
         y: parent.height - 1px;
         height: 1px;
         background: Theme.line;
+    }
+    TouchArea { clicked => { Kindil.panel-open = !Kindil.panel-open; } }
+}
+
+/// Quick settings under the status row. It covers the page rather than
+/// pushing it down, so opening it redraws only its own area.
+component QuickPanel inherits Rectangle {
+    background: Theme.paper;
+    height: self.preferred-height;
+    preferred-height: column.preferred-height;
+    // Swallow taps so they never reach the page underneath.
+    TouchArea { }
+    column := VerticalLayout {
+        padding-left: Theme.gutter;
+        padding-right: Theme.gutter;
+        padding-top: 4px;
+        padding-bottom: 14px;
+        LightRow { touched => { Kindil.activity += 1; } }
+        if Kindil.page == Page.reader: HorizontalLayout {
+            height: 76px;
+            spacing: 14px;
+            Text {
+                text: "Text size";
+                font-size: 23px;
+                font-weight: 600;
+                color: Theme.ink;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            VerticalLayout {
+                alignment: center;
+                BarButton {
+                    text: "A";
+                    font-size: 20px;
+                    clicked => { Kindil.activity += 1; Kindil.font-smaller(); }
+                }
+            }
+            Text {
+                text: Kindil.font-size + " px";
+                width: 84px;
+                font-size: 23px;
+                font-weight: 700;
+                color: Theme.ink;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            VerticalLayout {
+                alignment: center;
+                BarButton {
+                    text: "A";
+                    font-size: 34px;
+                    clicked => { Kindil.activity += 1; Kindil.font-larger(); }
+                }
+            }
+        }
+    }
+    Rectangle {
+        y: parent.height - 3px;
+        height: 3px;
+        background: Theme.ink;
     }
 }
 
@@ -1223,32 +1325,7 @@ component SettingsPage {
                 }
                 Group {
                     title: "DISPLAY";
-                    HorizontalLayout {
-                        min-height: 88px;
-                        spacing: 8px;
-                        Text {
-                            text: "Front light";
-                            font-size: 23px;
-                            font-weight: 600;
-                            color: Kindil.brightness >= 0 ? Theme.ink : Theme.ink-3;
-                            vertical-alignment: center;
-                        }
-                        LightSlider {
-                            horizontal-stretch: 1;
-                            max-width: 10000px;
-                            value: Kindil.brightness;
-                            chosen(percent) => { Kindil.choose-brightness(percent); }
-                        }
-                        Text {
-                            text: Kindil.brightness >= 0 ? Kindil.brightness + "%" : "—";
-                            width: 64px;
-                            font-size: 23px;
-                            font-weight: 700;
-                            color: Kindil.brightness >= 0 ? Theme.ink : Theme.ink-3;
-                            horizontal-alignment: right;
-                            vertical-alignment: center;
-                        }
-                    }
+                    LightRow { }
                     Divider { }
                     HorizontalLayout {
                         min-height: 84px;
@@ -1552,7 +1629,13 @@ export component AppWindow inherits Window {
             horizontal-alignment: center;
             vertical-alignment: center;
         }
-        TouchArea { clicked => { Kindil.chrome-visible = !Kindil.chrome-visible; } }
+        // The bars and the panel come and go together.
+        TouchArea {
+            clicked => {
+                Kindil.chrome-visible = !Kindil.chrome-visible;
+                Kindil.panel-open = Kindil.chrome-visible;
+            }
+        }
     }
 
     // The dashboard has no bars until tapped, so the battery stays visible in
@@ -1568,7 +1651,7 @@ export component AppWindow inherits Window {
 
     VerticalLayout {
         height: root.usable-height;
-        if !root.immersive || Kindil.chrome-visible: TopBar { }
+        if !root.immersive || Kindil.chrome-visible: StatusRow { }
         Rectangle {
             vertical-stretch: 1;
             if Kindil.page == Page.dashboard && Kindil.dashboard == DashboardKind.clock: ClockPage { width: parent.width; height: parent.height; }
@@ -1580,11 +1663,32 @@ export component AppWindow inherits Window {
         if !root.immersive || Kindil.chrome-visible: TabBar { }
     }
 
-    // Hide the revealed bars again so the wall dashboard stays clean.
-    Timer {
+    // A tap outside the panel puts it away (and the bars with it, on the dashboard).
+    if Kindil.panel-open: TouchArea {
+        y: 56px;
+        height: root.usable-height - 56px - 92px;
+        clicked => {
+            Kindil.panel-open = false;
+            if root.immersive {
+                Kindil.chrome-visible = false;
+            }
+        }
+    }
+    if Kindil.panel-open: QuickPanel {
+        y: 56px;
+    }
+
+    // Hide the revealed bars and the panel again so the wall dashboard stays
+    // clean. Using a panel control starts the time over.
+    property <int> activity: Kindil.activity;
+    changed activity => { hide.restart(); }
+    hide := Timer {
         interval: 20s;
-        running: Kindil.chrome-visible;
-        triggered => { Kindil.chrome-visible = false; }
+        running: Kindil.chrome-visible || Kindil.panel-open;
+        triggered => {
+            Kindil.chrome-visible = false;
+            Kindil.panel-open = false;
+        }
     }
 
     Timer {

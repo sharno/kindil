@@ -117,6 +117,9 @@ pub fn screens(app: &App, window: &MinimalSoftwareWindow, dir: &Path) -> anyhow:
     k.invoke_go(Page::Dashboard);
     shot("dashboard-miqat")?;
     k.set_chrome_visible(true);
+    k.set_panel_open(true);
+    shot("dashboard-miqat-panel")?;
+    k.set_panel_open(false);
     shot("dashboard-miqat-tabs")?;
     k.set_dashboard(DashboardKind::Clock);
     k.invoke_go(Page::Dashboard);
@@ -131,6 +134,9 @@ pub fn screens(app: &App, window: &MinimalSoftwareWindow, dir: &Path) -> anyhow:
         k.invoke_open_book(0);
         k.invoke_next_page();
         shot("reader")?;
+        k.set_panel_open(true);
+        shot("reader-panel")?;
+        k.set_panel_open(false);
     }
 
     k.invoke_go(Page::Settings);

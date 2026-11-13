@@ -13,9 +13,12 @@ system file. A reboot always returns the Kindle to stock.
 - **Home**: the [Miqat](https://github.com/sharno/miqat) prayer dashboard,
   full-bleed and pixel-exact, refreshed on each minute; or a large clock. A
   small battery gauge always shows at the top. Tap the dashboard to reveal the
-  top bar and the tab bar; they hide again after 20 s.
-- **Top bar**: clock, a front light slider with its level, Wi-Fi and battery on
-  every page; in the reader also text size smaller/larger.
+  status row, the quick panel and the tab bar; they hide again after 20 s.
+- **Status row and quick panel**: every page has a slim status row (clock,
+  Wi-Fi, battery). Tapping it drops a panel over the page with the front light
+  slider (dim sun to bright sun, with the level) and, in the reader, text size
+  smaller/larger. A tap outside, or 20 s, puts it away; using a control
+  restarts the 20 s.
 - **Library and reader**: `.epub` and UTF-8 `.txt` files from `/mnt/us/books`.
   Tap the right two-thirds of a page to go forward, the left third to go back.
   kindil remembers the position in every

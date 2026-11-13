@@ -16,14 +16,18 @@ const TAB_Y: f32 = 978.0;
 const HOME_TAB: f32 = 95.0;
 const LIBRARY_TAB: f32 = 284.0;
 const SETTINGS_TAB: f32 = 663.0;
-const BAR_Y: f32 = 34.0;
-// The front light slider's track (0% to 100%) in the top bar, and in Settings.
-const BAR_LIGHT: (f32, f32) = (335.0, 477.0);
-const SETTINGS_LIGHT: (f32, f32) = (170.0, 634.0);
-// Where the track starts depends on text widths, so levels are checked to within a few points.
-const SLACK: i32 = 6;
-const SMALLER_TEXT: f32 = 207.0;
-const LARGER_TEXT: f32 = 273.0;
+// The status row's grip, and the quick panel below it.
+const STATUS_ROW: (f32, f32) = (380.0, 28.0);
+// The front light slider's track (0% to 100%) and row height, in the panel and in Settings.
+const PANEL_LIGHT: (f32, f32) = (100.0, 588.0);
+const PANEL_LIGHT_Y: f32 = 104.0;
+const SETTINGS_LIGHT: (f32, f32) = (100.0, 588.0);
+const SETTINGS_LIGHT_Y: f32 = 372.0;
+const SLACK: i32 = 2;
+// Text size buttons in the reader's panel.
+const TEXT_SIZE_Y: f32 = 186.0;
+const SMALLER_TEXT: f32 = 533.0;
+const LARGER_TEXT: f32 = 702.0;
 
 struct Fixture {
     app: App,
@@ -151,49 +155,101 @@ fn miqat_is_pixel_exact_and_taps_reveal_both_bars() {
 
     f.tap(380.0, 500.0);
     assert!(f.k().get_chrome_visible());
+    assert!(
+        f.k().get_panel_open(),
+        "the tap opens the panel with the bars"
+    );
     let revealed = pixels(&f.window);
     assert!(
-        frame_differs(&revealed, &expected, 0..68),
-        "the tap shows the top bar"
+        frame_differs(&revealed, &expected, 0..56),
+        "the tap shows the status row"
+    );
+    assert!(
+        frame_differs(&revealed, &expected, 60..150),
+        "the tap shows the quick panel"
     );
     assert!(
         frame_differs(&revealed, &expected, 932..1024),
         "the tap shows the tab bar"
     );
 
-    // Dragging the slider sets the light once, on release, and the revealed
-    // bar stays up meanwhile.
+    // Dragging the slider sets the light once, on release, and the panel
+    // stays up meanwhile.
     assert_eq!(f.k().get_brightness(), 40);
-    let during = f.slide(BAR_LIGHT, BAR_Y, 40.0, 80.0);
+    let during = f.slide(PANEL_LIGHT, PANEL_LIGHT_Y, 40.0, 80.0);
     assert_eq!(during, 40, "the light is not set on every finger movement");
     assert!((f.k().get_brightness() - 80).abs() <= SLACK);
-    f.tap(BAR_LIGHT.0 + (BAR_LIGHT.1 - BAR_LIGHT.0) * 0.25, BAR_Y);
+    f.tap(
+        PANEL_LIGHT.0 + (PANEL_LIGHT.1 - PANEL_LIGHT.0) * 0.25,
+        PANEL_LIGHT_Y,
+    );
     assert!(
         (f.k().get_brightness() - 25).abs() <= SLACK,
         "a tap on the track jumps there, got {}",
         f.k().get_brightness()
     );
-    f.slide(BAR_LIGHT, BAR_Y, 25.0, -50.0);
+    f.slide(PANEL_LIGHT, PANEL_LIGHT_Y, 25.0, -50.0);
     assert_eq!(f.k().get_brightness(), 0, "dragging past the end clamps");
-    assert!(f.k().get_chrome_visible());
+    assert!(f.k().get_panel_open());
+    assert!(
+        f.k().get_activity() > 0,
+        "using the slider restarts the hide timer"
+    );
 
+    // A tap outside puts away the panel, and the bars with it.
+    f.tap(380.0, 600.0);
+    assert!(!f.k().get_panel_open());
+    assert!(!f.k().get_chrome_visible());
+
+    f.tap(380.0, 500.0);
+    f.tap(STATUS_ROW.0, STATUS_ROW.1);
+    assert!(!f.k().get_panel_open(), "the status row closes the panel");
+    assert!(f.k().get_chrome_visible());
     f.tap(LIBRARY_TAB, TAB_Y);
     assert_eq!(f.k().get_page(), Page::Library);
 }
 
 #[test]
-fn the_reader_top_bar_sets_text_size_and_light() {
+fn the_status_row_drops_a_panel_over_the_page() {
     let f = Fixture::new(Arc::new(Simulated::default()));
     f.tap(LIBRARY_TAB, TAB_Y);
-    f.tap(300.0, 220.0);
+    let closed = pixels(&f.window);
+    f.tap(STATUS_ROW.0, STATUS_ROW.1);
+    assert!(f.k().get_panel_open());
+    let open = pixels(&f.window);
+    assert!(
+        (56..160).any(|y| (0..758).any(|x| open[y * 758 + x] != closed[y * 758 + x])),
+        "the panel draws over the page"
+    );
+    assert!(
+        (300..900).all(|y| (0..758).all(|x| open[y * 758 + x] == closed[y * 758 + x])),
+        "the panel covers the page instead of pushing it down"
+    );
+    // The page behind does not react to the tap that puts the panel away.
+    f.tap(300.0, 208.0);
+    assert!(!f.k().get_panel_open());
+    assert_eq!(f.k().get_page(), Page::Library);
+    f.tap(STATUS_ROW.0, STATUS_ROW.1);
+    f.tap(SETTINGS_TAB, TAB_Y);
+    assert_eq!(f.k().get_page(), Page::Settings);
+    assert!(!f.k().get_panel_open(), "going elsewhere puts it away");
+}
+
+#[test]
+fn the_reader_panel_sets_text_size_and_light() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    f.tap(LIBRARY_TAB, TAB_Y);
+    f.tap(300.0, 208.0);
     assert_eq!(f.k().get_page(), Page::Reader);
+    f.tap(STATUS_ROW.0, STATUS_ROW.1);
     let size = f.k().get_font_size();
-    f.tap(LARGER_TEXT, BAR_Y);
+    f.tap(LARGER_TEXT, TEXT_SIZE_Y);
     assert!(f.k().get_font_size() > size);
-    f.tap(SMALLER_TEXT, BAR_Y);
-    f.tap(SMALLER_TEXT, BAR_Y);
+    f.tap(SMALLER_TEXT, TEXT_SIZE_Y);
+    f.tap(SMALLER_TEXT, TEXT_SIZE_Y);
     assert!(f.k().get_font_size() < size);
-    f.slide(BAR_LIGHT, BAR_Y, 40.0, 100.0);
+    assert!(f.k().get_panel_open(), "the panel stays while adjusting");
+    f.slide(PANEL_LIGHT, PANEL_LIGHT_Y, 40.0, 100.0);
     assert_eq!(f.k().get_brightness(), 100, "the end of the track is 100%");
 }
 
@@ -278,7 +334,7 @@ fn settings_switch_the_simulated_device() {
     let prefs = std::fs::read_to_string(f.dir.path().join("prefs.toml")).unwrap();
     assert!(prefs.contains("dashboard = \"clock\""), "{prefs}");
     assert_eq!(f.k().get_brightness(), 40);
-    f.slide(SETTINGS_LIGHT, 384.0, 40.0, 70.0); // front light slider
+    f.slide(SETTINGS_LIGHT, SETTINGS_LIGHT_Y, 40.0, 70.0); // front light slider
     assert!((f.k().get_brightness() - 70).abs() <= SLACK);
     assert_eq!(f.k().get_ssh(), Switch::On);
     f.tap(380.0, 829.0); // SSH server row
@@ -518,7 +574,7 @@ fn lists_follow_the_swipe_with_few_panel_updates() {
     // The list, left of the scroll bar, below the header.
     let list = |frame: &[slint::Rgb8Pixel], y: usize| frame[y * 758..y * 758 + 740].to_vec();
     let bar = |frame: &[slint::Rgb8Pixel]| {
-        (164..932)
+        (152..932)
             .map(|y| frame[y * 758 + 740..y * 758 + 758].to_vec())
             .collect::<Vec<_>>()
     };
@@ -532,7 +588,7 @@ fn lists_follow_the_swipe_with_few_panel_updates() {
         .for_each(|y| send(WindowEvent::PointerMoved { position: at(y) }));
     let moving = pixels(&f.window);
     assert!(
-        (164..932).all(|y| list(&moving, y) == list(&before, y)),
+        (152..932).all(|y| list(&moving, y) == list(&before, y)),
         "the list must not redraw on every finger movement"
     );
     assert!(
@@ -542,7 +598,7 @@ fn lists_follow_the_swipe_with_few_panel_updates() {
     std::thread::sleep(std::time::Duration::from_millis(450));
     let caught_up = pixels(&f.window);
     assert!(
-        (164..532).all(|y| list(&caught_up, y) == list(&before, y + 400)),
+        (152..532).all(|y| list(&caught_up, y) == list(&before, y + 400)),
         "the list catches up with the finger while it is down"
     );
     send(WindowEvent::PointerReleased {
@@ -551,7 +607,7 @@ fn lists_follow_the_swipe_with_few_panel_updates() {
     });
     let after = pixels(&f.window);
     assert!(
-        (164..532).all(|y| list(&after, y) == list(&before, y + 400)),
+        (152..532).all(|y| list(&after, y) == list(&before, y + 400)),
         "release settles the list where the finger lifted"
     );
     drag(&f.window, 380.0, 300.0, 800.0);
