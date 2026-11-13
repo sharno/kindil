@@ -24,7 +24,15 @@ system file. A reboot always returns the Kindle to stock.
   deleted outright.
 - **Settings**: home screen, front light, a "clean screen" flash, Wi-Fi on/off
   with network status, scan and join, SSH server and SSH-at-boot switches,
-  Syncthing, and device facts (battery, memory, storage, uptime).
+  Syncthing, device facts (battery, memory, storage, uptime), Restart and
+  Power off.
+- **Device duties** that Amazon's UI normally performs:
+  - **Power button**: sleeps (a sleep screen, front light off, suspend to
+    RAM) and wakes, with the light restored. powerd ignores the button while
+    kindil runs, so kindil hears it through kernel uevents.
+  - **USB drive mode**: plugging into a computer shows a USB screen while the
+    computer has `/mnt/us`; unplugging reloads the library and resumes
+    Syncthing.
 - **E-ink care**: while a finger drags a list, only the scroll bar follows
   it; the list catches up a few times a second and settles on release, so the
   panel is not redrawn on every finger movement. In the
@@ -50,7 +58,8 @@ and `dist/kindil` to `/mnt/us/extensions/kindil/bin/kindil`.
 Then put your Miqat settings at `/mnt/us/kindil/miqat.toml` and, optionally,
 a `/mnt/us/kindil/kindil.toml` (see [examples/kindil.toml](examples/kindil.toml)).
 Start it from KUAL → **kindil → Start kindil**. **Settings → Exit to Kindle**
-returns to Amazon's UI. The log is `/mnt/us/kindil/kindil.log`.
+returns to Amazon's UI. The log is `/var/local/kindil/kindil.log` (over SSH).
+Restart and Power off also come back to Amazon's UI on the next boot.
 
 If kindil ever stops responding: SSH in and `killall kindil` (the launcher then
 restarts Amazon's UI), or hold the power button for about 20 s to reboot.
@@ -60,6 +69,7 @@ restarts Amazon's UI), or hold the power button for about 20 s to reboot.
 | Path | What |
 |---|---|
 | `/mnt/us/extensions/kindil/` | KUAL launcher and the `kindil` binary |
+| `/var/local/kindil/` | The running copy and the log; off `/mnt/us`, which a computer takes in USB drive mode |
 | `/mnt/us/kindil/kindil.toml` | Optional settings (every key has a default) |
 | `/mnt/us/kindil/miqat.toml` | Miqat's own settings: location, prayer method |
 | `/mnt/us/kindil/prefs.toml` | Choices made on the device; safe to delete |

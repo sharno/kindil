@@ -3,11 +3,15 @@
 //! except the documented USBNetwork "SSH at boot" flag file.
 use crate::battery::{Battery, Charge};
 use crate::frontlight::Frontlight;
-use crate::host::{Brightness, DeviceInfo, Host, Memory, Power, Ssh, Storage, Wifi};
+use crate::host::{Brightness, Deliver, DeviceInfo, Host, Memory, Power, Ssh, Storage, Wifi};
 use crate::lipc;
+use crate::system::{self, Event};
+use crate::uevent::Uevent;
 use crate::wifi::{self, Credentials, Link, Network};
+use std::io::BufRead;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 const INTERFACE: &str = "wlan0";
@@ -153,6 +157,94 @@ impl Host for KindleHost {
                 .and_then(|text| parse_uptime(&text)),
         }
     }
+
+    fn listen(&self, deliver: Deliver) {
+        let deliver = Arc::new(deliver);
+        let power = deliver.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = power_button(|| power(Event::PowerButton)) {
+                eprintln!("kindil: power button: {error}");
+            }
+        });
+        std::thread::spawn(move || {
+            if let Err(error) = volumd(|event| deliver(event)) {
+                eprintln!("kindil: USB drive mode: {error}");
+            }
+        });
+    }
+
+    fn suspend(&self) -> anyhow::Result<()> {
+        // Let the panel finish drawing the sleep screen first: suspending
+        // mid-update leaves a half-drawn image for as long as it sleeps.
+        std::thread::sleep(Duration::from_millis(1500));
+        // powerd suspends the same way; it ignores the button while kindil
+        // runs, so nothing else will.
+        std::fs::write("/sys/power/state", b"mem")?;
+        Ok(())
+    }
+
+    fn restart(&self) -> anyhow::Result<()> {
+        run(&mut Command::new("/sbin/reboot"))
+    }
+
+    fn power_off(&self) -> anyhow::Result<()> {
+        std::thread::sleep(Duration::from_millis(1500));
+        run(Command::new("/sbin/shutdown").args(["-h", "now"]))
+    }
+}
+
+fn run(command: &mut Command) -> anyhow::Result<()> {
+    let status = command.status()?;
+    anyhow::ensure!(status.success(), "{command:?} exited with {status}");
+    Ok(())
+}
+
+/// The PW1 reports the power button as this misc device coming online.
+fn is_power_button(event: &Uevent) -> bool {
+    event.action == "online" && event.devpath.ends_with("/yoshibutton")
+}
+
+fn power_button(pressed: impl Fn()) -> std::io::Result<()> {
+    let listener = crate::uevent::Listener::open()?;
+    loop {
+        if is_power_button(&listener.next()?) {
+            pressed();
+        }
+    }
+}
+
+/// Follows volumd's drive mode through `lipc-wait-event`, which dies with kindil.
+fn volumd(deliver: impl Fn(Event)) -> anyhow::Result<()> {
+    let mut command = Command::new("lipc-wait-event");
+    command
+        .args([
+            "-m",
+            "com.lab126.volumd",
+            "driveModeStateChanged,userstoreIsLikelyToUnMount",
+        ])
+        .stdout(std::process::Stdio::piped());
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: prctl is async-signal-safe and touches only this child.
+        unsafe {
+            command.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
+    }
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+    std::io::BufReader::new(stdout)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| system::volumd_event(&line))
+        .for_each(deliver);
+    anyhow::bail!("lipc-wait-event exited with {}", child.wait()?)
 }
 
 /// True if `/proc/net/tcp{,6}` lists a socket in LISTEN state (0A) on `port`.
@@ -203,6 +295,17 @@ fn storage(path: &Path) -> Option<Storage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognises_the_power_button() {
+        let press = Uevent::parse(
+            b"online@/devices/virtual/misc/yoshibutton\0ACTION=online\0SUBSYSTEM=misc\0",
+        )
+        .unwrap();
+        let console = Uevent::parse(b"add@/devices/virtual/vc/vcs63\0ACTION=add\0").unwrap();
+        assert!(is_power_button(&press));
+        assert!(!is_power_button(&console));
+    }
 
     #[test]
     fn detects_a_listening_ssh_server() {

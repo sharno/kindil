@@ -45,6 +45,20 @@ impl std::fmt::Display for Uevent {
 #[cfg(target_os = "linux")]
 pub use socket::Listener;
 
+/// Netlink is Linux-only; elsewhere there is nothing to listen to.
+#[cfg(not(target_os = "linux"))]
+pub enum Listener {}
+
+#[cfg(not(target_os = "linux"))]
+impl Listener {
+    pub fn open() -> std::io::Result<Self> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+    pub fn next(&self) -> std::io::Result<Uevent> {
+        match *self {}
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod socket {
     use super::Uevent;

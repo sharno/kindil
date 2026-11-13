@@ -1,6 +1,6 @@
 //! Headless rendering: the production window on a software framebuffer with
 //! no devices, for previews and tests.
-use crate::ui::{App, DashboardKind, Kindil, Page};
+use crate::ui::{App, DashboardKind, Kindil, Page, System};
 use slint::platform::{
     software_renderer::{MinimalSoftwareWindow, RepaintBufferType},
     Platform, WindowAdapter,
@@ -147,5 +147,17 @@ pub fn screens(app: &App, window: &MinimalSoftwareWindow, dir: &Path) -> anyhow:
     shot("networks-join")?;
     k.set_join_open(false);
     k.invoke_go(Page::Dashboard);
+
+    [
+        (System::Asleep, "asleep"),
+        (System::UsbDrive, "usb-drive"),
+        (System::Off, "off"),
+    ]
+    .into_iter()
+    .try_for_each(|(system, name)| {
+        k.set_system(system);
+        shot(name)
+    })?;
+    k.set_system(System::App);
     Ok(())
 }

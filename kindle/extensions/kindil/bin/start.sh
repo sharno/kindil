@@ -9,6 +9,17 @@ PIDFILE=/var/tmp/kindil.pid
 if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
   exit 0
 fi
-mkdir -p /mnt/us/kindil
-"$DIR/bin/session.sh" >>/mnt/us/kindil/kindil.log 2>&1 </dev/null &
+# Run from /var/local, not /mnt/us: in USB drive mode the computer gets /mnt/us
+# while kindil keeps running. Copied only when changed, to spare the flash.
+RUN=/var/local/kindil
+mkdir -p "$RUN" /mnt/us/kindil
+for f in session.sh kindil; do
+  cmp -s "$DIR/bin/$f" "$RUN/$f" || cp "$DIR/bin/$f" "$RUN/$f"
+done
+# /var/local is 64 MB and also holds Amazon's settings: keep the log small.
+LOG="$RUN/kindil.log"
+if [ -f "$LOG" ] && [ "$(wc -c <"$LOG")" -gt 262144 ]; then
+  tail -c 131072 "$LOG" >"$LOG.old" && mv "$LOG.old" "$LOG"
+fi
+"$RUN/session.sh" >>"$LOG" 2>&1 </dev/null &
 echo $! >"$PIDFILE"

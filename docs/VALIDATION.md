@@ -41,9 +41,14 @@ Each step needs the one before it. Keep an SSH session open throughout.
    every 6th turn.
 5. Settings: Wi-Fi status and IP, scan, SSH switch (sshd stops and starts),
    SSH at boot (`/mnt/us/usbnet/auto` appears and disappears), battery.
-6. Leave the dashboard running for an hour plugged in. Record memory, minute
+6. Power button: a press shows the sleep screen, switches the light off and
+   suspends; the next press wakes with the light back and Wi-Fi reconnects
+   (`kindil uevents` prints the button as `online@.../yoshibutton`). USB:
+   plugging in shows the USB screen and the computer sees the Kindle drive;
+   unplugging returns to kindil with a clean screen.
+7. Leave the dashboard running for an hour plugged in. Record memory, minute
    updates, and the 30-minute ghosting flash.
-7. Optional: Syncthing, watching memory and the log.
+8. Optional: Syncthing, watching memory and the log.
 
-Record kernel messages (`dmesg`) and `/mnt/us/kindil/kindil.log` for any
+Record kernel messages (`dmesg`) and `/var/local/kindil/kindil.log` for any
 failure.

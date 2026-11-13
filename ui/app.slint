@@ -15,6 +15,9 @@ export enum Page { dashboard, library, reader, settings, networks }
 export enum DashboardKind { miqat, clock }
 /// A setting's switch. `unavailable` covers "not installed" and "no hardware".
 export enum Switch { off, on, unavailable }
+/// What owns the screen: the app, or one of the device states kindil runs
+/// in Amazon's place.
+export enum System { app, asleep, usb-drive, off }
 
 export struct BookItem {
     title: string,
@@ -126,6 +129,11 @@ export global Kindil {
     callback toggle-ssh-at-boot();
     callback toggle-sync();
     callback exit-app();
+    in property <System> system: System.app;
+    /// Device events are waiting on the Rust side.
+    callback device-events();
+    callback restart();
+    callback power-off();
 
     public function go(target: Page) {
         page = target;
@@ -1101,6 +1109,99 @@ component Group {
     }
 }
 
+enum PowerChoice { none, restart, power-off }
+
+/// Restart and Power off, each confirmed by a second tap.
+component PowerButtons inherits VerticalLayout {
+    property <PowerChoice> asking: PowerChoice.none;
+    if root.asking == PowerChoice.none: HorizontalLayout {
+        spacing: 12px;
+        Button {
+            horizontal-stretch: 1;
+            text: "Restart";
+            clicked => { root.asking = PowerChoice.restart; }
+        }
+        Button {
+            horizontal-stretch: 1;
+            text: "Power off";
+            clicked => { root.asking = PowerChoice.power-off; }
+        }
+    }
+    if root.asking != PowerChoice.none: HorizontalLayout {
+        spacing: 12px;
+        Text {
+            horizontal-stretch: 1;
+            text: root.asking == PowerChoice.restart ? "Restart the Kindle?" : "Power off the Kindle?";
+            font-size: 21px;
+            font-weight: 600;
+            color: Theme.ink;
+            vertical-alignment: center;
+        }
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.quiet;
+            clicked => { root.asking = PowerChoice.none; }
+        }
+        Button {
+            text: root.asking == PowerChoice.restart ? "Restart" : "Power off";
+            kind: ButtonKind.primary;
+            clicked => {
+                if root.asking == PowerChoice.restart {
+                    Kindil.restart();
+                } else {
+                    Kindil.power-off();
+                }
+                root.asking = PowerChoice.none;
+            }
+        }
+    }
+}
+
+/// Covers the app while the device sleeps, is a USB drive, or is off. E-ink
+/// keeps the image without power, so this is what the Kindle shows meanwhile.
+component SystemScreen inherits Rectangle {
+    background: Theme.paper;
+    // The app underneath must not take taps.
+    TouchArea { }
+    VerticalLayout {
+        alignment: center;
+        padding-left: 64px;
+        padding-right: 64px;
+        spacing: 20px;
+        Text {
+            text: "قنديل";
+            font-size: 120px;
+            font-weight: 700;
+            color: Theme.ink;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: Kindil.system == System.asleep ? "Asleep"
+                : Kindil.system == System.usb-drive ? "USB drive" : "Off";
+            font-size: 44px;
+            font-weight: 600;
+            color: Theme.ink;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: Kindil.system == System.asleep ? "Press the power button to wake."
+                : Kindil.system == System.usb-drive
+                    ? "Your books are on the computer as a drive named Kindle. Eject it there, then unplug the cable."
+                    : "Hold the power button for a few seconds to start.";
+            font-size: 24px;
+            color: Theme.ink-2;
+            wrap: word-wrap;
+            horizontal-alignment: center;
+        }
+        if Kindil.system == System.asleep: Text {
+            text: "Battery " + Kindil.battery-label;
+            font-size: 22px;
+            color: Theme.ink-3;
+            horizontal-alignment: center;
+        }
+    }
+}
+
 component SettingsPage {
     VerticalLayout {
         PageHeader { title: "Settings"; trailing: Kindil.version; }
@@ -1247,6 +1348,8 @@ component SettingsPage {
                     wrap: word-wrap;
                     horizontal-alignment: center;
                 }
+                Rectangle { height: 12px; }
+                PowerButtons { }
             }
         }
     }
@@ -1489,4 +1592,6 @@ export component AppWindow inherits Window {
         height: 320px;
         close => { root.dismiss-keyboard(); }
     }
+
+    if Kindil.system != System.app: SystemScreen { }
 }

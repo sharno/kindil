@@ -3,7 +3,8 @@
 use kindil::config::Config;
 use kindil::host::{Host, Simulated};
 use kindil::preview::{self, drag, pixels, tap};
-use kindil::ui::{App, DashboardKind, Execution, Kindil, Options, Page, Panel, Switch};
+use kindil::system::{Drive, Event};
+use kindil::ui::{App, DashboardKind, Execution, Kindil, Options, Page, Panel, Switch, System};
 use kindil::wifi::Credentials;
 use slint::platform::software_renderer::MinimalSoftwareWindow;
 use slint::{ComponentHandle, Model};
@@ -256,6 +257,45 @@ fn settings_switch_the_simulated_device() {
     );
 }
 
+#[test]
+fn the_power_button_sleeps_and_the_light_comes_back() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    // The simulated device wakes as soon as it suspends.
+    f.app.device_event(Event::PowerButton);
+    assert_eq!(host.suspends(), 1);
+    assert_eq!(f.k().get_system(), System::App);
+    assert_eq!(host.brightness().unwrap().percent(), 40);
+    // The press that woke it is reported after resume; it must not sleep again.
+    f.app.device_event(Event::PowerButton);
+    assert_eq!(host.suspends(), 1);
+}
+
+#[test]
+fn usb_drive_mode_covers_the_app_until_the_storage_is_back() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    f.tap(LIBRARY_TAB, TAB_Y);
+    let before = pixels(&f.window);
+    f.app.device_event(Event::StorageLeaving);
+    f.app.device_event(Event::Drive(Drive::Computer));
+    assert_eq!(f.k().get_system(), System::UsbDrive);
+    assert!(pixels(&f.window) != before);
+    f.tap(380.0, 300.0);
+    assert_eq!(f.k().get_page(), Page::Library, "taps don't reach the app");
+    std::fs::write(f.books().join("New_Book.txt"), "Copied over USB\n").unwrap();
+    f.app.device_event(Event::Drive(Drive::Kindle));
+    assert_eq!(f.k().get_system(), System::App);
+    assert_eq!(f.k().get_books().row_count(), 2, "the library is reloaded");
+}
+
+#[test]
+fn power_off_reports_a_device_that_cannot() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    f.k().invoke_power_off();
+    assert_eq!(f.k().get_system(), System::App);
+    assert!(f.k().get_notice().contains("cannot power off"));
+}
+
 /// Records what the UI asked to join, so no passphrase has to be exposed.
 #[derive(Default)]
 struct Recording {
@@ -298,6 +338,18 @@ impl Host for Recording {
     }
     fn info(&self) -> kindil::host::DeviceInfo {
         self.device.info()
+    }
+    fn listen(&self, deliver: kindil::host::Deliver) {
+        self.device.listen(deliver)
+    }
+    fn suspend(&self) -> anyhow::Result<()> {
+        self.device.suspend()
+    }
+    fn restart(&self) -> anyhow::Result<()> {
+        self.device.restart()
+    }
+    fn power_off(&self) -> anyhow::Result<()> {
+        self.device.power_off()
     }
 }
 

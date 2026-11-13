@@ -108,6 +108,9 @@ pub struct DeviceInfo {
     pub uptime: Option<Duration>,
 }
 
+/// Delivers device events to the UI from any thread.
+pub type Deliver = Box<dyn Fn(crate::system::Event) + Send + Sync>;
+
 pub trait Host: Send + Sync {
     fn brightness(&self) -> anyhow::Result<Brightness>;
     fn set_brightness(&self, level: Brightness) -> anyhow::Result<()>;
@@ -121,6 +124,12 @@ pub trait Host: Send + Sync {
     fn set_ssh(&self, power: Power) -> anyhow::Result<()>;
     fn set_ssh_at_boot(&self, power: Power) -> anyhow::Result<()>;
     fn info(&self) -> DeviceInfo;
+    /// Starts the threads that report the power button and USB drive mode.
+    fn listen(&self, deliver: Deliver);
+    /// Suspends to RAM; returns once the device is awake again.
+    fn suspend(&self) -> anyhow::Result<()>;
+    fn restart(&self) -> anyhow::Result<()>;
+    fn power_off(&self) -> anyhow::Result<()>;
 }
 
 /// Fixture device for previews and tests. Switches remember their state so UI
@@ -131,6 +140,7 @@ pub struct Simulated {
 
 struct SimulatedState {
     brightness: Brightness,
+    suspends: u32,
     wifi: Power,
     ssh: Power,
     ssh_at_boot: Power,
@@ -141,6 +151,7 @@ impl Default for Simulated {
         Self {
             state: Mutex::new(SimulatedState {
                 brightness: Brightness::new(40),
+                suspends: 0,
                 wifi: Power::On,
                 ssh: Power::On,
                 ssh_at_boot: Power::On,
@@ -150,6 +161,11 @@ impl Default for Simulated {
 }
 
 impl Simulated {
+    /// How many times the device was put to sleep.
+    pub fn suspends(&self) -> u32 {
+        self.with(|s| s.suspends)
+    }
+
     fn with<T>(&self, f: impl FnOnce(&mut SimulatedState) -> T) -> T {
         f(&mut self.state.lock().expect("simulated host poisoned"))
     }
@@ -219,6 +235,19 @@ impl Host for Simulated {
             }),
             uptime: Some(Duration::from_secs(3 * 3600 + 25 * 60)),
         }
+    }
+    /// Tests deliver events themselves.
+    fn listen(&self, _: Deliver) {}
+    /// Wakes at once, as if the power button were pressed right away.
+    fn suspend(&self) -> anyhow::Result<()> {
+        self.with(|s| s.suspends += 1);
+        Ok(())
+    }
+    fn restart(&self) -> anyhow::Result<()> {
+        anyhow::bail!("a simulated device cannot restart")
+    }
+    fn power_off(&self) -> anyhow::Result<()> {
+        anyhow::bail!("a simulated device cannot power off")
     }
 }
 

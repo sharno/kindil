@@ -14,6 +14,7 @@ pub mod preview;
 pub mod reader;
 pub mod signals;
 pub mod sync;
+pub mod system;
 pub mod uevent;
 pub mod ui;
 pub mod view;

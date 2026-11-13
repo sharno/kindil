@@ -8,6 +8,7 @@ use crate::host::{Brightness, DeviceInfo, Host, Power, Ssh, Wifi};
 use crate::prefs::Store;
 use crate::reader::{self, Book, Layout, Reader};
 use crate::sync::Service;
+use crate::system::{Effect, Event as DeviceEvent, Mode, Step};
 use crate::view;
 use crate::wifi::Credentials;
 use chrono::{DateTime, Timelike, Utc};
@@ -15,7 +16,7 @@ use slint::{ComponentHandle, ModelRc, VecModel};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 slint::include_modules!();
@@ -95,6 +96,14 @@ struct State {
     sync: Service,
     trashed: Option<Trashed>,
     miqat: Worker,
+    system: Mode,
+}
+
+/// Device events from any thread, queued for the UI thread.
+#[derive(Clone)]
+struct Events {
+    sender: mpsc::Sender<DeviceEvent>,
+    queue: Rc<mpsc::Receiver<DeviceEvent>>,
 }
 
 #[derive(Clone)]
@@ -105,6 +114,7 @@ struct Ctx {
     state: Rc<RefCell<State>>,
     display: Display,
     execution: Execution,
+    events: Events,
 }
 
 pub struct App {
@@ -190,6 +200,7 @@ impl App {
         let store = Store::open(&options.config.prefs);
         let sync = Service::new(options.config.syncthing.clone());
         let dashboard = store.prefs.dashboard.unwrap_or(options.config.dashboard);
+        let (sender, queue) = mpsc::channel();
         let ctx = Ctx {
             weak: window.as_weak(),
             host: options.host,
@@ -200,6 +211,7 @@ impl App {
                 sync,
                 trashed: None,
                 miqat: Worker::Idle,
+                system: Mode::start(Instant::now()),
             })),
             display: Display {
                 panel: options.panel,
@@ -207,6 +219,10 @@ impl App {
             },
             config: Rc::new(options.config),
             execution: options.execution,
+            events: Events {
+                sender,
+                queue: Rc::new(queue),
+            },
         };
         {
             let k = window.global::<Kindil>();
@@ -236,6 +252,7 @@ impl App {
 
     /// Clock, status, the dashboard worker, and Syncthing if it was left on.
     pub fn start(&self) {
+        self.ctx.host.listen(Box::new(self.ctx.deliver()));
         self.ctx.refresh_status();
         arm_clock(self.clock.clone(), self.ctx.clone());
         let ctx = self.ctx.clone();
@@ -257,15 +274,14 @@ impl App {
         k.set_miqat_frame(slint::Image::from_rgb8(pixels(gray)));
     }
 
+    /// A power press, USB drive mode, ... as the device would report it.
+    pub fn device_event(&self, event: DeviceEvent) {
+        self.ctx.device(event);
+    }
+
     /// Stops Syncthing and keeps the reading position before the window goes.
     pub fn shutdown(&self) {
-        let mut state = self.ctx.state.borrow_mut();
-        let sync = std::mem::replace(&mut state.sync, Service::NotInstalled);
-        state.sync = match sync {
-            Service::Running(running) => Service::Stopped(running.stop()),
-            other => other,
-        };
-        let _ = state.store.save();
+        self.ctx.release_storage();
     }
 }
 
@@ -317,6 +333,9 @@ fn wire(window: &AppWindow, ctx: &Ctx) {
     on!(on_toggle_ssh_at_boot => toggle_ssh_at_boot());
     on!(on_toggle_sync => toggle_sync());
     on!(on_exit_app => exit_app());
+    on!(on_device_events => device_events());
+    on!(on_restart => restart());
+    on!(on_power_off => power_off());
 }
 
 fn arm_clock(timer: Rc<slint::Timer>, ctx: Ctx) {
@@ -781,6 +800,150 @@ impl Ctx {
             state.sync = sync.polled();
         }
         self.show_sync();
+    }
+
+    // ── device: sleep, USB drive mode, power ──
+
+    /// Sends device events to the UI thread from anywhere.
+    fn deliver(&self) -> impl Fn(DeviceEvent) + Send + Sync + 'static {
+        let sender = self.events.sender.clone();
+        let weak = self.weak.clone();
+        move |event| {
+            if sender.send(event).is_ok() {
+                let _ =
+                    weak.upgrade_in_event_loop(|ui| ui.global::<Kindil>().invoke_device_events());
+            }
+        }
+    }
+
+    fn device_events(&self) {
+        std::iter::from_fn(|| self.events.queue.try_recv().ok()).for_each(|e| self.device(e));
+    }
+
+    fn device(&self, event: DeviceEvent) {
+        let mode = self.state.borrow().system;
+        match mode.step(event, Instant::now()) {
+            Err(ignored) => eprintln!("kindil: {event:?} ignored: {ignored:?}"),
+            Ok(Step { next, effects }) => {
+                self.state.borrow_mut().system = next;
+                effects.into_iter().for_each(|effect| self.apply(effect));
+            }
+        }
+    }
+
+    /// Runs slow device work off the UI thread and feeds its outcome back as an event.
+    fn device_later(&self, work: impl FnOnce(&dyn Host) -> DeviceEvent + Send + 'static) {
+        match self.execution {
+            Execution::Inline => self.device(work(&*self.host)),
+            Execution::Background => {
+                let host = self.host.clone();
+                let deliver = self.deliver();
+                std::thread::spawn(move || deliver(work(&*host)));
+            }
+        }
+    }
+
+    fn apply(&self, effect: Effect) {
+        let Some(ui) = self.ui() else { return };
+        match effect {
+            Effect::ShowSleep => self.show_system(&ui, System::Asleep),
+            Effect::ShowUsbDrive => self.show_system(&ui, System::UsbDrive),
+            Effect::LightOff => self.device_later(|host| {
+                let level = host.brightness().ok();
+                // A light that won't switch off doesn't stop the device sleeping.
+                let _ = host.set_brightness(Brightness::new(0));
+                DeviceEvent::LightOff(level)
+            }),
+            Effect::Suspend => self.device_later(|host| match host.suspend() {
+                Ok(()) => DeviceEvent::Resumed,
+                Err(error) => {
+                    eprintln!("kindil: suspend: {error}");
+                    DeviceEvent::SuspendFailed
+                }
+            }),
+            Effect::Wake { light } => {
+                self.show_system(&ui, System::App);
+                // The clock and battery moved on while the device slept.
+                self.tick_clock();
+                self.refresh_status();
+                if let Some(level) = light {
+                    self.background(
+                        move |host| host.set_brightness(level),
+                        |ui, result| {
+                            if let Err(error) = result {
+                                notify(ui, &format!("Front light: {error}"));
+                            }
+                        },
+                    );
+                }
+            }
+            Effect::ReleaseStorage => self.release_storage(),
+            Effect::StorageBack => self.storage_back(),
+        }
+    }
+
+    /// A different screen, so flash the panel clean: this also clears whatever
+    /// Amazon's screen modules drew.
+    fn show_system(&self, ui: &AppWindow, system: System) {
+        ui.global::<Kindil>().set_system(system);
+        self.display.updated(ui, Update::Navigate);
+    }
+
+    /// Stops Syncthing, which keeps files open on the user storage, and saves
+    /// choices while the storage is still there. The Syncthing preference stays.
+    fn release_storage(&self) {
+        {
+            let mut state = self.state.borrow_mut();
+            let sync = std::mem::replace(&mut state.sync, Service::NotInstalled);
+            state.sync = match sync {
+                Service::Running(running) => Service::Stopped(running.stop()),
+                other => other,
+            };
+            let _ = state.store.save();
+        }
+        self.show_sync();
+    }
+
+    /// The computer may have added, renamed or removed books.
+    fn storage_back(&self) {
+        self.reload_library();
+        let resume_sync = {
+            let state = self.state.borrow();
+            state.store.prefs.sync == Power::On && matches!(state.sync, Service::Stopped(_))
+        };
+        if resume_sync {
+            self.toggle_sync();
+        }
+    }
+
+    fn restart(&self) {
+        self.release_storage();
+        self.background(
+            |host| host.restart(),
+            |ui, result| {
+                if let Err(error) = result {
+                    notify(ui, &format!("Restart: {error}"));
+                }
+            },
+        );
+    }
+
+    fn power_off(&self) {
+        let Some(ui) = self.ui() else { return };
+        self.release_storage();
+        // E-ink keeps this screen with the power off.
+        self.show_system(&ui, System::Off);
+        let display = self.display.clone();
+        self.background(
+            |host| host.power_off(),
+            move |ui, result| {
+                if let Err(error) = result {
+                    ui.global::<Kindil>().set_system(System::App);
+                    display.updated(ui, Update::Navigate);
+                    notify(ui, &format!("Power off: {error}"));
+                }
+            },
+        );
     }
 
     fn exit_app(&self) {
