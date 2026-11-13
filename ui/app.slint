@@ -1257,9 +1257,17 @@ component SystemScreen inherits Rectangle {
         padding-left: 64px;
         padding-right: 64px;
         spacing: 20px;
+        HorizontalLayout {
+            alignment: center;
+            Image {
+                source: @image-url("../assets/logo.svg");
+                width: 200px;
+                height: 200px;
+            }
+        }
         Text {
             text: "قنديل";
-            font-size: 120px;
+            font-size: 96px;
             font-weight: 700;
             color: Theme.ink;
             horizontal-alignment: center;

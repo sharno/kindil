@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <title>kindil</title>
+  <!-- A qandil: a hanging lantern with a flame. Black on a white tile, so it
+       reads on e-ink and on light or dark pages alike. -->
+  <rect width="128" height="128" rx="28" fill="#fff"/>
+  <g fill="#000">
+    <!-- hanging ring -->
+    <circle cx="64" cy="15" r="6.5" fill="none" stroke="#000" stroke-width="4.5"/>
+    <!-- dome and band -->
+    <path d="M42 36 Q64 14 86 36 Z"/>
+    <rect x="36" y="34" width="56" height="8" rx="3"/>
+    <!-- glass -->
+    <path d="M43 42 H85 L95 69 L85 96 H43 L33 69 Z" fill="#fff" stroke="#000" stroke-width="6" stroke-linejoin="round"/>
+    <!-- flame -->
+    <path d="M65 50 C71 58 77 64 77 73 C77 80 71 85 64 85 C57 85 51 80 51 73 C51 67 55 62 58 58 C59 62 60 65 63 66 C61 60 61 55 65 50 Z"/>
+    <!-- base and foot -->
+    <rect x="38" y="95" width="52" height="8" rx="3"/>
+    <rect x="50" y="103" width="28" height="9" rx="3"/>
+  </g>
+</svg>

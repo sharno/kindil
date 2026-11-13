@@ -1,3 +1,5 @@
+<img src="assets/logo.svg" alt="" width="96" align="right">
+
 # kindil · قنديل
 
 A prayer-time wall dashboard and e-reader for the first-generation Kindle
