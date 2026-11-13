@@ -25,6 +25,12 @@ LIMIT=2
 SETTLE=120
 # How long a boot may take to bring up what kindil waits for.
 PATIENCE=120
+# Amazon's services that kindil doesn't use, which a standalone boot stops:
+# connections (cmd, with tmd and phd), apps, archive, power management
+# helpers, dynamic config, updates, crash dumps and sync. kindil keeps
+# powerd, wifid and volumd. Amazon's UI needs them all back; session.sh
+# keeps the same list (tests/launcher.sh checks).
+SERVICES="cmd appmgrd archive dpmd dynconfig otaupd otav3 rcm stackdumpd todo deviced"
 
 log() { echo "$(date '+%F %T') boot: $*"; }
 
@@ -46,12 +52,23 @@ await() {
 # Whether the lipc service $1 answers for its property $2.
 answers() { lipc-get-prop "$1" "$2" >/dev/null 2>&1; }
 
+# Runs upstart's $1 (start or stop) on each of SERVICES that isn't so already.
+services() {
+  for job in $SERVICES; do
+    case "$1" in
+    start) running "$job" || start "$job" ;;
+    stop) ! running "$job" || stop "$job" ;;
+    esac
+  done
+}
+
 # A standalone boot has no Amazon UI to fall back on: bring it back with its
 # framework, now and for the next boots.
 amazon_ui() {
   [ -f "$SKIP" ] || return 0
   rm -f "$SKIP"
   log "starting Amazon's UI with its framework"
+  services start
   if ! running x; then
     # Stopped by a standalone boot: X brings up the rest of Amazon's UI.
     start x
@@ -84,6 +101,9 @@ if [ -f "$SKIP" ]; then
   stop early_progress
   await answers com.lab126.powerd state || log "powerd isn't answering"
   await answers com.lab126.wifid enable || log "wifid isn't answering"
+  # After powerd answers: deviced starts once powerd has.
+  log "stopping Amazon's services kindil doesn't use"
+  services stop
   # What X's language picker does at boot to set up the front light.
   lipc-set-prop com.lab126.powerd flStartup 1
 else

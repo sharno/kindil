@@ -10,6 +10,9 @@ BIN="$RUN/kindil"
 EXT=/mnt/us/extensions/kindil/bin
 CONFIG=/mnt/us/kindil/kindil.toml
 SKIP=/mnt/us/DONT_START_FRAMEWORK
+# Amazon's services that a standalone boot stops (bin/boot.sh, which keeps
+# the same list).
+SERVICES="cmd appmgrd archive dpmd dynconfig otaupd otav3 rcm stackdumpd todo deviced"
 # Present while a new version is on trial; kindil removes it once it has run
 # for two minutes (src/update.rs). Still present after it exits: roll back.
 TRYING="$RUN/trying"
@@ -35,7 +38,8 @@ restore() {
   lipc-set-prop com.lab126.blanket load usb
   lipc-set-prop com.lab126.blanket load splash
   log "starting the Kindle UI"
-  # A standalone boot stopped X: starting it brings up the rest.
+  # A standalone boot stopped these and X: Amazon's UI needs them all.
+  for job in $SERVICES; do running "$job" || start "$job"; done
   if running x; then start lab126_gui; else start x; fi
   rm -f /var/tmp/kindil.pid
 }

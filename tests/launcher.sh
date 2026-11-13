@@ -17,8 +17,13 @@ done
 printf '#!/bin/sh\nif grep -qx "$1" %s/jobs; then echo "$1 start/running"; else echo "$1 stop/waiting"; fi\n' \
   "$T" >"$T/stub/status"
 chmod +x "$T"/stub/*
-# Started from KUAL: X and Amazon's UI are up.
-printf 'x\nlab126_gui\n' >"$T/jobs"
+# Amazon's services a standalone boot stops, as session.sh lists them.
+SERVICES="$(sed -n 's/^SERVICES="\(.*\)"$/\1/p' "$SESSION")"
+BOOT_SERVICES="$(sed -n 's/^SERVICES="\(.*\)"$/\1/p' "$(dirname "$SESSION")/boot.sh")"
+# Started from KUAL: Amazon's services, X and Amazon's UI are up.
+kual() { { echo "$SERVICES" | tr ' ' '\n'; printf 'x\nlab126_gui\n'; } >"$T/jobs"; }
+[ -n "$SERVICES" ] || { echo "FAIL no SERVICES in session.sh"; exit 1; }
+kual
 sed -e "s#^EXT=.*#EXT=$T/ext#" \
   -e "s#^SKIP=.*#SKIP=$T/SKIP#" \
   -e "s#^export PATH=.*#export PATH=$T/stub:/usr/bin:/bin#" \
@@ -128,4 +133,7 @@ expect "started from KUAL, it stops Amazon's UI and starts it again" "$(tr '\n' 
 rm -f "$T/upstart"
 : >"$T/jobs"
 run
-expect "after a standalone boot, leaving starts X and with it Amazon's UI" "$(tr '\n' ',' <"$T/upstart")" "start x,"
+expect "after a standalone boot, leaving starts Amazon's services, then X and with it Amazon's UI" \
+  "$(tr '\n' ',' <"$T/upstart")" "$(for j in $SERVICES; do printf 'start %s,' "$j"; done)start x,"
+
+expect "session.sh and boot.sh stop and start the same services" "$SERVICES" "$BOOT_SERVICES"

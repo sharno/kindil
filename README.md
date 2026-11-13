@@ -139,9 +139,12 @@ faster.
 
 - **Standalone:** `BOOT` holding `standalone` also sets Amazon's own
   `/mnt/us/DONT_START_FRAMEWORK` flag. The next boots then skip X, Amazon's
-  UI and its Java framework, since kindil draws to the screen itself: kindil
-  comes up about 20 s after the kernel, with more memory free. Every way back
-  to Amazon's UI removes the flag first and starts X if it isn't running:
+  UI and its Java framework, since kindil draws to the screen itself, and
+  stop Amazon's boot spinner and the services kindil doesn't use (connections,
+  apps, archive, updates, sync and the like). Of Amazon's system only powerd,
+  wifid and volumd stay: kindil comes up about 20 s after the kernel, with
+  more memory free. Every way back to Amazon's UI removes the flag first and
+  starts those services and X if they aren't running:
   leaving kindil (Exit to Kindle, a crash it gives up on, a kill), and any
   boot where kindil doesn't stay up for 2 minutes. After a boot kindil stays
   up in, the flag is set again.

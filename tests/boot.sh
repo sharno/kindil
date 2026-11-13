@@ -34,14 +34,21 @@ sed -e "s#^FLAG=.*#FLAG=$T/BOOT#" \
   "$BOOT" >"$T/run/boot.sh"
 chmod +x "$T/run/boot.sh"
 
+# Amazon's services a standalone boot stops, and what stopping or starting
+# them all records.
+SERVICES="$(sed -n 's/^SERVICES="\(.*\)"$/\1/p' "$BOOT")"
+[ -n "$SERVICES" ] || { echo "FAIL no SERVICES in boot.sh"; exit 1; }
+all() { for j in $SERVICES; do printf '%s %s,' "$1" "$j"; done; }
+
 boot() { echo "$1" >"$T/boot_id"; "$T/run/boot.sh" >/dev/null 2>&1; }
 starts() { if [ -f "$T/starts" ]; then wc -l <"$T/starts" | tr -d ' '; else echo 0; fi; }
 tries() { cat "$T/state/boot-tries" 2>/dev/null || echo 0; }
-# A boot as the job finds it: X starting, Amazon's UI still to come.
+# A boot as the job finds it: Amazon's services up, X starting, Amazon's UI
+# still to come.
 reset() {
   rm -rf "$T/state" "$T/starts" "$T/pid" "$T/BOOT" "$T/SKIP" "$T/upstart"
   echo 1 >"$T/up"
-  echo x >"$T/jobs"
+  { echo "$SERVICES" | tr ' ' '\n'; echo x; } >"$T/jobs"
 }
 skip() { if [ -f "$T/SKIP" ]; then echo skip; else echo framework; fi; }
 upstart() { cat "$T/upstart" 2>/dev/null | tr '\n' ','; }
@@ -93,7 +100,7 @@ reset
 echo standalone >"$T/BOOT"
 touch "$T/SKIP"
 boot a
-expect "standalone: X and Amazon's UI never start, nor does the spinner stay" "$(starts) $(upstart)" "1 stop x,stop early_progress,"
+expect "standalone: X and Amazon's UI never start, nor does the spinner stay" "$(starts) $(upstart)" "1 stop x,stop early_progress,$(all stop)"
 
 reset
 : >"$T/BOOT"
@@ -105,9 +112,9 @@ echo standalone >"$T/BOOT"
 touch "$T/SKIP"
 echo 0 >"$T/up"
 boot a
-expect "a standalone boot kindil doesn't stay up in gets Amazon's full UI" "$(skip) $(upstart)" "framework stop x,stop early_progress,start x,"
+expect "a standalone boot kindil doesn't stay up in gets Amazon's full UI" "$(skip) $(upstart)" "framework stop x,stop early_progress,$(all stop)$(all start)start x,"
 boot a
-expect "which starts nothing more in that boot" "$(starts) $(upstart)" "1 stop x,stop early_progress,start x,"
+expect "which starts nothing more in that boot" "$(starts) $(upstart)" "1 stop x,stop early_progress,$(all stop)$(all start)start x,"
 
 reset
 echo standalone >"$T/BOOT"
@@ -116,10 +123,10 @@ boot a
 boot b
 touch "$T/SKIP"
 rm -f "$T/upstart"
-echo x >"$T/jobs"
+{ echo "$SERVICES" | tr ' ' '\n'; echo x; } >"$T/jobs"
 boot c
 expect "past the failed-boot limit Amazon's UI comes with its framework" "$(starts) $(skip) $(upstart)" "2 framework "
-printf 'x\nlab126_gui\n' >"$T/jobs"
+{ echo "$SERVICES" | tr ' ' '\n'; printf 'x\nlab126_gui\n'; } >"$T/jobs"
 touch "$T/SKIP"
 boot d
 expect "a job from before 0.6.2 restarts Amazon's UI, which is already up" "$(skip) $(upstart)" "framework stop lab126_gui,start lab126_gui,"
