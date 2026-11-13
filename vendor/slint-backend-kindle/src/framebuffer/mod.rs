@@ -9,8 +9,29 @@ use ffi::{
     MXCFB_SEND_UPDATE_MTK, MXCFB_SEND_UPDATE_REX, MXCFB_SEND_UPDATE_ZELDA,
     MXCFB_WAIT_FOR_UPDATE_COMPLETE, TEMP_USE_AMBIENT, UPDATE_MODE_FULL, UPDATE_MODE_PARTIAL,
     UpdateMarkerData, UpdateRect, UpdateRequest, UpdateRequestMtk, UpdateRequestRex,
-    UpdateRequestZelda, WAVEFORM_MODE_AUTO, WAVEFORM_MODE_GC16,
+    UpdateRequestZelda, WAVEFORM_MODE_A2, WAVEFORM_MODE_AUTO, WAVEFORM_MODE_GC16,
 };
+
+/// How the panel moves pixels for a partial update. kindil patch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Waveform {
+    /// The driver picks; grayscale content gets a slow, clean waveform.
+    Auto,
+    /// Full 16-level grayscale: cleans what A2 left behind.
+    Gc16,
+    /// Black and white only, fastest: for content in motion.
+    A2,
+}
+
+impl Waveform {
+    fn mode(self) -> u32 {
+        match self {
+            Waveform::Auto => WAVEFORM_MODE_AUTO,
+            Waveform::Gc16 => WAVEFORM_MODE_GC16,
+            Waveform::A2 => WAVEFORM_MODE_A2,
+        }
+    }
+}
 
 /// Which MXCFB update ioctl this kernel accepts, varies with the Kindle model
 ///
@@ -308,6 +329,7 @@ impl Framebuffer {
         &self,
         origin: slint::PhysicalPosition,
         size: slint::PhysicalSize,
+        waveform: Waveform,
     ) {
         if size.width == 0 || size.height == 0 {
             return;
@@ -319,7 +341,7 @@ impl Framebuffer {
                 width: size.width,
                 height: size.height,
             },
-            WAVEFORM_MODE_AUTO,
+            waveform.mode(),
             UPDATE_MODE_PARTIAL,
         );
     }

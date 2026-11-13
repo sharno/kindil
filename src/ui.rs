@@ -23,11 +23,15 @@ use std::time::{Duration, Instant};
 
 slint::include_modules!();
 
-/// The display's full-refresh switch.
+/// The display's switches.
 #[derive(Clone)]
 pub enum Panel {
-    /// Set the flag and the next drawn frame is a full GC16 refresh.
-    Eink(Arc<AtomicBool>),
+    Eink {
+        /// Set it and the next drawn frame is a full GC16 refresh.
+        full_refresh: Arc<AtomicBool>,
+        /// Set while content moves: fast black-and-white frames.
+        motion: Arc<AtomicBool>,
+    },
     /// Desktop windows and previews have nothing to clean.
     Lcd,
 }
@@ -66,11 +70,21 @@ impl Display {
             refresh
         };
         match (refresh, &self.panel) {
-            (Refresh::Full, Panel::Eink(flag)) => {
-                flag.store(true, Ordering::Relaxed);
+            (Refresh::Full, Panel::Eink { full_refresh, .. }) => {
+                full_refresh.store(true, Ordering::Relaxed);
                 ui.window().request_redraw();
             }
             (Refresh::Full, Panel::Lcd) | (Refresh::Partial, _) => {}
+        }
+    }
+
+    fn motion(&self, ui: &AppWindow, motion: Motion) {
+        match &self.panel {
+            Panel::Eink { motion: flag, .. } => {
+                flag.store(motion == Motion::Moving, Ordering::Relaxed);
+                ui.window().request_redraw();
+            }
+            Panel::Lcd => {}
         }
     }
 }
@@ -349,6 +363,7 @@ fn wire(window: &AppWindow, ctx: &Ctx) {
     on!(on_font_smaller => font_smaller());
     on!(on_choose_brightness => choose_brightness(percent));
     on!(on_clean_screen => clean_screen());
+    on!(on_motion => motion(motion));
     on!(on_toggle_wifi => toggle_wifi());
     on!(on_scan_networks => scan_networks());
     on!(on_join_network => join_network(ssid, password));
@@ -663,6 +678,12 @@ impl Ctx {
         match self.host.set_brightness(level) {
             Ok(()) => k.set_brightness(i32::from(level.percent())),
             Err(error) => notify(&ui, &format!("Front light: {error}")),
+        }
+    }
+
+    fn motion(&self, motion: Motion) {
+        if let Some(ui) = self.ui() {
+            self.display.motion(&ui, motion);
         }
     }
 

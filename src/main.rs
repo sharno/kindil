@@ -117,7 +117,10 @@ fn kindle(cli: &Cli) -> anyhow::Result<()> {
     let app = App::new(Options {
         config,
         host: Arc::new(KindleHost::open()),
-        panel: Panel::Eink(backend.full_refresh_flag()),
+        panel: Panel::Eink {
+            full_refresh: backend.full_refresh_flag(),
+            motion: backend.motion_flag(),
+        },
         execution: Execution::Background,
         touches: Touches::new(backend.touch_counter()),
     })?;

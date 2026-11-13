@@ -70,6 +70,7 @@ pub struct KindleBackend<State = NoSchedule> {
     rotation: Arc<AtomicU32>,
     full_refresh: Arc<AtomicBool>,
     touches: Arc<AtomicU64>,
+    motion: Arc<AtomicBool>,
     _state: PhantomData<State>,
 }
 
@@ -130,6 +131,13 @@ impl<State> KindleBackend<State> {
         self.touches.clone()
     }
 
+    /// Set while content moves under a finger: frames are drawn black and
+    /// white with the fast A2 waveform, one at a time. Clearing it repaints
+    /// the window in grayscale to clean up. kindil patch.
+    pub fn motion_flag(&self) -> Arc<AtomicBool> {
+        self.motion.clone()
+    }
+
     /// Switch state, keeping the same internals.
     fn into_state<Next>(self) -> KindleBackend<Next> {
         KindleBackend {
@@ -140,6 +148,7 @@ impl<State> KindleBackend<State> {
             rotation: self.rotation,
             full_refresh: self.full_refresh,
             touches: self.touches,
+            motion: self.motion,
             _state: PhantomData,
         }
     }
@@ -223,6 +232,7 @@ pub fn install(font_data: &[u8]) -> Result<KindleBackend, slint::PlatformError> 
     let rotation = Arc::new(AtomicU32::new(0));
     let full_refresh = Arc::new(AtomicBool::new(false));
     let touches = Arc::new(AtomicU64::new(0));
+    let motion = Arc::new(AtomicBool::new(false));
     let platform = KindlePlatform::new(
         wake_schedule.clone(),
         on_wake.clone(),
@@ -230,6 +240,7 @@ pub fn install(font_data: &[u8]) -> Result<KindleBackend, slint::PlatformError> 
         rotation.clone(),
         full_refresh.clone(),
         touches.clone(),
+        motion.clone(),
     )
     .map_err(|e| slint::PlatformError::Other(format!("failed to init Kindle platform: {e}")))?;
     let window = platform.window.clone();
@@ -243,6 +254,7 @@ pub fn install(font_data: &[u8]) -> Result<KindleBackend, slint::PlatformError> 
         rotation,
         full_refresh,
         touches,
+        motion,
         _state: PhantomData,
     })
 }

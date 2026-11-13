@@ -11,7 +11,7 @@ use slint::platform::software_renderer::{
 };
 use slint::platform::{EventLoopProxy, Platform, PlatformError, WindowAdapter};
 
-use crate::framebuffer::Framebuffer;
+use crate::framebuffer::{Framebuffer, Waveform};
 use crate::power::{arm_wakealarm, find_wakealarm, suspend_to_mem};
 use crate::touch::{TouchInput, has_accelerometer};
 use crate::wakeup::{self, KindleEventLoopProxy, Queue, Wakeup};
@@ -33,6 +33,77 @@ pub(crate) struct KindlePlatform {
     rotation: Arc<AtomicU32>,
     full_refresh: Arc<AtomicBool>,
     touches: Arc<AtomicU64>,
+    motion: Arc<AtomicBool>,
+}
+
+/// A panel rectangle in physical pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Area {
+    origin: slint::PhysicalPosition,
+    size: slint::PhysicalSize,
+}
+
+impl Area {
+    fn union(self, other: Area) -> Area {
+        let left = self.origin.x.min(other.origin.x);
+        let top = self.origin.y.min(other.origin.y);
+        let right = (self.origin.x + self.size.width as i32)
+            .max(other.origin.x + other.size.width as i32);
+        let bottom = (self.origin.y + self.size.height as i32)
+            .max(other.origin.y + other.size.height as i32);
+        Area {
+            origin: slint::PhysicalPosition::new(left, top),
+            size: slint::PhysicalSize::new((right - left) as u32, (bottom - top) as u32),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.size.width == 0 || self.size.height == 0
+    }
+}
+
+/// Whether content is moving under a finger, and where the fast frames
+/// landed. kindil patch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Motion {
+    Still,
+    Moving { drawn: Option<Area> },
+}
+
+/// What kind of frame the panel is about to get. kindil patch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Frame {
+    /// Content is moving: black and white with the fast A2 waveform, one
+    /// update at a time so frames never pile up into a smear.
+    Motion,
+    /// Motion just ended: repaint in grayscale (GC16) where the fast frames
+    /// left black-and-white pixels.
+    Settle(Area),
+    Still,
+}
+
+impl Motion {
+    fn frame(self, moving: bool) -> Frame {
+        match (self, moving) {
+            (_, true) => Frame::Motion,
+            (Motion::Moving { drawn: Some(area) }, false) => Frame::Settle(area),
+            (Motion::Moving { drawn: None } | Motion::Still, false) => Frame::Still,
+        }
+    }
+
+    /// After a frame: still moving accumulates the area just drawn.
+    fn after(self, moving: bool, drawn: Option<Area>) -> Motion {
+        match (self, moving) {
+            (_, false) => Motion::Still,
+            (Motion::Still, true) => Motion::Moving { drawn },
+            (Motion::Moving { drawn: before }, true) => Motion::Moving {
+                drawn: match (before, drawn) {
+                    (Some(a), Some(b)) => Some(a.union(b)),
+                    (a, b) => a.or(b),
+                },
+            },
+        }
+    }
 }
 
 impl KindlePlatform {
@@ -43,6 +114,7 @@ impl KindlePlatform {
         rotation: Arc<AtomicU32>,
         full_refresh: Arc<AtomicBool>,
         touches: Arc<AtomicU64>,
+        motion: Arc<AtomicBool>,
     ) -> std::io::Result<Self> {
         let window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
         let wakeup = wakeup::make_wakeup()?;
@@ -58,6 +130,7 @@ impl KindlePlatform {
             rotation,
             full_refresh,
             touches,
+            motion,
         })
     }
 
@@ -167,6 +240,7 @@ impl Platform for KindlePlatform {
         // if a schedule is configured.
         let wakealarm = find_wakealarm().ok();
         let mut last_interaction = Instant::now();
+        let mut motion = Motion::Still;
 
         loop {
             // A suspend cycle restarts the loop with a fresh stay-awake window.
@@ -258,7 +332,14 @@ impl Platform for KindlePlatform {
             touch_input.poll(&self.window, applied_rotation);
             slint::platform::update_timers_and_animations();
 
-            let black_and_white = self.black_and_white.load(Ordering::Relaxed);
+            let moving = self.motion.load(Ordering::Relaxed);
+            let frame = motion.frame(moving);
+            if let Frame::Settle(_) = frame {
+                self.window.request_redraw();
+            }
+            let mut drawn = None;
+            let black_and_white =
+                self.black_and_white.load(Ordering::Relaxed) || frame == Frame::Motion;
 
             let app_rotation = self.rotation.load(Ordering::Relaxed);
             let rotation_changed = app_rotation != applied_rotation;
@@ -274,13 +355,20 @@ impl Platform for KindlePlatform {
                     270 => RenderingRotation::Rotate270,
                     _ => RenderingRotation::NoRotation,
                 });
-                if rotation_changed {
+                // Settling repaints everything: A2 frames left black-and-white
+                // pixels wherever the content moved.
+                if rotation_changed || matches!(frame, Frame::Settle(_)) {
                     renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
                     renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
+                }
+                if frame == Frame::Motion {
+                    // Don't write pixels the panel is still driving.
+                    frame_buffer.wait_for_update_complete();
                 }
                 let dirty = renderer.render(&mut rgb_buffer, width);
                 let origin = dirty.bounding_box_origin();
                 let size = dirty.bounding_box_size();
+                drawn = Some(Area { origin, size }).filter(|area| !area.is_empty());
                 let (x0, y0) = (origin.x as usize, origin.y as usize);
                 let (w, h) = (size.width as usize, size.height as usize);
 
@@ -307,9 +395,17 @@ impl Platform for KindlePlatform {
                 if rotation_changed || full {
                     frame_buffer.refresh_full();
                 } else {
-                    frame_buffer.refresh_region(origin, size);
+                    // Settling renders the whole window but cleans only
+                    // where the fast frames went, so the rest doesn't flash.
+                    let (area, waveform) = match frame {
+                        Frame::Motion => (Area { origin, size }, Waveform::A2),
+                        Frame::Settle(moved) => (moved, Waveform::Gc16),
+                        Frame::Still => (Area { origin, size }, Waveform::Auto),
+                    };
+                    frame_buffer.refresh_region(area.origin, area.size, waveform);
                 }
             });
+            motion = motion.after(moving, drawn);
         }
 
         Ok(())
@@ -333,4 +429,31 @@ fn launch_render_offset() -> u32 {
             .output()
             .is_ok_and(|out| out.status.success() && out.stdout.trim_ascii() == b"D");
     if flipped { 180 } else { 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn area(x: i32, y: i32, w: u32, h: u32) -> Area {
+        Area {
+            origin: slint::PhysicalPosition::new(x, y),
+            size: slint::PhysicalSize::new(w, h),
+        }
+    }
+
+    #[test]
+    fn motion_cleans_up_only_where_fast_frames_landed() {
+        let moving = Motion::Still.after(true, Some(area(0, 100, 10, 10)));
+        assert_eq!(moving.frame(true), Frame::Motion);
+        let moving = moving.after(true, None).after(true, Some(area(5, 300, 20, 10)));
+        assert_eq!(moving.frame(false), Frame::Settle(area(0, 100, 25, 210)));
+        assert_eq!(moving.after(false, None), Motion::Still);
+    }
+
+    #[test]
+    fn motion_without_frames_needs_no_clean_up() {
+        assert_eq!(Motion::Still.after(true, None).frame(false), Frame::Still);
+        assert_eq!(Motion::Still.frame(false), Frame::Still);
+    }
 }

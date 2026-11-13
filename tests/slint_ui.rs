@@ -33,6 +33,8 @@ struct Fixture {
     app: App,
     window: Rc<MinimalSoftwareWindow>,
     dir: tempfile::TempDir,
+    /// The panel's fast black-and-white mode, as the app sets it.
+    motion: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Fixture {
@@ -51,10 +53,14 @@ impl Fixture {
             ..Config::parse("dashboard = \"clock\"").unwrap()
         };
         let window = preview::install().unwrap();
+        let motion = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let app = App::new(Options {
             config,
             host,
-            panel: Panel::Lcd,
+            panel: Panel::Eink {
+                full_refresh: Arc::default(),
+                motion: motion.clone(),
+            },
             execution: Execution::Inline,
             touches: Touches::default(),
         })
@@ -63,7 +69,12 @@ impl Fixture {
         app.window.show().unwrap();
         // The clock's width moves the slider, so pin it.
         app.window.global::<Kindil>().set_clock("09:41".into());
-        Self { app, window, dir }
+        Self {
+            app,
+            window,
+            dir,
+            motion,
+        }
     }
 
     fn k(&self) -> Kindil<'_> {
@@ -562,8 +573,9 @@ fn every_printable_ascii_key_exists() {
 }
 
 #[test]
-fn lists_follow_the_swipe_with_few_panel_updates() {
+fn lists_follow_the_finger_in_fast_frames_while_it_moves() {
     use slint::platform::{PointerEventButton, WindowAdapter, WindowEvent};
+    use std::sync::atomic::Ordering;
     let f = Fixture::new(Arc::new(Simulated::default()));
     f.tap(SETTINGS_TAB, TAB_Y);
     let at = |y| slint::LogicalPosition::new(380.0, y);
@@ -573,11 +585,6 @@ fn lists_follow_the_swipe_with_few_panel_updates() {
     };
     // The list, left of the scroll bar, below the header.
     let list = |frame: &[slint::Rgb8Pixel], y: usize| frame[y * 758..y * 758 + 740].to_vec();
-    let bar = |frame: &[slint::Rgb8Pixel]| {
-        (152..932)
-            .map(|y| frame[y * 758 + 740..y * 758 + 758].to_vec())
-            .collect::<Vec<_>>()
-    };
     let before = pixels(&f.window);
     send(WindowEvent::PointerPressed {
         position: at(800.0),
@@ -586,25 +593,23 @@ fn lists_follow_the_swipe_with_few_panel_updates() {
     [700.0, 550.0, 400.0]
         .into_iter()
         .for_each(|y| send(WindowEvent::PointerMoved { position: at(y) }));
+    assert!(
+        f.motion.load(Ordering::Relaxed),
+        "a drag puts the panel in its fast mode"
+    );
     let moving = pixels(&f.window);
     assert!(
-        (152..932).all(|y| list(&moving, y) == list(&before, y)),
-        "the list must not redraw on every finger movement"
-    );
-    assert!(
-        bar(&moving) != bar(&before),
-        "the scroll bar follows the finger"
-    );
-    std::thread::sleep(std::time::Duration::from_millis(450));
-    let caught_up = pixels(&f.window);
-    assert!(
-        (152..532).all(|y| list(&caught_up, y) == list(&before, y + 400)),
-        "the list catches up with the finger while it is down"
+        (152..532).all(|y| list(&moving, y) == list(&before, y + 400)),
+        "the list follows the finger while it is down"
     );
     send(WindowEvent::PointerReleased {
         position: at(400.0),
         button: PointerEventButton::Left,
     });
+    assert!(
+        !f.motion.load(Ordering::Relaxed),
+        "lifting the finger ends the fast mode, so the panel cleans up"
+    );
     let after = pixels(&f.window);
     assert!(
         (152..532).all(|y| list(&after, y) == list(&before, y + 400)),

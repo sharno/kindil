@@ -17,6 +17,9 @@ export enum DashboardKind { miqat, clock }
 export enum Switch { off, on, unavailable }
 /// What owns the screen: the app, or one of the device states kindil runs
 /// in Amazon's place.
+/// Whether content is moving under a finger.
+export enum Motion { still, moving }
+
 export enum System { app, asleep, usb-drive, off }
 
 export struct BookItem {
@@ -136,6 +139,8 @@ export global Kindil {
     in property <System> system: System.app;
     /// Device events are waiting on the Rust side.
     callback device-events();
+    /// Content started or stopped moving under a finger.
+    callback motion(Motion);
     callback restart();
     callback power-off();
     /// Auto-sleep: the choices' labels and the chosen one's index (-1: none of them).
@@ -471,10 +476,9 @@ component ProgressBar {
     }
 }
 
-/// A list moved by swiping, drawn for e-ink. Redrawing the list on every finger
-/// movement floods the panel with updates, so while the finger is down only the
-/// scroll bar follows it (a thin strip, cheap to update), the list catches up a
-/// few times a second, and it settles where the finger lifts.
+/// A list moved by swiping, drawn for e-ink. The list follows the finger; while
+/// it moves, the panel draws fast black-and-white frames one at a time, then
+/// repaints the moved area in grayscale when the finger lifts.
 component SwipeScroll inherits Rectangle {
     in property <length> content-height;
     in-out property <length> offset: 0;
@@ -489,6 +493,7 @@ component SwipeScroll inherits Rectangle {
     property <length> target: clamp(
         root.start + touch.pressed-position.y - touch.current-position.y,
         0px, root.max-offset);
+    property <bool> dragging;
     clip: true;
     touch := SwipeGestureHandler {
         handle-swipe-up: root.shown < root.max-offset;
@@ -498,16 +503,22 @@ component SwipeScroll inherits Rectangle {
             if !root.dragging {
                 root.start = root.shown;
                 root.dragging = true;
+                Kindil.motion(Motion.moving);
             }
+            // The list follows the finger: the panel draws these frames in
+            // fast black and white, one at a time, and cleans up on release.
+            root.offset = root.target;
         }
         swiped => {
             root.offset = root.target;
             root.dragging = false;
+            Kindil.motion(Motion.still);
             root.moved();
         }
         cancelled => {
             root.offset = root.start;
             root.dragging = false;
+            Kindil.motion(Motion.still);
         }
         Rectangle {
             y: -root.shown;
@@ -515,15 +526,7 @@ component SwipeScroll inherits Rectangle {
             @children
         }
     }
-    property <bool> dragging;
-    // Each catch-up is one partial panel update; faster turns into a smear.
-    Timer {
-        interval: 400ms;
-        running: root.dragging;
-        triggered => { root.offset = root.target; }
-    }
-    // Where the view sits in the list. Darker and wider while the finger is
-    // down, and following it live: the cue that the list is moving.
+    // Where the view sits in the list. Darker and wider while the finger is down.
     if root.max-offset > 0: Rectangle {
         x: parent.width - (root.dragging ? 10px : 7px);
         y: 8px;
@@ -532,7 +535,7 @@ component SwipeScroll inherits Rectangle {
         border-radius: self.width / 2;
         background: Theme.surface;
         Rectangle {
-            y: parent.height * (root.dragging ? root.target : root.shown) / root.content-height;
+            y: parent.height * root.shown / root.content-height;
             height: parent.height * root.height / root.content-height;
             border-radius: parent.border-radius;
             background: root.dragging ? Theme.ink : Theme.ink-2;

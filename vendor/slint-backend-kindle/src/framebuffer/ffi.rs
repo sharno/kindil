@@ -197,6 +197,7 @@ pub(super) struct UpdateMarkerData {
 }
 
 pub(super) const WAVEFORM_MODE_GC16: u32 = 2; // Full 16-level grayscale refresh (slow, high quality)
+pub(super) const WAVEFORM_MODE_A2: u32 = 4; // Two-level, fastest (~120 ms); ghosts until a grayscale pass
 pub(super) const WAVEFORM_MODE_AUTO: u32 = 257; // Let the driver pick the best waveform
 pub(super) const UPDATE_MODE_PARTIAL: u32 = 0; // Only redraw the dirty region
 pub(super) const UPDATE_MODE_FULL: u32 = 1; // Flash the whole screen (clears ghosting)

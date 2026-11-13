@@ -39,9 +39,10 @@ system file. A reboot always returns the Kindle to stock.
     computer has `/mnt/us`; unplugging reloads the library and resumes
     Syncthing. A cable that keeps dropping doesn't flash the screen: kindil
     returns only once the storage has stayed back for 3 s.
-- **E-ink care**: while a finger drags a list, only the scroll bar follows
-  it; the list catches up a few times a second and settles on release, so the
-  panel is not redrawn on every finger movement. In the
+- **E-ink care**: while a finger drags a list, the list follows it in fast
+  black-and-white frames (the A2 waveform), each sent only once the panel has
+  finished the last, so motion doesn't smear; on release the moved area is
+  repainted once in grayscale, without flashing the rest. In the
   reader, swipe left/right or tap to turn pages. Page changes flash the panel
   once; reading flashes every 6th page turn, the dashboard every 30 minutes, to
   clear ghosting.
