@@ -1,6 +1,6 @@
 [package]
 name = "kindil"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2021"
 rust-version = "1.92"
 description = "A single-process Rust shell for the first-generation Amazon Kindle Paperwhite"

@@ -358,7 +358,12 @@ fn wifid() -> anyhow::Result<()> {
 }
 
 fn route_wifi() -> anyhow::Result<()> {
-    let Some(gateway) = lease_gateway(&std::fs::read_to_string(DHCP_LEASE)?) else {
+    let lease = match std::fs::read_to_string(DHCP_LEASE) {
+        // Not connected since boot: cmConnected comes once it is.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        lease => lease?,
+    };
+    let Some(gateway) = lease_gateway(&lease) else {
         return Ok(());
     };
     if !has_default_route(&std::fs::read_to_string(ROUTES)?) {
