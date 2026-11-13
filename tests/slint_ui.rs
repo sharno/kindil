@@ -15,6 +15,14 @@ const TAB_Y: f32 = 978.0;
 const HOME_TAB: f32 = 95.0;
 const LIBRARY_TAB: f32 = 284.0;
 const SETTINGS_TAB: f32 = 663.0;
+const BAR_Y: f32 = 34.0;
+// Top bar buttons: x on the dashboard and library, and in the reader, where
+// the text size buttons push the light controls left.
+const LIGHT_DOWN: f32 = 375.0;
+const LIGHT_UP: f32 = 507.0;
+const READER_LIGHT_UP: f32 = 495.0;
+const SMALLER_TEXT: f32 = 213.0;
+const LARGER_TEXT: f32 = 279.0;
 
 struct Fixture {
     app: App,
@@ -69,8 +77,18 @@ impl Fixture {
     }
 }
 
+/// Whether any pixel in these rows differs from Miqat's frame.
+fn frame_differs(
+    rendered: &[slint::Rgb8Pixel],
+    expected: &[u8],
+    rows: std::ops::Range<usize>,
+) -> bool {
+    rows.flat_map(|y| (0..758).map(move |x| y * 758 + x))
+        .any(|i| rendered[i].r != expected[i])
+}
+
 #[test]
-fn miqat_is_pixel_exact_and_taps_reveal_the_tabs() {
+fn miqat_is_pixel_exact_and_taps_reveal_both_bars() {
     let f = Fixture::new(Arc::new(Simulated::default()));
     let miqat = miqat::config::Config::load(Path::new("examples/miqat.toml")).unwrap();
     let noon = chrono::DateTime::from_timestamp(1_794_398_400, 0).unwrap();
@@ -79,17 +97,62 @@ fn miqat_is_pixel_exact_and_taps_reveal_the_tabs() {
     f.app.set_miqat(gray);
     f.k().set_dashboard(DashboardKind::Miqat);
     let rendered = pixels(&f.window);
+    // Only the battery badge, in the strip between the clock and the prayer
+    // name, is drawn over the frame.
+    let outside_badge = |frame: &[slint::Rgb8Pixel]| {
+        frame.iter().enumerate().all(|(i, p)| {
+            let (x, y) = (i % 758, i / 758);
+            (300..460).contains(&x) && (4..48).contains(&y) || p.r == expected[i]
+        })
+    };
     assert!(
-        rendered
-            .iter()
-            .zip(&expected)
-            .all(|(p, g)| p.r == *g && p.g == *g && p.b == *g),
+        outside_badge(&rendered),
         "the dashboard must be Miqat's frame, without chrome or scaling"
     );
+    assert!(
+        frame_differs(&rendered, &expected, 8..44),
+        "the battery stays visible without a tap"
+    );
+
     f.tap(380.0, 500.0);
     assert!(f.k().get_chrome_visible());
+    let revealed = pixels(&f.window);
+    assert!(
+        frame_differs(&revealed, &expected, 0..68),
+        "the tap shows the top bar"
+    );
+    assert!(
+        frame_differs(&revealed, &expected, 932..1024),
+        "the tap shows the tab bar"
+    );
+
+    // The light buttons work from the revealed bar, which stays up meanwhile.
+    assert_eq!(f.k().get_brightness(), 40);
+    f.tap(LIGHT_UP, BAR_Y);
+    assert_eq!(f.k().get_brightness(), 50);
+    f.tap(LIGHT_DOWN, BAR_Y);
+    f.tap(LIGHT_DOWN, BAR_Y);
+    assert_eq!(f.k().get_brightness(), 30);
+    assert!(f.k().get_chrome_visible());
+
     f.tap(LIBRARY_TAB, TAB_Y);
     assert_eq!(f.k().get_page(), Page::Library);
+}
+
+#[test]
+fn the_reader_top_bar_sets_text_size_and_light() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    f.tap(LIBRARY_TAB, TAB_Y);
+    f.tap(300.0, 220.0);
+    assert_eq!(f.k().get_page(), Page::Reader);
+    let size = f.k().get_font_size();
+    f.tap(LARGER_TEXT, BAR_Y);
+    assert!(f.k().get_font_size() > size);
+    f.tap(SMALLER_TEXT, BAR_Y);
+    f.tap(SMALLER_TEXT, BAR_Y);
+    assert!(f.k().get_font_size() < size);
+    f.tap(READER_LIGHT_UP, BAR_Y);
+    assert_eq!(f.k().get_brightness(), 50);
 }
 
 #[test]
@@ -297,12 +360,12 @@ fn arabic_text_is_shaped() {
     let f = Fixture::new(Arc::new(Simulated::default()));
     f.k().set_dashboard(DashboardKind::Clock);
     f.k().set_clock("".into());
-    // Ink extent of the status-bar date, left of the Wi-Fi and battery icons.
+    // Ink extent of the top bar's date, left of the light controls.
     let span = |date: &str| {
         f.k().set_date(date.into());
         let frame = pixels(&f.window);
-        let xs: Vec<usize> = (20..500)
-            .filter(|x| (8..48).any(|y| frame[y * 758 + x].r < 128))
+        let xs: Vec<usize> = (20..300)
+            .filter(|x| (16..52).any(|y| frame[y * 758 + x].r < 128))
             .collect();
         xs.last().unwrap() - xs.first().unwrap()
     };
@@ -352,7 +415,7 @@ fn lists_follow_the_swipe_with_few_panel_updates() {
     // The list, left of the scroll bar, below the header.
     let list = |frame: &[slint::Rgb8Pixel], y: usize| frame[y * 758..y * 758 + 740].to_vec();
     let bar = |frame: &[slint::Rgb8Pixel]| {
-        (152..932)
+        (164..932)
             .map(|y| frame[y * 758 + 740..y * 758 + 758].to_vec())
             .collect::<Vec<_>>()
     };
@@ -366,7 +429,7 @@ fn lists_follow_the_swipe_with_few_panel_updates() {
         .for_each(|y| send(WindowEvent::PointerMoved { position: at(y) }));
     let moving = pixels(&f.window);
     assert!(
-        (152..932).all(|y| list(&moving, y) == list(&before, y)),
+        (164..932).all(|y| list(&moving, y) == list(&before, y)),
         "the list must not redraw on every finger movement"
     );
     assert!(
@@ -376,7 +439,7 @@ fn lists_follow_the_swipe_with_few_panel_updates() {
     std::thread::sleep(std::time::Duration::from_millis(450));
     let caught_up = pixels(&f.window);
     assert!(
-        (152..532).all(|y| list(&caught_up, y) == list(&before, y + 400)),
+        (164..532).all(|y| list(&caught_up, y) == list(&before, y + 400)),
         "the list catches up with the finger while it is down"
     );
     send(WindowEvent::PointerReleased {
@@ -385,7 +448,7 @@ fn lists_follow_the_swipe_with_few_panel_updates() {
     });
     let after = pixels(&f.window);
     assert!(
-        (152..532).all(|y| list(&after, y) == list(&before, y + 400)),
+        (164..532).all(|y| list(&after, y) == list(&before, y + 400)),
         "release settles the list where the finger lifted"
     );
     drag(&f.window, 380.0, 300.0, 800.0);

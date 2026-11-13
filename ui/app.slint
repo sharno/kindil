@@ -4,7 +4,7 @@
 // - black on white, a few solid grays, no animation or translucency (each frame
 //   costs a panel update, and dithered grays look dirty);
 // - every tap target is at least 64 px tall, row targets span the full width;
-// - the prayer dashboard stays full-bleed: tap it to reveal the tab bar.
+// - the prayer dashboard stays full-bleed: tap it to reveal the top and tab bars.
 import { VirtualKeyboard, VirtualKeyboardHandler } from "vendor/slint-keyboard/virtual_keyboard.slint";
 export { VirtualKeyboardHandler }
 import "../crates/miqat/assets/fonts/IBMPlexSansArabic-Regular.ttf";
@@ -53,9 +53,10 @@ global Theme {
 export global Kindil {
     in-out property <Page> page: Page.dashboard;
     in-out property <DashboardKind> dashboard: DashboardKind.miqat;
+    /// The top and tab bars over the full-bleed dashboard; other pages always show them.
     in-out property <bool> chrome-visible: false;
 
-    // Status bar
+    // Top bar
     in property <string> clock: "--:--";
     in property <string> date;
     in property <int> battery-level: -1;
@@ -79,7 +80,6 @@ export global Kindil {
     in property <string> book-position;
     in property <float> book-progress;
     in property <int> font-size: 24;
-    in-out property <bool> reader-options: false;
 
     // Settings
     in property <int> brightness: -1;
@@ -130,7 +130,6 @@ export global Kindil {
     public function go(target: Page) {
         page = target;
         chrome-visible = false;
-        reader-options = false;
         navigated(target);
     }
 }
@@ -474,32 +473,38 @@ component SwipeScroll inherits Rectangle {
 
 // ───────────────────────── chrome ─────────────────────────
 
-component StatusBar {
+/// A square outlined button for the top bar, sized for a thumb.
+component BarButton {
+    in property <string> text;
+    in property <length> font-size: 26px;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 56px;
     height: 56px;
+    Rectangle {
+        border-radius: Theme.radius;
+        border-width: 2px;
+        border-color: root.enabled ? Theme.ink : Theme.line;
+        background: touch.pressed ? Theme.surface : Theme.paper;
+    }
+    Text {
+        text: root.text;
+        font-size: root.font-size;
+        font-weight: 700;
+        color: root.enabled ? Theme.ink : Theme.line;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// The battery icon and percentage.
+component BatteryStatus {
     HorizontalLayout {
-        padding-left: Theme.gutter;
-        padding-right: Theme.gutter;
-        spacing: 12px;
-        Text {
-            text: Kindil.clock;
-            font-size: 22px;
-            font-weight: 700;
-            color: Theme.ink;
-            vertical-alignment: center;
-        }
-        Text {
-            text: Kindil.date;
-            font-size: 19px;
-            color: Theme.ink-2;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-            overflow: elide;
-        }
-        if Kindil.wifi-bars >= 0: VerticalLayout {
-            alignment: center;
-            WifiBars { bars: Kindil.wifi-bars; }
-        }
-        Rectangle { width: 6px; }
+        spacing: 8px;
         VerticalLayout {
             alignment: center;
             BatteryIcon { level: Kindil.battery-level; }
@@ -511,6 +516,79 @@ component StatusBar {
             color: Theme.ink;
             vertical-alignment: center;
         }
+    }
+}
+
+/// Quick controls: clock, front light and battery everywhere; text size in the
+/// reader. Shown with the tab bar, so one tap reveals both over the dashboard.
+component TopBar inherits Rectangle {
+    height: 68px;
+    background: Theme.paper;
+    HorizontalLayout {
+        padding-left: 20px;
+        padding-right: 20px;
+        spacing: 10px;
+        Text {
+            text: Kindil.clock;
+            font-size: 22px;
+            font-weight: 700;
+            color: Theme.ink;
+            vertical-alignment: center;
+        }
+        // The reader's room goes to the text size buttons instead.
+        Text {
+            text: Kindil.page == Page.reader ? "" : Kindil.date;
+            font-size: 19px;
+            color: Theme.ink-2;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        if Kindil.page == Page.reader: HorizontalLayout {
+            horizontal-stretch: 1;
+            alignment: end;
+            spacing: 10px;
+            VerticalLayout {
+                alignment: center;
+                BarButton { text: "A"; font-size: 20px; clicked => { Kindil.font-smaller(); } }
+            }
+            VerticalLayout {
+                alignment: center;
+                BarButton { text: "A"; font-size: 34px; clicked => { Kindil.font-larger(); } }
+            }
+        }
+        Rectangle { width: 8px; }
+        VerticalLayout {
+            alignment: center;
+            BarButton {
+                text: "−";
+                enabled: Kindil.brightness >= 0;
+                clicked => { Kindil.dimmer(); }
+            }
+        }
+        Text {
+            text: Kindil.brightness >= 0 ? Kindil.brightness + "%" : "—";
+            width: 56px;
+            font-size: 20px;
+            font-weight: 600;
+            color: Kindil.brightness >= 0 ? Theme.ink : Theme.ink-3;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        VerticalLayout {
+            alignment: center;
+            BarButton {
+                text: "+";
+                enabled: Kindil.brightness >= 0;
+                clicked => { Kindil.brighter(); }
+            }
+        }
+        Rectangle { width: 8px; }
+        if Kindil.wifi-bars >= 0: VerticalLayout {
+            alignment: center;
+            WifiBars { bars: Kindil.wifi-bars; }
+        }
+        BatteryStatus { }
     }
     Rectangle {
         y: parent.height - 1px;
@@ -901,7 +979,7 @@ component ReaderPage {
         HorizontalLayout {
             height: 68px;
             padding-left: 8px;
-            padding-right: 8px;
+            padding-right: Theme.gutter;
             Button {
                 text: "‹ Library";
                 kind: ButtonKind.quiet;
@@ -914,15 +992,9 @@ component ReaderPage {
                 font-weight: 600;
                 color: Theme.ink-2;
                 overflow: elide;
-                horizontal-alignment: center;
+                horizontal-alignment: right;
                 vertical-alignment: center;
                 horizontal-stretch: 1;
-            }
-            Button {
-                text: "Aa";
-                kind: ButtonKind.quiet;
-                font-size: 24px;
-                clicked => { Kindil.reader-options = !Kindil.reader-options; }
             }
         }
         // Sideways swipes turn pages, like the tap zones below.
@@ -997,29 +1069,6 @@ component ReaderPage {
                 clicked => { Kindil.next-page(); }
             }
         }
-    }
-}
-
-component ReaderOptions inherits Sheet {
-    Caption { text: "READING"; }
-    Stepper {
-        title: "Text size";
-        value: Kindil.font-size + " px";
-        decrease => { Kindil.font-smaller(); }
-        increase => { Kindil.font-larger(); }
-    }
-    Divider { }
-    Stepper {
-        title: "Front light";
-        enabled: Kindil.brightness >= 0;
-        value: Kindil.brightness >= 0 ? Kindil.brightness + "%" : "—";
-        decrease => { Kindil.dimmer(); }
-        increase => { Kindil.brighter(); }
-    }
-    Button {
-        text: "Done";
-        kind: ButtonKind.primary;
-        clicked => { Kindil.reader-options = false; }
     }
 }
 
@@ -1377,9 +1426,20 @@ export component AppWindow inherits Window {
         TouchArea { clicked => { Kindil.chrome-visible = !Kindil.chrome-visible; } }
     }
 
+    // The dashboard has no bars until tapped, so the battery stays visible in
+    // the one empty strip of Miqat's frame, between the clock and the prayer name.
+    if root.immersive && !Kindil.chrome-visible: Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: 8px;
+        width: 140px;
+        height: 36px;
+        background: Theme.paper;
+        BatteryStatus { }
+    }
+
     VerticalLayout {
         height: root.usable-height;
-        if !root.immersive: StatusBar { }
+        if !root.immersive || Kindil.chrome-visible: TopBar { }
         Rectangle {
             vertical-stretch: 1;
             if Kindil.page == Page.dashboard && Kindil.dashboard == DashboardKind.clock: ClockPage { width: parent.width; height: parent.height; }
@@ -1391,7 +1451,7 @@ export component AppWindow inherits Window {
         if !root.immersive || Kindil.chrome-visible: TabBar { }
     }
 
-    // Hide the revealed tab bar again so the wall dashboard stays clean.
+    // Hide the revealed bars again so the wall dashboard stays clean.
     Timer {
         interval: 20s;
         running: Kindil.chrome-visible;
@@ -1415,10 +1475,6 @@ export component AppWindow inherits Window {
 
     if Kindil.page == Page.library && Kindil.selected-book >= 0: BookActions {
         y: root.usable-height - self.height;
-        height: self.preferred-height;
-    }
-    if Kindil.page == Page.reader && Kindil.reader-options: ReaderOptions {
-        y: root.height - 92px - self.height;
         height: self.preferred-height;
     }
     if Kindil.page == Page.networks && Kindil.join-open: JoinSheet {

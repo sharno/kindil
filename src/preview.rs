@@ -131,9 +131,6 @@ pub fn screens(app: &App, window: &MinimalSoftwareWindow, dir: &Path) -> anyhow:
         k.invoke_open_book(0);
         k.invoke_next_page();
         shot("reader")?;
-        k.set_reader_options(true);
-        shot("reader-options")?;
-        k.set_reader_options(false);
     }
 
     k.invoke_go(Page::Settings);

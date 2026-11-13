@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 pub const MAX_BOOK_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Text area of the reader screen, in px: the panel minus side margins, and
-/// minus the status bar, reader top bar, page bar, tab bar and padding.
+/// minus the top bar, reader header, page bar, tab bar and padding.
 /// The UI owns the real layout; this is the budget pagination plans for.
 pub const PAGE_WIDTH_PX: u32 = 758 - 2 * 44;
-pub const PAGE_HEIGHT_PX: u32 = 1024 - 56 - 68 - 76 - 92 - 32;
+pub const PAGE_HEIGHT_PX: u32 = 1024 - 68 - 68 - 76 - 92 - 32;
 
 /// Characters per line and lines per page for a font size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
