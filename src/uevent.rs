@@ -5,10 +5,49 @@
 //! hears the press too and runs sleep itself.
 use std::collections::BTreeMap;
 
+/// What happened to the device. The kernel's set, plus whatever a future
+/// kernel adds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Action {
+    Add,
+    Remove,
+    Change,
+    Move,
+    Online,
+    Offline,
+    Other(String),
+}
+
+impl Action {
+    fn parse(text: &str) -> Self {
+        match text {
+            "add" => Action::Add,
+            "remove" => Action::Remove,
+            "change" => Action::Change,
+            "move" => Action::Move,
+            "online" => Action::Online,
+            "offline" => Action::Offline,
+            other => Action::Other(other.to_owned()),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Action::Add => "add",
+            Action::Remove => "remove",
+            Action::Change => "change",
+            Action::Move => "move",
+            Action::Online => "online",
+            Action::Offline => "offline",
+            Action::Other(other) => other,
+        }
+    }
+}
+
 /// One uevent: `ACTION@DEVPATH` followed by `KEY=VALUE` lines.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Uevent {
-    pub action: String,
+    pub action: Action,
     pub devpath: String,
     pub vars: BTreeMap<String, String>,
 }
@@ -26,7 +65,7 @@ impl Uevent {
             .filter_map(|f| f.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())))
             .collect();
         Some(Self {
-            action: action.to_owned(),
+            action: Action::parse(action),
             devpath: devpath.to_owned(),
             vars,
         })
@@ -35,7 +74,7 @@ impl Uevent {
 
 impl std::fmt::Display for Uevent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}@{}", self.action, self.devpath)?;
+        write!(f, "{}@{}", self.action.as_str(), self.devpath)?;
         self.vars
             .iter()
             .try_for_each(|(k, v)| write!(f, " {k}={v}"))
@@ -139,7 +178,7 @@ mod tests {
         let event =
             Uevent::parse(b"change@/devices/platform/whitney-button\0ACTION=change\0KEY=pressed\0")
                 .unwrap();
-        assert_eq!(event.action, "change");
+        assert_eq!(event.action, Action::Change);
         assert_eq!(event.devpath, "/devices/platform/whitney-button");
         assert_eq!(event.vars.get("KEY").map(String::as_str), Some("pressed"));
         assert_eq!(

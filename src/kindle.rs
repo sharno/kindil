@@ -199,7 +199,7 @@ fn run(command: &mut Command) -> anyhow::Result<()> {
 
 /// The PW1 reports the power button as this misc device coming online.
 fn is_power_button(event: &Uevent) -> bool {
-    event.action == "online" && event.devpath.ends_with("/yoshibutton")
+    event.action == crate::uevent::Action::Online && event.devpath.ends_with("/yoshibutton")
 }
 
 fn power_button(pressed: impl Fn()) -> std::io::Result<()> {
