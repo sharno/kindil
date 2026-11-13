@@ -503,6 +503,9 @@ impl Host for Recording {
     fn set_wifi(&self, power: kindil::host::Power) -> anyhow::Result<()> {
         self.device.set_wifi(power)
     }
+    fn reconnect_wifi(&self) -> anyhow::Result<()> {
+        self.device.reconnect_wifi()
+    }
     fn scan(&self) -> anyhow::Result<Vec<kindil::wifi::Network>> {
         self.device.scan()
     }

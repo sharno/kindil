@@ -118,6 +118,11 @@ pub trait Host: Send + Sync {
     fn set_brightness(&self, level: Brightness) -> anyhow::Result<()>;
     fn wifi(&self) -> Wifi;
     fn set_wifi(&self, power: Power) -> anyhow::Result<()>;
+    /// Wi-Fi stays down after kindil suspends the device itself: wifid never
+    /// hears of the suspend. Switching it off and on rejoins Amazon's saved
+    /// networks; a network joined for the session only is lost. Blocks for a
+    /// few seconds: call from a worker thread.
+    fn reconnect_wifi(&self) -> anyhow::Result<()>;
     /// Blocks for a few seconds: call from a worker thread.
     fn scan(&self) -> anyhow::Result<Vec<Network>>;
     /// Joins for this session only; nothing is written to Amazon's Wi-Fi profiles.
@@ -223,6 +228,9 @@ impl Host for Simulated {
     }
     fn set_wifi(&self, power: Power) -> anyhow::Result<()> {
         self.with(|s| s.wifi = power);
+        Ok(())
+    }
+    fn reconnect_wifi(&self) -> anyhow::Result<()> {
         Ok(())
     }
     fn scan(&self) -> anyhow::Result<Vec<Network>> {

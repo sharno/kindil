@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const INTERFACE: &str = "wlan0";
+const WIFI_SETTLE: Duration = Duration::from_secs(2);
 /// USBNetwork toggles dropbear when configured with USE_WIFI_SSHD_ONLY.
 const USBNET_TOGGLE: &str = "/mnt/us/usbnet/bin/usbnetwork";
 const USBNET_AT_BOOT: &str = "/mnt/us/usbnet/auto";
@@ -108,6 +109,19 @@ impl Host for KindleHost {
             Power::Off => "0",
         };
         lipc::set("com.lab126.wifid", "enable", value)
+    }
+
+    fn reconnect_wifi(&self) -> anyhow::Result<()> {
+        match wifi_power()? {
+            Power::Off => Ok(()),
+            Power::On => {
+                self.set_wifi(Power::Off)?;
+                // wifid applies a change asynchronously: an immediate switch
+                // back on can land before it has gone down.
+                std::thread::sleep(WIFI_SETTLE);
+                self.set_wifi(Power::On)
+            }
+        }
     }
 
     fn scan(&self) -> anyhow::Result<Vec<Network>> {

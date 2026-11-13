@@ -44,7 +44,8 @@ and a reboot always returns the Kindle to stock.
     dashboard: after 2 minutes without a touch the light goes off and the
     Kindle suspends to RAM, waking on the RTC alarm each minute to redraw the
     clock and countdown, and every 30 minutes to fetch over Wi-Fi. The power
-    button brings it back with the light restored.
+    button brings it back with the light restored. wifid never hears of a
+    suspend kindil starts, so kindil switches Wi-Fi off and on after one.
   - **USB drive mode**: plugging into a computer shows a USB screen while the
     computer has `/mnt/us`; unplugging reloads the library and resumes
     Syncthing. A cable that keeps dropping doesn't flash the screen: kindil

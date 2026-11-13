@@ -141,6 +141,8 @@ pub enum Effect {
     Wake,
     /// Back from dozing: the app never left the screen.
     Rouse,
+    /// Back from a suspend: bring Wi-Fi back, see [`crate::host::Host::reconnect_wifi`].
+    Reconnect,
     RestoreLight(Brightness),
     ShowUsbDrive,
     /// Close everything that holds files on the user storage.
@@ -214,7 +216,9 @@ impl Mode {
             // Whether it lands before or after the nap returns, the press wakes.
             (M::Dozing(doze), E::PowerButton) => to(
                 awake,
-                std::iter::once(Effect::Rouse).chain(doze.light().map(Effect::RestoreLight)),
+                std::iter::once(Effect::Rouse)
+                    .chain(doze.light().map(Effect::RestoreLight))
+                    .chain(doze.napped().then_some(Effect::Reconnect)),
             ),
             // The light is already off, or on its way: LightOff carries its level.
             (M::Dozing(Doze::DimmingLight), E::BatteryEmpty) => {
@@ -236,7 +240,10 @@ impl Mode {
             (M::Asleep(Sleep::Settling { light }), E::PanelSettled) => {
                 to(M::Asleep(Sleep::Suspended { light }), [Effect::Suspend])
             }
-            (M::Asleep(sleep), E::PowerButton | E::Resumed) => to(awake, wake(sleep.light())),
+            (M::Asleep(sleep), E::PowerButton | E::Resumed) => to(
+                awake,
+                wake(sleep.light()).chain(sleep.suspended().then_some(Effect::Reconnect)),
+            ),
             // The sleep screen stays and the light stays off; the next press wakes.
             (M::Asleep(Sleep::Suspended { .. }), E::SuspendFailed) => to(self, []),
             (_, E::StorageLeaving) => to(self, [Effect::ReleaseStorage]),
@@ -304,6 +311,13 @@ impl Sleep {
             Sleep::Settling { light } | Sleep::Suspended { light } => light,
         }
     }
+
+    fn suspended(self) -> bool {
+        match self {
+            Sleep::DimmingLight | Sleep::Settling { .. } => false,
+            Sleep::Suspended { .. } => true,
+        }
+    }
 }
 
 impl Doze {
@@ -311,6 +325,14 @@ impl Doze {
         match self {
             Doze::DimmingLight => None,
             Doze::Settling { light } | Doze::Napping { light } | Doze::Drawing { light } => light,
+        }
+    }
+
+    /// The first nap comes after settling; every later state follows one.
+    fn napped(self) -> bool {
+        match self {
+            Doze::DimmingLight | Doze::Settling { .. } => false,
+            Doze::Napping { .. } | Doze::Drawing { .. } => true,
         }
     }
 }
@@ -488,7 +510,8 @@ mod tests {
                 Effect::AwaitPanel,
                 Effect::Suspend,
                 Effect::Wake,
-                Effect::RestoreLight(light)
+                Effect::RestoreLight(light),
+                Effect::Reconnect,
             ]
         );
     }
@@ -552,8 +575,28 @@ mod tests {
                 Effect::Nap,
                 Effect::Rouse,
                 Effect::RestoreLight(light),
+                Effect::Reconnect,
             ]
         );
+    }
+
+    #[test]
+    fn only_a_wake_after_a_suspend_reconnects_wifi() {
+        let light = Brightness::new(40);
+        // Pressed before the first nap: Wi-Fi never went down.
+        let (_, effects) = run(&[
+            (Event::Doze, 10_000),
+            (Event::LightOff(Some(light)), 10_100),
+            (Event::PowerButton, 10_500),
+        ]);
+        assert!(!effects.contains(&Effect::Reconnect));
+        // Pressed again before the sleep's suspend.
+        let (_, effects) = run(&[
+            (Event::PowerButton, 10_000),
+            (Event::LightOff(Some(light)), 10_100),
+            (Event::PowerButton, 11_000),
+        ]);
+        assert!(!effects.contains(&Effect::Reconnect));
     }
 
     #[test]

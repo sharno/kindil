@@ -952,6 +952,17 @@ impl Ctx {
         }
     }
 
+    fn reconnect_wifi(&self) {
+        self.background(
+            |host| host.reconnect_wifi(),
+            |_, result| {
+                if let Err(error) = result {
+                    eprintln!("kindil: reconnect Wi-Fi: {error}");
+                }
+            },
+        );
+    }
+
     fn apply(&self, effect: Effect) {
         let Some(ui) = self.ui() else { return };
         match effect {
@@ -999,6 +1010,7 @@ impl Ctx {
                 };
                 self.catch_up(Tick::Draw);
                 if window == Window::Online {
+                    self.reconnect_wifi();
                     let ctx = self.clone();
                     self.later(FETCH_AFTER, move || ctx.tick_miqat(Tick::Fetch));
                 }
@@ -1021,6 +1033,7 @@ impl Ctx {
                     }
                 },
             ),
+            Effect::Reconnect => self.reconnect_wifi(),
             Effect::ReleaseStorage => self.release_storage(),
             Effect::StorageBack => self.storage_back(),
         }
