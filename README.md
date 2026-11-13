@@ -30,9 +30,12 @@ system file. A reboot always returns the Kindle to stock.
   - **Power button**: sleeps (a sleep screen, front light off, suspend to
     RAM) and wakes, with the light restored. powerd ignores the button while
     kindil runs, so kindil hears it through kernel uevents.
+  - **Sleep when idle**: Never (the default, for an always-updating wall
+    dashboard) or after 5, 15, 30 or 60 minutes without a touch.
   - **USB drive mode**: plugging into a computer shows a USB screen while the
     computer has `/mnt/us`; unplugging reloads the library and resumes
-    Syncthing.
+    Syncthing. A cable that keeps dropping doesn't flash the screen: kindil
+    returns only once the storage has stayed back for 3 s.
 - **E-ink care**: while a finger drags a list, only the scroll bar follows
   it; the list catches up a few times a second and settles on release, so the
   panel is not redrawn on every finger movement. In the

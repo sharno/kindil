@@ -3,7 +3,7 @@
 use kindil::config::Config;
 use kindil::host::{Host, Simulated};
 use kindil::preview::{self, drag, pixels, tap};
-use kindil::system::{Drive, Event};
+use kindil::system::{Drive, Event, Touches};
 use kindil::ui::{App, DashboardKind, Execution, Kindil, Options, Page, Panel, Switch, System};
 use kindil::wifi::Credentials;
 use slint::platform::software_renderer::MinimalSoftwareWindow;
@@ -52,6 +52,7 @@ impl Fixture {
             host,
             panel: Panel::Lcd,
             execution: Execution::Inline,
+            touches: Touches::default(),
         })
         .unwrap();
         app.refresh_now();
@@ -326,6 +327,16 @@ fn usb_drive_mode_covers_the_app_until_the_storage_is_back() {
     f.app.device_event(Event::Drive(Drive::Kindle));
     assert_eq!(f.k().get_system(), System::App);
     assert_eq!(f.k().get_books().row_count(), 2, "the library is reloaded");
+}
+
+#[test]
+fn auto_sleep_is_a_saved_choice() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    assert_eq!(f.k().get_auto_sleep(), 0, "never, by default");
+    f.k().invoke_choose_auto_sleep(2);
+    assert_eq!(f.k().get_auto_sleep(), 2);
+    let prefs = std::fs::read_to_string(f.dir.path().join("prefs.toml")).unwrap();
+    assert!(prefs.contains("minutes = 15"), "{prefs}");
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,7 @@ pub(crate) struct KindlePlatform {
     black_and_white: Arc<AtomicBool>,
     rotation: Arc<AtomicU32>,
     full_refresh: Arc<AtomicBool>,
+    touches: Arc<AtomicU64>,
 }
 
 impl KindlePlatform {
@@ -41,6 +42,7 @@ impl KindlePlatform {
         black_and_white: Arc<AtomicBool>,
         rotation: Arc<AtomicU32>,
         full_refresh: Arc<AtomicBool>,
+        touches: Arc<AtomicU64>,
     ) -> std::io::Result<Self> {
         let window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
         let wakeup = wakeup::make_wakeup()?;
@@ -55,6 +57,7 @@ impl KindlePlatform {
             black_and_white,
             rotation,
             full_refresh,
+            touches,
         })
     }
 
@@ -249,6 +252,7 @@ impl Platform for KindlePlatform {
             // suspend countdown
             if file_descriptors[0].revents & libc::POLLIN != 0 {
                 last_interaction = Instant::now();
+                self.touches.fetch_add(1, Ordering::Relaxed);
             }
 
             touch_input.poll(&self.window, applied_rotation);

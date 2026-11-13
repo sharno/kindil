@@ -174,9 +174,6 @@ impl Host for KindleHost {
     }
 
     fn suspend(&self) -> anyhow::Result<()> {
-        // Let the panel finish drawing the sleep screen first: suspending
-        // mid-update leaves a half-drawn image for as long as it sleeps.
-        std::thread::sleep(Duration::from_millis(1500));
         // powerd suspends the same way; it ignores the button while kindil
         // runs, so nothing else will.
         std::fs::write("/sys/power/state", b"mem")?;
@@ -188,7 +185,8 @@ impl Host for KindleHost {
     }
 
     fn power_off(&self) -> anyhow::Result<()> {
-        std::thread::sleep(Duration::from_millis(1500));
+        // Let the panel finish drawing the "Off" screen, which it then keeps.
+        std::thread::sleep(crate::system::PANEL_SETTLE);
         run(Command::new("/sbin/shutdown").args(["-h", "now"]))
     }
 }

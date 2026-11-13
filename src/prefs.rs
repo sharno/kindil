@@ -83,6 +83,7 @@ pub struct Prefs {
     pub dashboard: Option<Dashboard>,
     pub font: FontSize,
     pub sync: Power,
+    pub auto_sleep: crate::system::AutoSleep,
     /// Keyed by file name inside the books directory.
     pub positions: BTreeMap<String, Progress>,
 }

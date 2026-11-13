@@ -134,6 +134,10 @@ export global Kindil {
     callback device-events();
     callback restart();
     callback power-off();
+    /// Auto-sleep: the choices' labels and the chosen one's index (-1: none of them).
+    in property <[string]> sleep-choices;
+    in property <int> auto-sleep: 0;
+    callback choose-auto-sleep(int);
 
     public function go(target: Page) {
         page = target;
@@ -1332,6 +1336,30 @@ component SettingsPage {
                             color: Theme.ink;
                             vertical-alignment: center;
                         }
+                    }
+                }
+                Group {
+                    title: "SLEEP WHEN IDLE";
+                    Rectangle {
+                        height: 72px;
+                        border-radius: Theme.radius;
+                        border-width: 2px;
+                        border-color: Theme.ink;
+                        HorizontalLayout {
+                            padding: 6px;
+                            spacing: 4px;
+                            for choice[i] in Kindil.sleep-choices: Segment {
+                                text: choice;
+                                selected: i == Kindil.auto-sleep;
+                                clicked => { Kindil.choose-auto-sleep(i); }
+                            }
+                        }
+                    }
+                    Text {
+                        text: "The power button always sleeps and wakes. Never keeps the dashboard updating.";
+                        font-size: 17px;
+                        color: Theme.ink-3;
+                        wrap: word-wrap;
                     }
                 }
                 Rectangle { height: 20px; }

@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use kindil::config::Config;
 use kindil::host::Simulated;
+use kindil::system::Touches;
 use kindil::ui::{App, Execution, Options, Panel};
 use slint::ComponentHandle;
 use std::path::PathBuf;
@@ -73,6 +74,7 @@ fn preview(cli: &Cli, dir: &std::path::Path) -> anyhow::Result<()> {
         host: Arc::new(Simulated::default()),
         panel: Panel::Lcd,
         execution: Execution::Inline,
+        touches: Touches::default(),
     })?;
     app.refresh_now();
     if miqat_config.is_file() {
@@ -95,6 +97,7 @@ fn desktop(cli: &Cli) -> anyhow::Result<()> {
         host: Arc::new(Simulated::default()),
         panel: Panel::Lcd,
         execution: Execution::Background,
+        touches: Touches::default(),
     })?;
     app.start();
     kindil::signals::quit_on_termination()?;
@@ -116,6 +119,7 @@ fn kindle(cli: &Cli) -> anyhow::Result<()> {
         host: Arc::new(KindleHost::open()),
         panel: Panel::Eink(backend.full_refresh_flag()),
         execution: Execution::Background,
+        touches: Touches::new(backend.touch_counter()),
     })?;
     app.start();
     kindil::signals::quit_on_termination()?;

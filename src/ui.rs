@@ -8,7 +8,9 @@ use crate::host::{Brightness, DeviceInfo, Host, Power, Ssh, Wifi};
 use crate::prefs::Store;
 use crate::reader::{self, Book, Layout, Reader};
 use crate::sync::Service;
-use crate::system::{Effect, Event as DeviceEvent, Mode, Step};
+use crate::system::{
+    AutoSleep, Effect, Event as DeviceEvent, Idle, Mode, Step, Touches, DRIVE_SETTLE, PANEL_SETTLE,
+};
 use crate::view;
 use crate::wifi::Credentials;
 use chrono::{DateTime, Timelike, Utc};
@@ -44,6 +46,8 @@ pub struct Options {
     pub host: Arc<dyn Host>,
     pub panel: Panel,
     pub execution: Execution,
+    /// Touches seen by the panel, for auto-sleep.
+    pub touches: Touches,
 }
 
 /// The e-ink ghosting policy applied to a panel. Send, so workers can use it.
@@ -97,6 +101,7 @@ struct State {
     trashed: Option<Trashed>,
     miqat: Worker,
     system: Mode,
+    idle: Idle,
 }
 
 /// Device events from any thread, queued for the UI thread.
@@ -115,6 +120,7 @@ struct Ctx {
     display: Display,
     execution: Execution,
     events: Events,
+    touches: Touches,
 }
 
 pub struct App {
@@ -178,6 +184,15 @@ impl Snapshot {
     }
 }
 
+/// The Settings segment for an auto-sleep choice; -1 for a hand-edited value.
+fn sleep_choice(choice: AutoSleep) -> i32 {
+    AutoSleep::CHOICES
+        .iter()
+        .position(|c| *c == choice)
+        .and_then(|i| i32::try_from(i).ok())
+        .unwrap_or(-1)
+}
+
 fn model<T: Clone + 'static>(items: Vec<T>) -> ModelRc<T> {
     ModelRc::from(Rc::new(VecModel::from(items)))
 }
@@ -212,6 +227,7 @@ impl App {
                 trashed: None,
                 miqat: Worker::Idle,
                 system: Mode::start(Instant::now()),
+                idle: Idle::new(options.touches.count(), Instant::now()),
             })),
             display: Display {
                 panel: options.panel,
@@ -223,6 +239,7 @@ impl App {
                 sender,
                 queue: Rc::new(queue),
             },
+            touches: options.touches,
         };
         {
             let k = window.global::<Kindil>();
@@ -230,6 +247,13 @@ impl App {
             k.set_version(format!("v{}", env!("CARGO_PKG_VERSION")).into());
             k.set_books_root(ctx.config.books.display().to_string().into());
             k.set_font_size(i32::from(ctx.state.borrow().store.prefs.font.px()));
+            k.set_sleep_choices(model(
+                AutoSleep::CHOICES
+                    .iter()
+                    .map(|choice| choice.label().into())
+                    .collect(),
+            ));
+            k.set_auto_sleep(sleep_choice(ctx.state.borrow().store.prefs.auto_sleep));
         }
         install_keyboard(&window);
         wire(&window, &ctx);
@@ -335,6 +359,7 @@ fn wire(window: &AppWindow, ctx: &Ctx) {
     on!(on_device_events => device_events());
     on!(on_restart => restart());
     on!(on_power_off => power_off());
+    on!(on_choose_auto_sleep => choose_auto_sleep(index));
 }
 
 fn arm_clock(timer: Rc<slint::Timer>, ctx: Ctx) {
@@ -345,6 +370,7 @@ fn arm_clock(timer: Rc<slint::Timer>, ctx: Ctx) {
         move || {
             ctx.tick_clock();
             ctx.refresh_status();
+            ctx.check_idle();
             arm_clock(next.clone(), ctx.clone());
         },
     );
@@ -842,6 +868,8 @@ impl Ctx {
                 let _ = host.set_brightness(Brightness::new(0));
                 DeviceEvent::LightOff(level)
             }),
+            Effect::AwaitPanel => self.after(PANEL_SETTLE, DeviceEvent::PanelSettled),
+            Effect::AwaitDrive(since) => self.after(DRIVE_SETTLE, DeviceEvent::DriveSettled(since)),
             Effect::Suspend => self.device_later(|host| match host.suspend() {
                 Ok(()) => DeviceEvent::Resumed,
                 Err(error) => {
@@ -849,24 +877,59 @@ impl Ctx {
                     DeviceEvent::SuspendFailed
                 }
             }),
-            Effect::Wake { light } => {
+            Effect::Wake => {
                 self.show_system(&ui, System::App);
                 // The clock and battery moved on while the device slept.
                 self.tick_clock();
                 self.refresh_status();
-                if let Some(level) = light {
-                    self.background(
-                        move |host| host.set_brightness(level),
-                        |ui, result| {
-                            if let Err(error) = result {
-                                notify(ui, &format!("Front light: {error}"));
-                            }
-                        },
-                    );
-                }
+                self.state.borrow_mut().idle = Idle::new(self.touches.count(), Instant::now());
             }
+            Effect::RestoreLight(level) => self.background(
+                move |host| host.set_brightness(level),
+                |ui, result| {
+                    if let Err(error) = result {
+                        notify(ui, &format!("Front light: {error}"));
+                    }
+                },
+            ),
             Effect::ReleaseStorage => self.release_storage(),
             Effect::StorageBack => self.storage_back(),
+        }
+    }
+
+    /// Delivers `event` after `delay`; previews and tests deliver it at once.
+    fn after(&self, delay: Duration, event: DeviceEvent) {
+        match self.execution {
+            Execution::Inline => self.device(event),
+            Execution::Background => {
+                let ctx = self.clone();
+                slint::Timer::single_shot(delay, move || ctx.device(event));
+            }
+        }
+    }
+
+    fn check_idle(&self) {
+        let now = Instant::now();
+        let due = {
+            let mut state = self.state.borrow_mut();
+            state.idle = state.idle.observe(self.touches.count(), now);
+            state.idle.due(state.store.prefs.auto_sleep, now)
+        };
+        if due {
+            self.device(DeviceEvent::Idle);
+        }
+    }
+
+    fn choose_auto_sleep(&self, index: i32) {
+        let Some(choice) = usize::try_from(index)
+            .ok()
+            .and_then(|i| AutoSleep::CHOICES.get(i).copied())
+        else {
+            return;
+        };
+        self.save(|prefs| prefs.auto_sleep = choice);
+        if let Some(ui) = self.ui() {
+            ui.global::<Kindil>().set_auto_sleep(sleep_choice(choice));
         }
     }
 

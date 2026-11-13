@@ -29,7 +29,7 @@ use slint::platform::software_renderer::MinimalSoftwareWindow;
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -69,6 +69,7 @@ pub struct KindleBackend<State = NoSchedule> {
     black_and_white: Arc<AtomicBool>,
     rotation: Arc<AtomicU32>,
     full_refresh: Arc<AtomicBool>,
+    touches: Arc<AtomicU64>,
     _state: PhantomData<State>,
 }
 
@@ -123,6 +124,12 @@ impl<State> KindleBackend<State> {
         self.full_refresh.clone()
     }
 
+    /// Counts touch input as it arrives, so an app can tell how long the
+    /// device has been idle. kindil patch.
+    pub fn touch_counter(&self) -> Arc<AtomicU64> {
+        self.touches.clone()
+    }
+
     /// Switch state, keeping the same internals.
     fn into_state<Next>(self) -> KindleBackend<Next> {
         KindleBackend {
@@ -132,6 +139,7 @@ impl<State> KindleBackend<State> {
             black_and_white: self.black_and_white,
             rotation: self.rotation,
             full_refresh: self.full_refresh,
+            touches: self.touches,
             _state: PhantomData,
         }
     }
@@ -214,12 +222,14 @@ pub fn install(font_data: &[u8]) -> Result<KindleBackend, slint::PlatformError> 
     let black_and_white = Arc::new(AtomicBool::new(false));
     let rotation = Arc::new(AtomicU32::new(0));
     let full_refresh = Arc::new(AtomicBool::new(false));
+    let touches = Arc::new(AtomicU64::new(0));
     let platform = KindlePlatform::new(
         wake_schedule.clone(),
         on_wake.clone(),
         black_and_white.clone(),
         rotation.clone(),
         full_refresh.clone(),
+        touches.clone(),
     )
     .map_err(|e| slint::PlatformError::Other(format!("failed to init Kindle platform: {e}")))?;
     let window = platform.window.clone();
@@ -232,6 +242,7 @@ pub fn install(font_data: &[u8]) -> Result<KindleBackend, slint::PlatformError> 
         black_and_white,
         rotation,
         full_refresh,
+        touches,
         _state: PhantomData,
     })
 }

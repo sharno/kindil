@@ -14,7 +14,7 @@ fi
 RUN=/var/local/kindil
 mkdir -p "$RUN" /mnt/us/kindil
 for f in session.sh kindil; do
-  cmp -s "$DIR/bin/$f" "$RUN/$f" || cp "$DIR/bin/$f" "$RUN/$f"
+  cmp -s "$DIR/bin/$f" "$RUN/$f" 2>/dev/null || cp "$DIR/bin/$f" "$RUN/$f"
 done
 # /var/local is 64 MB and also holds Amazon's settings: keep the log small.
 LOG="$RUN/kindil.log"
