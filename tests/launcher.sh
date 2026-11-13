@@ -95,3 +95,18 @@ touch "$T/SKIP"
 fake "$T/ext/kindil" 1.0.0 "exit 0"
 run
 expect "leaving kindil brings Amazon's framework back" "$([ -f "$T/SKIP" ] && echo skip || echo framework)" "framework"
+
+reset
+fake "$T/ext/kindil" 1.0.0 "exit 0"
+run
+# Same time, different content: only a copy would bring the content back.
+printf '#!/bin/sh\nexit 0\n' >"$T/marker"
+chmod +x "$T/marker"
+touch -r "$T/run/kindil" "$T/marker"
+mv "$T/marker" "$T/run/kindil"
+run
+expect "an unchanged binary isn't copied again" "$(cat "$T/run/kindil")" "$(printf '#!/bin/sh\nexit 0')"
+fake "$T/ext/kindil" 1.1.0 "exit 0"
+touch -t 203001010000 "$T/ext/kindil"
+run
+expect "a replaced binary is" "$("$T/run/kindil" --version)" "kindil 1.1.0"

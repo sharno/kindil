@@ -49,9 +49,19 @@ crashed() {
   [ "$(echo "$crashes" | wc -w)" -lt "$CRASHES" ]
 }
 
+# Comparing the 16 MB binaries takes over 10 s at boot. Instead the copy
+# records its source and keeps the source's modification time (cp -p sets it
+# last, so a cut-short copy never matches): the same source with the same
+# time means the copy is current.
+FROM="$BIN.from"
+current() {
+  [ "$(cat "$FROM" 2>/dev/null)" = "$1" ] && [ ! "$1" -nt "$BIN" ] && [ ! "$BIN" -nt "$1" ]
+}
+copy() { rm -f "$FROM" && cp -p "$1" "$BIN" && echo "$1" >"$FROM"; }
+
 pick() {
   if [ -f "$EXT/kindil.next" ] && mv -f "$EXT/kindil.next" "$EXT/kindil.trying"; then
-    if cp "$EXT/kindil.trying" "$BIN"; then
+    if copy "$EXT/kindil.trying"; then
       touch "$TRYING"
       log "trying the update"
       return
@@ -59,7 +69,7 @@ pick() {
     rm -f "$EXT/kindil.trying"
   fi
   if [ -f "$SLOT" ]; then
-    cmp -s "$SLOT" "$BIN" || cp "$SLOT" "$BIN"
+    current "$SLOT" || copy "$SLOT"
   fi
 }
 
