@@ -11,7 +11,7 @@ use slint::platform::software_renderer::{
 };
 use slint::platform::{EventLoopProxy, Platform, PlatformError, WindowAdapter};
 
-use crate::framebuffer::{Framebuffer, Waveform};
+use crate::framebuffer::{Framebuffer, Pass};
 use crate::power::{arm_wakealarm, find_wakealarm, suspend_to_mem};
 use crate::touch::{TouchInput, has_accelerometer};
 use crate::wakeup::{self, KindleEventLoopProxy, Queue, Wakeup};
@@ -62,12 +62,16 @@ impl Area {
     }
 }
 
-/// Whether content is moving under a finger, and where the fast frames
-/// landed. kindil patch.
+/// Fast frames between two fast cleans of the moved area: enough to keep
+/// the motion fluid, few enough that ghosts don't build up during a long drag.
+const FAST_CLEAN_EVERY: u16 = 8;
+
+/// Whether content is moving under a finger, where the fast frames landed,
+/// and how many there were since the last clean. kindil patch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Motion {
     Still,
-    Moving { drawn: Option<Area> },
+    Moving { drawn: Option<Area>, fast: u16 },
 }
 
 /// What kind of frame the panel is about to get. kindil patch.
@@ -76,32 +80,60 @@ enum Frame {
     /// Content is moving: black and white with the fast A2 waveform, one
     /// update at a time so frames never pile up into a smear.
     Motion,
-    /// Motion just ended: repaint in grayscale (GC16) where the fast frames
-    /// left black-and-white pixels.
+    /// Still moving, and the fast frames have left ghosts: drive every pixel
+    /// of the moved area once, still in fast black and white.
+    FastClean(Area),
+    /// Motion just ended: a hard grayscale clean of the moved area.
     Settle(Area),
     Still,
+}
+
+impl Frame {
+    fn is_motion(self) -> bool {
+        match self {
+            Frame::Motion | Frame::FastClean(_) => true,
+            Frame::Settle(_) | Frame::Still => false,
+        }
+    }
 }
 
 impl Motion {
     fn frame(self, moving: bool) -> Frame {
         match (self, moving) {
+            (
+                Motion::Moving {
+                    drawn: Some(area),
+                    fast,
+                },
+                true,
+            ) if fast >= FAST_CLEAN_EVERY => Frame::FastClean(area),
             (_, true) => Frame::Motion,
-            (Motion::Moving { drawn: Some(area) }, false) => Frame::Settle(area),
-            (Motion::Moving { drawn: None } | Motion::Still, false) => Frame::Still,
+            (Motion::Moving { drawn: Some(area), .. }, false) => Frame::Settle(area),
+            (Motion::Moving { drawn: None, .. } | Motion::Still, false) => Frame::Still,
         }
     }
 
-    /// After a frame: still moving accumulates the area just drawn.
-    fn after(self, moving: bool, drawn: Option<Area>) -> Motion {
-        match (self, moving) {
-            (_, false) => Motion::Still,
-            (Motion::Still, true) => Motion::Moving { drawn },
-            (Motion::Moving { drawn: before }, true) => Motion::Moving {
-                drawn: match (before, drawn) {
-                    (Some(a), Some(b)) => Some(a.union(b)),
-                    (a, b) => a.or(b),
-                },
+    /// After a frame: motion accumulates the area drawn and counts the fast
+    /// frames since the last clean.
+    fn after(self, frame: Frame, drawn: Option<Area>) -> Motion {
+        let (before, fast) = match self {
+            Motion::Still => (None, 0),
+            Motion::Moving { drawn, fast } => (drawn, fast),
+        };
+        let drawn_so_far = match (before, drawn) {
+            (Some(a), Some(b)) => Some(a.union(b)),
+            (a, b) => a.or(b),
+        };
+        match frame {
+            Frame::Motion => Motion::Moving {
+                drawn: drawn_so_far,
+                fast: fast + u16::from(drawn.is_some()),
             },
+            Frame::FastClean(_) => Motion::Moving {
+                drawn: drawn_so_far,
+                fast: 0,
+            },
+            Frame::Settle(_) | Frame::Still => Motion::Still,
         }
     }
 }
@@ -334,12 +366,13 @@ impl Platform for KindlePlatform {
 
             let moving = self.motion.load(Ordering::Relaxed);
             let frame = motion.frame(moving);
-            if let Frame::Settle(_) = frame {
-                self.window.request_redraw();
+            match frame {
+                Frame::Settle(_) | Frame::FastClean(_) => self.window.request_redraw(),
+                Frame::Motion | Frame::Still => {}
             }
             let mut drawn = None;
             let black_and_white =
-                self.black_and_white.load(Ordering::Relaxed) || frame == Frame::Motion;
+                self.black_and_white.load(Ordering::Relaxed) || frame.is_motion();
 
             let app_rotation = self.rotation.load(Ordering::Relaxed);
             let rotation_changed = app_rotation != applied_rotation;
@@ -361,14 +394,15 @@ impl Platform for KindlePlatform {
                     renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
                     renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
                 }
-                if frame == Frame::Motion {
+                if frame.is_motion() {
                     // Don't write pixels the panel is still driving.
                     frame_buffer.wait_for_update_complete();
                 }
                 let dirty = renderer.render(&mut rgb_buffer, width);
                 let origin = dirty.bounding_box_origin();
                 let size = dirty.bounding_box_size();
-                drawn = Some(Area { origin, size }).filter(|area| !area.is_empty());
+                let dirty = Area { origin, size };
+                drawn = Some(dirty).filter(|area| !area.is_empty());
                 let (x0, y0) = (origin.x as usize, origin.y as usize);
                 let (w, h) = (size.width as usize, size.height as usize);
 
@@ -397,15 +431,18 @@ impl Platform for KindlePlatform {
                 } else {
                     // Settling renders the whole window but cleans only
                     // where the fast frames went, so the rest doesn't flash.
-                    let (area, waveform) = match frame {
-                        Frame::Motion => (Area { origin, size }, Waveform::A2),
-                        Frame::Settle(moved) => (moved, Waveform::Gc16),
-                        Frame::Still => (Area { origin, size }, Waveform::Auto),
+                    let (area, pass) = match frame {
+                        Frame::Motion => (dirty, Pass::Fast),
+                        Frame::FastClean(moved) => {
+                            (drawn.map_or(moved, |d| moved.union(d)), Pass::FastClean)
+                        }
+                        Frame::Settle(moved) => (moved, Pass::Clean),
+                        Frame::Still => (dirty, Pass::Auto),
                     };
-                    frame_buffer.refresh_region(area.origin, area.size, waveform);
+                    frame_buffer.refresh_region(area.origin, area.size, pass);
                 }
             });
-            motion = motion.after(moving, drawn);
+            motion = motion.after(frame, drawn);
         }
 
         Ok(())
@@ -442,18 +479,54 @@ mod tests {
         }
     }
 
+    /// Runs frames through the motion state: each is (moving, drawn area).
+    fn run(frames: &[(bool, Option<Area>)]) -> (Motion, Vec<Frame>) {
+        frames
+            .iter()
+            .fold((Motion::Still, Vec::new()), |(motion, mut seen), &(moving, drawn)| {
+                let frame = motion.frame(moving);
+                seen.push(frame);
+                (motion.after(frame, drawn), seen)
+            })
+    }
+
     #[test]
     fn motion_cleans_up_only_where_fast_frames_landed() {
-        let moving = Motion::Still.after(true, Some(area(0, 100, 10, 10)));
-        assert_eq!(moving.frame(true), Frame::Motion);
-        let moving = moving.after(true, None).after(true, Some(area(5, 300, 20, 10)));
-        assert_eq!(moving.frame(false), Frame::Settle(area(0, 100, 25, 210)));
-        assert_eq!(moving.after(false, None), Motion::Still);
+        let (motion, frames) = run(&[
+            (true, Some(area(0, 100, 10, 10))),
+            (true, None),
+            (true, Some(area(5, 300, 20, 10))),
+            (false, None),
+        ]);
+        assert_eq!(
+            frames,
+            [
+                Frame::Motion,
+                Frame::Motion,
+                Frame::Motion,
+                Frame::Settle(area(0, 100, 25, 210))
+            ]
+        );
+        assert_eq!(motion, Motion::Still);
+    }
+
+    #[test]
+    fn long_drags_get_a_fast_clean_every_few_frames() {
+        let step = (true, Some(area(0, 0, 10, 10)));
+        let (_, frames) = run(&[step; 2 * FAST_CLEAN_EVERY as usize + 2]);
+        let cleans: Vec<usize> = frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| matches!(f, Frame::FastClean(_)))
+            .map(|(i, _)| i)
+            .collect();
+        let every = FAST_CLEAN_EVERY as usize;
+        assert_eq!(cleans, [every, 2 * every + 1]);
     }
 
     #[test]
     fn motion_without_frames_needs_no_clean_up() {
-        assert_eq!(Motion::Still.after(true, None).frame(false), Frame::Still);
+        assert_eq!(run(&[(true, None), (false, None)]).1[1], Frame::Still);
         assert_eq!(Motion::Still.frame(false), Frame::Still);
     }
 }

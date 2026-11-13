@@ -14,21 +14,27 @@ use ffi::{
 
 /// How the panel moves pixels for a partial update. kindil patch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Waveform {
-    /// The driver picks; grayscale content gets a slow, clean waveform.
+pub(crate) enum Pass {
+    /// Changed pixels only; the driver picks the waveform.
     Auto,
-    /// Full 16-level grayscale: cleans what A2 left behind.
-    Gc16,
-    /// Black and white only, fastest: for content in motion.
-    A2,
+    /// Changed pixels only, black and white, fastest: content in motion.
+    Fast,
+    /// Every pixel of the area, black and white: clears what fast passes
+    /// left behind without stopping the motion for long.
+    FastClean,
+    /// Every pixel of the area in 16-level grayscale, with a flash: a hard
+    /// clean once motion ends.
+    Clean,
 }
 
-impl Waveform {
-    fn mode(self) -> u32 {
+impl Pass {
+    /// The waveform and update mode.
+    fn update(self) -> (u32, u32) {
         match self {
-            Waveform::Auto => WAVEFORM_MODE_AUTO,
-            Waveform::Gc16 => WAVEFORM_MODE_GC16,
-            Waveform::A2 => WAVEFORM_MODE_A2,
+            Pass::Auto => (WAVEFORM_MODE_AUTO, UPDATE_MODE_PARTIAL),
+            Pass::Fast => (WAVEFORM_MODE_A2, UPDATE_MODE_PARTIAL),
+            Pass::FastClean => (WAVEFORM_MODE_A2, UPDATE_MODE_FULL),
+            Pass::Clean => (WAVEFORM_MODE_GC16, UPDATE_MODE_FULL),
         }
     }
 }
@@ -324,13 +330,14 @@ impl Framebuffer {
         }
     }
 
-    /// Partial refresh of a dirty rectangle
+    /// Refresh a rectangle of the panel.
     pub(crate) fn refresh_region(
         &self,
         origin: slint::PhysicalPosition,
         size: slint::PhysicalSize,
-        waveform: Waveform,
+        pass: Pass,
     ) {
+        let (waveform, mode) = pass.update();
         if size.width == 0 || size.height == 0 {
             return;
         }
@@ -341,8 +348,8 @@ impl Framebuffer {
                 width: size.width,
                 height: size.height,
             },
-            waveform.mode(),
-            UPDATE_MODE_PARTIAL,
+            waveform,
+            mode,
         );
     }
 }

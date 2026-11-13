@@ -115,8 +115,6 @@ export global Kindil {
     in-out property <bool> notice-undo: false;
 
     callback navigated(Page);
-    /// A list moved by a swipe.
-    callback scrolled();
     callback choose-dashboard(DashboardKind);
     callback open-book(int);
     callback rename-book(int, string);
@@ -482,8 +480,6 @@ component ProgressBar {
 component SwipeScroll inherits Rectangle {
     in property <length> content-height;
     in-out property <length> offset: 0;
-    /// The swipe ended and the list settled.
-    callback moved();
     property <length> max-offset: max(0px, root.content-height - root.height);
     // Clamped here too, so a list that shrinks never shows empty space.
     property <length> shown: min(root.offset, root.max-offset);
@@ -513,7 +509,6 @@ component SwipeScroll inherits Rectangle {
             root.offset = root.target;
             root.dragging = false;
             Kindil.motion(Motion.still);
-            root.moved();
         }
         cancelled => {
             root.offset = root.start;
@@ -1006,7 +1001,6 @@ component LibraryPage {
         if Kindil.books.length > 0: SwipeScroll {
             vertical-stretch: 1;
             content-height: list.preferred-height;
-            moved => { Kindil.scrolled(); }
             list := VerticalLayout {
                 width: parent.width;
                 alignment: start;
@@ -1296,7 +1290,6 @@ component SettingsPage {
         SwipeScroll {
             vertical-stretch: 1;
             content-height: content.preferred-height;
-            moved => { Kindil.scrolled(); }
             content := VerticalLayout {
                 width: parent.width;
                 alignment: start;
@@ -1503,7 +1496,6 @@ component NetworksPage {
         SwipeScroll {
             vertical-stretch: 1;
             content-height: rows.preferred-height;
-            moved => { Kindil.scrolled(); }
             rows := VerticalLayout {
                 width: parent.width;
                 alignment: start;

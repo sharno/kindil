@@ -41,8 +41,9 @@ system file. A reboot always returns the Kindle to stock.
     returns only once the storage has stayed back for 3 s.
 - **E-ink care**: while a finger drags a list, the list follows it in fast
   black-and-white frames (the A2 waveform), each sent only once the panel has
-  finished the last, so motion doesn't smear; on release the moved area is
-  repainted once in grayscale, without flashing the rest. In the
+  finished the last, so motion doesn't smear. Every 8 frames of a long drag
+  the moved area gets a fast black-and-white clean, and on release a hard
+  grayscale clean (a flash of that area only). In the
   reader, swipe left/right or tap to turn pages. Page changes flash the panel
   once; reading flashes every 6th page turn, the dashboard every 30 minutes, to
   clear ghosting.
