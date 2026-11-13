@@ -84,6 +84,9 @@ pub struct Prefs {
     pub font: FontSize,
     pub sync: Power,
     pub auto_sleep: crate::system::AutoSleep,
+    /// The front light level last chosen; the light comes back to it when
+    /// kindil starts, after a reboot too. None until one is chosen.
+    pub light: Option<crate::host::Brightness>,
     /// Keyed by file name inside the books directory.
     pub positions: BTreeMap<String, Progress>,
 }
@@ -130,6 +133,7 @@ mod tests {
         assert_eq!(store.prefs, Prefs::default());
         store.prefs.dashboard = Some(Dashboard::Clock);
         store.prefs.font = store.prefs.font.larger();
+        store.prefs.light = Some(crate::host::Brightness::new(70));
         store
             .prefs
             .positions

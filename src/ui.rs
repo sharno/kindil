@@ -325,6 +325,7 @@ impl App {
         }
         install_keyboard(&window);
         wire(&window, &ctx);
+        ctx.restore_light();
         ctx.reload_library();
         ctx.show_sync();
         ctx.tick_clock();
@@ -758,9 +759,28 @@ impl Ctx {
         let level = Brightness::new(percent.clamp(0, 100) as u8);
         let k = ui.global::<Kindil>();
         match self.host.set_brightness(level) {
-            Ok(()) => k.set_brightness(i32::from(level.percent())),
+            Ok(()) => {
+                k.set_brightness(i32::from(level.percent()));
+                self.save(|prefs| prefs.light = Some(level));
+            }
             Err(error) => notify(&ui, &format!("Front light: {error}")),
         }
+    }
+
+    /// The light as last chosen; after a reboot nothing else sets it.
+    fn restore_light(&self) {
+        let Some(level) = self.state.borrow().store.prefs.light else {
+            return;
+        };
+        self.background(
+            move |host| host.set_brightness(level),
+            move |ui, result| match result {
+                Ok(()) => ui
+                    .global::<Kindil>()
+                    .set_brightness(i32::from(level.percent())),
+                Err(error) => notify(ui, &format!("Front light: {error}")),
+            },
+        );
     }
 
     fn motion(&self, motion: Motion) {

@@ -26,7 +26,8 @@ and a reboot always returns the Kindle to stock.
 - **Library and reader**: `.epub` and UTF-8 `.txt` files from `/mnt/us/books`.
   Tap the right two-thirds of a page to go forward, the left third to go back.
   kindil remembers the position in every
-  book, the text size and the home screen across restarts. Rename and Trash
+  book, the text size, the home screen and the front light across restarts
+  and reboots. Rename and Trash
   (with Undo) from a book's **···** menu; nothing is ever overwritten or
   deleted outright.
 - **Settings**: an index of sections, each row showing what it is set to now,

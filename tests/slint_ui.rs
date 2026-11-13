@@ -51,7 +51,21 @@ impl Fixture {
     }
 
     fn with_clock(host: Arc<dyn Host>, now: fn() -> chrono::DateTime<chrono::Utc>) -> Self {
+        Self::build(host, now, "")
+    }
+
+    /// Started with these saved preferences, as after a reboot.
+    fn with_prefs(host: Arc<dyn Host>, prefs: &str) -> Self {
+        Self::build(
+            host,
+            || chrono::DateTime::from_timestamp(1_794_398_430, 0).unwrap(),
+            prefs,
+        )
+    }
+
+    fn build(host: Arc<dyn Host>, now: fn() -> chrono::DateTime<chrono::Utc>, prefs: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("prefs.toml"), prefs).unwrap();
         let books = dir.path().join("books");
         std::fs::create_dir(&books).unwrap();
         std::fs::write(
@@ -383,6 +397,26 @@ fn settings_switch_the_simulated_device() {
         facts,
         ["Battery", "Memory free", "Storage free", "Up for", "kindil"]
     );
+}
+
+#[test]
+fn a_chosen_front_light_level_is_saved() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    assert_eq!(f.k().get_brightness(), 40, "never chosen: left as it is");
+    f.k().invoke_choose_brightness(70);
+    assert_eq!(host.brightness().unwrap().percent(), 70);
+    let saved = std::fs::read_to_string(f.dir.path().join("prefs.toml")).unwrap();
+    assert!(saved.contains("light = 70"), "saved: {saved}");
+}
+
+#[test]
+fn the_front_light_comes_back_to_the_saved_level_at_start() {
+    // After a reboot the light is wherever the hardware starts it.
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::with_prefs(host.clone(), "light = 70\n");
+    assert_eq!(host.brightness().unwrap().percent(), 70);
+    assert_eq!(f.k().get_brightness(), 70);
 }
 
 #[test]

@@ -29,8 +29,21 @@ impl Power {
 }
 
 /// Frontlight level in percent, 0..=100.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(from = "u8", into = "u8")]
 pub struct Brightness(u8);
+
+impl From<u8> for Brightness {
+    fn from(percent: u8) -> Self {
+        Self::new(percent)
+    }
+}
+
+impl From<Brightness> for u8 {
+    fn from(level: Brightness) -> u8 {
+        level.0
+    }
+}
 
 impl Brightness {
     pub fn new(percent: u8) -> Self {

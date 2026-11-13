@@ -28,6 +28,10 @@ const RESOLV: &str = "/var/run/resolv.conf";
 const ROUTES: &str = "/proc/net/route";
 /// The PW1's fuel gauge; it stalls while suspended and catches up on resume.
 const GAUGE_CHARGE: &str = "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_mAH";
+/// The gauge's state of charge, as `71%`; powerd's `battLevel` is this.
+const GAUGE_CAPACITY: &str = "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_capacity";
+/// `1` while the charger charges; powerd's `isCharging` is this.
+const CHARGER: &str = "/sys/devices/platform/aplite_charger.0/charging";
 /// USBNetwork toggles dropbear when configured with USE_WIFI_SSHD_ONLY.
 const USBNET_TOGGLE: &str = "/mnt/us/usbnet/bin/usbnetwork";
 const USBNET_AT_BOOT: &str = "/mnt/us/usbnet/auto";
@@ -71,17 +75,23 @@ fn wifi_power() -> anyhow::Result<Power> {
     }
 }
 
-/// powerd knows the PW1's fuel gauge, which has no `power_supply` class entry.
-fn powerd_battery() -> anyhow::Result<Battery> {
-    let percent: u8 = lipc::get("com.lab126.powerd", "battLevel")?.parse()?;
-    let charge = match lipc::get("com.lab126.powerd", "isCharging")?.as_str() {
+/// The PW1's fuel gauge and charger, read where powerd reads them; the
+/// gauge has no `power_supply` class entry.
+fn gauge_battery() -> anyhow::Result<Battery> {
+    let text = std::fs::read_to_string(GAUGE_CAPACITY)?;
+    let percent =
+        parse_capacity(&text).ok_or_else(|| anyhow::anyhow!("unexpected capacity {text:?}"))?;
+    let charge = match std::fs::read_to_string(CHARGER)?.trim() {
         "1" => Charge::Charging,
         _ => Charge::Discharging,
     };
-    Ok(Battery::Known {
-        percent: percent.min(100),
-        charge,
-    })
+    Ok(Battery::Known { percent, charge })
+}
+
+/// The gauge reports `71%`.
+pub fn parse_capacity(text: &str) -> Option<u8> {
+    let percent: u8 = text.trim().trim_end_matches('%').parse().ok()?;
+    Some(percent.min(100))
 }
 
 impl Host for KindleHost {
@@ -220,7 +230,7 @@ impl Host for KindleHost {
 
     fn info(&self) -> DeviceInfo {
         DeviceInfo {
-            battery: powerd_battery().unwrap_or_else(|_| crate::battery::read(Path::new("/sys"))),
+            battery: gauge_battery().unwrap_or_else(|_| crate::battery::read(Path::new("/sys"))),
             charge: std::fs::read_to_string(GAUGE_CHARGE)
                 .ok()
                 .and_then(|text| text.trim().parse().ok())
@@ -523,6 +533,13 @@ mod tests {
         let default = "wlan0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n";
         assert!(!has_default_route(&format!("{header}{local}")));
         assert!(has_default_route(&format!("{header}{local}{default}")));
+    }
+
+    #[test]
+    fn reads_the_gauges_capacity() {
+        assert_eq!(parse_capacity("71%\n"), Some(71));
+        assert_eq!(parse_capacity("100%"), Some(100));
+        assert_eq!(parse_capacity("%"), None);
     }
 
     #[test]
