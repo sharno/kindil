@@ -35,9 +35,13 @@ restore() {
   lipc-set-prop com.lab126.blanket load usb
   lipc-set-prop com.lab126.blanket load splash
   log "starting the Kindle UI"
-  start lab126_gui
+  # A standalone boot stopped X: starting it brings up the rest.
+  if running x; then start lab126_gui; else start x; fi
   rm -f /var/tmp/kindil.pid
 }
+
+# Starting or running, by upstart's goal.
+running() { status "$1" 2>/dev/null | grep -q start/; }
 
 # Copies the binary to run into /var/local, which stays when a computer takes
 # /mnt/us. A staged update (kindil.next, written by kindil after checking its
@@ -85,16 +89,19 @@ if [ ! -x "$BIN" ]; then
   log "missing $BIN"
   exit 1
 fi
-# Let KUAL close its menu before the UI goes away.
-sleep 2
 # powerd then ignores the power button and never sleeps on its own: kindil
 # hears the button through kernel uevents and runs sleep itself.
 lipc-set-prop com.lab126.powerd preventScreenSaver 1
 # Stopping the GUI job signals its whole tree, which can include us.
 trap '' TERM
-log "stopping the Kindle UI"
-stop lab126_gui
-sleep 2
+# A standalone boot never started it.
+if running lab126_gui; then
+  # Let KUAL close its menu before the UI goes away.
+  sleep 2
+  log "stopping the Kindle UI"
+  stop lab126_gui
+  sleep 2
+fi
 trap restore EXIT
 # Amazon's screen modules would draw over kindil in USB drive mode and after
 # it; kindil draws its own screens.

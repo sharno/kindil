@@ -6,12 +6,19 @@ BOOT="$(cd "$(dirname "$0")/.." && pwd)/kindle/extensions/kindil/bin/boot.sh"
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/stub" "$T/run"
-printf '#!/bin/sh\nexit 0\n' >"$T/stub/sleep"
-# Upstart's stop and start, recorded in order.
-for c in stop start; do
-  printf '#!/bin/sh\necho "%s $*" >>%s/upstart\n' "$c" "$T" >"$T/stub/$c"
+for c in sleep lipc-get-prop lipc-set-prop; do
+  printf '#!/bin/sh\nexit 0\n' >"$T/stub/$c"
 done
-chmod +x "$T/stub/sleep" "$T/stub/stop" "$T/stub/start"
+# Amazon's UI comes up while boot.sh waits for it.
+printf '#!/bin/sh\necho lab126_gui >>%s/jobs\n' "$T" >"$T/stub/usleep"
+# Upstart's stop and start, recorded in order, and the jobs running, one per
+# line in $T/jobs.
+printf '#!/bin/sh\necho "stop $1" >>%s/upstart\ngrep -vx "$1" %s/jobs >%s/jobs.new; mv %s/jobs.new %s/jobs\n' \
+  "$T" "$T" "$T" "$T" "$T" >"$T/stub/stop"
+printf '#!/bin/sh\necho "start $1" >>%s/upstart\necho "$1" >>%s/jobs\n' "$T" "$T" >"$T/stub/start"
+printf '#!/bin/sh\nif grep -qx "$1" %s/jobs; then echo "$1 start/running"; else echo "$1 stop/waiting"; fi\n' \
+  "$T" >"$T/stub/status"
+chmod +x "$T"/stub/*
 # The fake start.sh, like the real one, does nothing while its pid file names
 # a live process. It counts its runs and leaves a pid file naming a process
 # that is alive (up=1: this test's shell) or gone.
@@ -30,9 +37,14 @@ chmod +x "$T/run/boot.sh"
 boot() { echo "$1" >"$T/boot_id"; "$T/run/boot.sh" >/dev/null 2>&1; }
 starts() { if [ -f "$T/starts" ]; then wc -l <"$T/starts" | tr -d ' '; else echo 0; fi; }
 tries() { cat "$T/state/boot-tries" 2>/dev/null || echo 0; }
-reset() { rm -rf "$T/state" "$T/starts" "$T/pid" "$T/BOOT" "$T/SKIP" "$T/upstart"; echo 1 >"$T/up"; }
+# A boot as the job finds it: X starting, Amazon's UI still to come.
+reset() {
+  rm -rf "$T/state" "$T/starts" "$T/pid" "$T/BOOT" "$T/SKIP" "$T/upstart"
+  echo 1 >"$T/up"
+  echo x >"$T/jobs"
+}
 skip() { if [ -f "$T/SKIP" ]; then echo skip; else echo framework; fi; }
-upstart() { tr '\n' ',' <"$T/upstart" 2>/dev/null || true; }
+upstart() { cat "$T/upstart" 2>/dev/null | tr '\n' ','; }
 expect() {
   [ "$2" = "$3" ] || { echo "FAIL $1: got '$2', want '$3'"; exit 1; }
   echo "ok   $1"
@@ -80,11 +92,22 @@ expect "after Amazon's UI: the framework keeps starting" "$(skip)" "framework"
 reset
 echo standalone >"$T/BOOT"
 touch "$T/SKIP"
+boot a
+expect "standalone: X and Amazon's UI never start" "$(starts) $(upstart)" "1 stop x,"
+
+reset
+: >"$T/BOOT"
+boot a
+expect "after Amazon's UI: kindil waits for it" "$(starts) $(upstart) $(grep -c lab126_gui "$T/jobs")" "1  1"
+
+reset
+echo standalone >"$T/BOOT"
+touch "$T/SKIP"
 echo 0 >"$T/up"
 boot a
-expect "a standalone boot kindil doesn't stay up in gets Amazon's full UI" "$(skip) $(upstart)" "framework stop lab126_gui,start lab126_gui,"
+expect "a standalone boot kindil doesn't stay up in gets Amazon's full UI" "$(skip) $(upstart)" "framework stop x,start x,"
 boot a
-expect "which starts nothing more in that boot" "$(starts) $(upstart)" "1 stop lab126_gui,start lab126_gui,"
+expect "which starts nothing more in that boot" "$(starts) $(upstart)" "1 stop x,start x,"
 
 reset
 echo standalone >"$T/BOOT"
@@ -93,5 +116,10 @@ boot a
 boot b
 touch "$T/SKIP"
 rm -f "$T/upstart"
+echo x >"$T/jobs"
 boot c
-expect "past the failed-boot limit the framework comes back" "$(starts) $(skip) $(upstart)" "2 framework stop lab126_gui,start lab126_gui,"
+expect "past the failed-boot limit Amazon's UI comes with its framework" "$(starts) $(skip) $(upstart)" "2 framework "
+printf 'x\nlab126_gui\n' >"$T/jobs"
+touch "$T/SKIP"
+boot d
+expect "a job from before 0.6.2 restarts Amazon's UI, which is already up" "$(skip) $(upstart)" "framework stop lab126_gui,start lab126_gui,"

@@ -6,10 +6,19 @@ SESSION="$(cd "$(dirname "$0")/.." && pwd)/kindle/extensions/kindil/bin/session.
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/stub" "$T/ext" "$T/run"
-for c in lipc-set-prop stop start eips sleep; do
+for c in lipc-set-prop eips sleep; do
   printf '#!/bin/sh\nexit 0\n' >"$T/stub/$c"
-  chmod +x "$T/stub/$c"
 done
+# Upstart's stop and start, recorded in order; the jobs running are the lines
+# of $T/jobs.
+for c in stop start; do
+  printf '#!/bin/sh\necho "%s $1" >>%s/upstart\n' "$c" "$T" >"$T/stub/$c"
+done
+printf '#!/bin/sh\nif grep -qx "$1" %s/jobs; then echo "$1 start/running"; else echo "$1 stop/waiting"; fi\n' \
+  "$T" >"$T/stub/status"
+chmod +x "$T"/stub/*
+# Started from KUAL: X and Amazon's UI are up.
+printf 'x\nlab126_gui\n' >"$T/jobs"
 sed -e "s#^EXT=.*#EXT=$T/ext#" \
   -e "s#^SKIP=.*#SKIP=$T/SKIP#" \
   -e "s#^export PATH=.*#export PATH=$T/stub:/usr/bin:/bin#" \
@@ -110,3 +119,13 @@ fake "$T/ext/kindil" 1.1.0 "exit 0"
 touch -t 203001010000 "$T/ext/kindil"
 run
 expect "a replaced binary is" "$("$T/run/kindil" --version)" "kindil 1.1.0"
+
+reset
+rm -f "$T/upstart"
+fake "$T/ext/kindil" 1.0.0 "exit 0"
+run
+expect "started from KUAL, it stops Amazon's UI and starts it again" "$(tr '\n' ',' <"$T/upstart")" "stop lab126_gui,start lab126_gui,"
+rm -f "$T/upstart"
+: >"$T/jobs"
+run
+expect "after a standalone boot, leaving starts X and with it Amazon's UI" "$(tr '\n' ',' <"$T/upstart")" "start x,"
