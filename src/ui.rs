@@ -323,8 +323,7 @@ fn wire(window: &AppWindow, ctx: &Ctx) {
     on!(on_previous_page => previous_page());
     on!(on_font_larger => font_larger());
     on!(on_font_smaller => font_smaller());
-    on!(on_brighter => brighter());
-    on!(on_dimmer => dimmer());
+    on!(on_choose_brightness => choose_brightness(percent));
     on!(on_clean_screen => clean_screen());
     on!(on_toggle_wifi => toggle_wifi());
     on!(on_scan_networks => scan_networks());
@@ -631,25 +630,14 @@ impl Ctx {
 
     // ── display ──
 
-    fn set_brightness(&self, change: fn(Brightness) -> Brightness) {
+    fn choose_brightness(&self, percent: i32) {
         let Some(ui) = self.ui() else { return };
+        let level = Brightness::new(percent.clamp(0, 100) as u8);
         let k = ui.global::<Kindil>();
-        let Ok(current) = u8::try_from(k.get_brightness()) else {
-            return;
-        };
-        let next = change(Brightness::new(current));
-        match self.host.set_brightness(next) {
-            Ok(()) => k.set_brightness(i32::from(next.percent())),
+        match self.host.set_brightness(level) {
+            Ok(()) => k.set_brightness(i32::from(level.percent())),
             Err(error) => notify(&ui, &format!("Front light: {error}")),
         }
-    }
-
-    fn brighter(&self) {
-        self.set_brightness(Brightness::brighter);
-    }
-
-    fn dimmer(&self) {
-        self.set_brightness(Brightness::dimmer);
     }
 
     fn clean_screen(&self) {

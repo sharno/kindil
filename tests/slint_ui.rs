@@ -17,13 +17,13 @@ const HOME_TAB: f32 = 95.0;
 const LIBRARY_TAB: f32 = 284.0;
 const SETTINGS_TAB: f32 = 663.0;
 const BAR_Y: f32 = 34.0;
-// Top bar buttons: x on the dashboard and library, and in the reader, where
-// the text size buttons push the light controls left.
-const LIGHT_DOWN: f32 = 375.0;
-const LIGHT_UP: f32 = 507.0;
-const READER_LIGHT_UP: f32 = 495.0;
-const SMALLER_TEXT: f32 = 213.0;
-const LARGER_TEXT: f32 = 279.0;
+// The front light slider's track (0% to 100%) in the top bar, and in Settings.
+const BAR_LIGHT: (f32, f32) = (335.0, 477.0);
+const SETTINGS_LIGHT: (f32, f32) = (170.0, 634.0);
+// Where the track starts depends on text widths, so levels are checked to within a few points.
+const SLACK: i32 = 6;
+const SMALLER_TEXT: f32 = 207.0;
+const LARGER_TEXT: f32 = 273.0;
 
 struct Fixture {
     app: App,
@@ -56,6 +56,8 @@ impl Fixture {
         .unwrap();
         app.refresh_now();
         app.window.show().unwrap();
+        // The clock's width moves the slider, so pin it.
+        app.window.global::<Kindil>().set_clock("09:41".into());
         Self { app, window, dir }
     }
 
@@ -67,6 +69,37 @@ impl Fixture {
         let _ = pixels(&self.window);
         tap(&self.window, x, y);
         let _ = pixels(&self.window);
+    }
+
+    /// A finger on the track from `from` to `to` percent along it, lifted there.
+    /// Returns the light while the finger is still down.
+    fn slide(&self, track: (f32, f32), y: f32, from: f32, to: f32) -> i32 {
+        use slint::platform::{PointerEventButton, WindowAdapter, WindowEvent};
+        let at = |percent: f32| {
+            slint::LogicalPosition::new(track.0 + (track.1 - track.0) * percent / 100.0, y)
+        };
+        let send = |event| {
+            self.window.window().dispatch_event(event);
+            slint::platform::update_timers_and_animations();
+        };
+        let _ = pixels(&self.window);
+        send(WindowEvent::PointerPressed {
+            position: at(from),
+            button: PointerEventButton::Left,
+        });
+        (1..=8).for_each(|step| {
+            let percent = from + (to - from) * step as f32 / 8.0;
+            send(WindowEvent::PointerMoved {
+                position: at(percent),
+            });
+        });
+        let during = self.k().get_brightness();
+        send(WindowEvent::PointerReleased {
+            position: at(to),
+            button: PointerEventButton::Left,
+        });
+        let _ = pixels(&self.window);
+        during
     }
 
     fn books(&self) -> std::path::PathBuf {
@@ -127,13 +160,20 @@ fn miqat_is_pixel_exact_and_taps_reveal_both_bars() {
         "the tap shows the tab bar"
     );
 
-    // The light buttons work from the revealed bar, which stays up meanwhile.
+    // Dragging the slider sets the light once, on release, and the revealed
+    // bar stays up meanwhile.
     assert_eq!(f.k().get_brightness(), 40);
-    f.tap(LIGHT_UP, BAR_Y);
-    assert_eq!(f.k().get_brightness(), 50);
-    f.tap(LIGHT_DOWN, BAR_Y);
-    f.tap(LIGHT_DOWN, BAR_Y);
-    assert_eq!(f.k().get_brightness(), 30);
+    let during = f.slide(BAR_LIGHT, BAR_Y, 40.0, 80.0);
+    assert_eq!(during, 40, "the light is not set on every finger movement");
+    assert!((f.k().get_brightness() - 80).abs() <= SLACK);
+    f.tap(BAR_LIGHT.0 + (BAR_LIGHT.1 - BAR_LIGHT.0) * 0.25, BAR_Y);
+    assert!(
+        (f.k().get_brightness() - 25).abs() <= SLACK,
+        "a tap on the track jumps there, got {}",
+        f.k().get_brightness()
+    );
+    f.slide(BAR_LIGHT, BAR_Y, 25.0, -50.0);
+    assert_eq!(f.k().get_brightness(), 0, "dragging past the end clamps");
     assert!(f.k().get_chrome_visible());
 
     f.tap(LIBRARY_TAB, TAB_Y);
@@ -152,8 +192,8 @@ fn the_reader_top_bar_sets_text_size_and_light() {
     f.tap(SMALLER_TEXT, BAR_Y);
     f.tap(SMALLER_TEXT, BAR_Y);
     assert!(f.k().get_font_size() < size);
-    f.tap(READER_LIGHT_UP, BAR_Y);
-    assert_eq!(f.k().get_brightness(), 50);
+    f.slide(BAR_LIGHT, BAR_Y, 40.0, 100.0);
+    assert_eq!(f.k().get_brightness(), 100, "the end of the track is 100%");
 }
 
 #[test]
@@ -237,8 +277,8 @@ fn settings_switch_the_simulated_device() {
     let prefs = std::fs::read_to_string(f.dir.path().join("prefs.toml")).unwrap();
     assert!(prefs.contains("dashboard = \"clock\""), "{prefs}");
     assert_eq!(f.k().get_brightness(), 40);
-    f.tap(700.0, 380.0); // front light +
-    assert_eq!(f.k().get_brightness(), 50);
+    f.slide(SETTINGS_LIGHT, 384.0, 40.0, 70.0); // front light slider
+    assert!((f.k().get_brightness() - 70).abs() <= SLACK);
     assert_eq!(f.k().get_ssh(), Switch::On);
     f.tap(380.0, 829.0); // SSH server row
     assert_eq!(f.k().get_ssh(), Switch::Off);
@@ -412,12 +452,12 @@ fn arabic_text_is_shaped() {
     let f = Fixture::new(Arc::new(Simulated::default()));
     f.k().set_dashboard(DashboardKind::Clock);
     f.k().set_clock("".into());
-    // Ink extent of the top bar's date, left of the light controls.
+    // Ink extent of the clock page's date.
     let span = |date: &str| {
         f.k().set_date(date.into());
         let frame = pixels(&f.window);
-        let xs: Vec<usize> = (20..300)
-            .filter(|x| (16..52).any(|y| frame[y * 758 + x].r < 128))
+        let xs: Vec<usize> = (0..758)
+            .filter(|x| (300..720).any(|y| frame[y * 758 + x].r < 128))
             .collect();
         xs.last().unwrap() - xs.first().unwrap()
     };

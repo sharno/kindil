@@ -119,8 +119,8 @@ export global Kindil {
     callback previous-page();
     callback font-larger();
     callback font-smaller();
-    callback brighter();
-    callback dimmer();
+    /// The front light level (0-100) the slider settled on.
+    callback choose-brightness(int);
     callback clean-screen();
     callback toggle-wifi();
     callback scan-networks();
@@ -248,66 +248,64 @@ component SwitchRow {
     }
 }
 
-component RoundButton {
-    in property <string> text;
-    in property <bool> enabled: true;
-    callback clicked();
-    width: 64px;
-    height: 64px;
+/// The front light as a slider. Tapping the track jumps the light there. While
+/// the finger is down only the knob follows it (a small redraw); the light is
+/// set about every 400 ms and once more on release, not on every movement.
+component LightSlider {
+    in property <int> value;
+    callback chosen(int);
+    property <bool> enabled: root.value >= 0;
+    property <length> pad: 24px;
+    property <length> span: root.width - 2 * root.pad;
+    // The level under the finger.
+    property <int> at: round(clamp(touch.mouse-x - root.pad, 0px, root.span) / root.span * 100);
+    property <int> shown: touch.pressed ? root.at : max(root.value, 0);
+    // A fixed width in the top bar keeps the controls where they are; Settings stretches it.
+    min-width: 150px;
+    preferred-width: 190px;
+    max-width: 190px;
+    // Track: filled up to the knob.
     Rectangle {
-        border-radius: self.height / 2;
-        border-width: 2px;
-        border-color: root.enabled ? Theme.ink : Theme.line;
-        background: touch.pressed ? Theme.surface : Theme.paper;
+        x: root.pad;
+        y: (parent.height - self.height) / 2;
+        width: root.span;
+        height: 8px;
+        border-radius: 4px;
+        background: root.enabled ? Theme.line : Theme.surface;
     }
-    Text {
-        text: root.text;
-        font-size: 30px;
-        font-weight: 600;
-        color: root.enabled ? Theme.ink : Theme.line;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+    Rectangle {
+        x: root.pad;
+        y: (parent.height - self.height) / 2;
+        width: root.span * root.shown / 100;
+        height: 8px;
+        border-radius: 4px;
+        background: root.enabled ? Theme.ink : Theme.line;
+    }
+    Rectangle {
+        x: root.pad + root.span * root.shown / 100 - self.width / 2;
+        y: (parent.height - self.height) / 2;
+        width: 36px;
+        height: 36px;
+        border-radius: 18px;
+        border-width: 3px;
+        border-color: root.enabled ? Theme.ink : Theme.line;
+        background: touch.pressed ? Theme.ink : Theme.paper;
     }
     touch := TouchArea {
         enabled: root.enabled;
-        clicked => { root.clicked(); }
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.up && root.at != root.value {
+                root.chosen(root.at);
+            }
+        }
     }
-}
-
-component Stepper {
-    in property <string> title;
-    in property <string> value;
-    in property <bool> enabled: true;
-    callback decrease();
-    callback increase();
-    min-height: 88px;
-    HorizontalLayout {
-        spacing: 14px;
-        alignment: stretch;
-        Text {
-            text: root.title;
-            font-size: 23px;
-            font-weight: 600;
-            color: root.enabled ? Theme.ink : Theme.ink-3;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-        }
-        VerticalLayout {
-            alignment: center;
-            RoundButton { text: "−"; enabled: root.enabled; clicked => { root.decrease(); } }
-        }
-        Text {
-            text: root.value;
-            width: 92px;
-            font-size: 23px;
-            font-weight: 700;
-            color: root.enabled ? Theme.ink : Theme.ink-3;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
-        VerticalLayout {
-            alignment: center;
-            RoundButton { text: "+"; enabled: root.enabled; clicked => { root.increase(); } }
+    Timer {
+        interval: 400ms;
+        running: touch.pressed;
+        triggered => {
+            if root.at != root.value {
+                root.chosen(root.at);
+            }
         }
     }
 }
@@ -511,7 +509,9 @@ component BarButton {
 
 /// The battery icon and percentage.
 component BatteryStatus {
-    HorizontalLayout {
+    // Its width is its content, so a layout leaves no gap before the next item.
+    max-width: row.preferred-width;
+    row := HorizontalLayout {
         spacing: 8px;
         VerticalLayout {
             alignment: center;
@@ -543,15 +543,7 @@ component TopBar inherits Rectangle {
             color: Theme.ink;
             vertical-alignment: center;
         }
-        // The reader's room goes to the text size buttons instead.
-        Text {
-            text: Kindil.page == Page.reader ? "" : Kindil.date;
-            font-size: 19px;
-            color: Theme.ink-2;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-            overflow: elide;
-        }
+        if Kindil.page != Page.reader: Rectangle { horizontal-stretch: 1; }
         if Kindil.page == Page.reader: HorizontalLayout {
             horizontal-stretch: 1;
             alignment: end;
@@ -565,31 +557,18 @@ component TopBar inherits Rectangle {
                 BarButton { text: "A"; font-size: 34px; clicked => { Kindil.font-larger(); } }
             }
         }
-        Rectangle { width: 8px; }
-        VerticalLayout {
-            alignment: center;
-            BarButton {
-                text: "−";
-                enabled: Kindil.brightness >= 0;
-                clicked => { Kindil.dimmer(); }
-            }
+        LightSlider {
+            value: Kindil.brightness;
+            chosen(percent) => { Kindil.choose-brightness(percent); }
         }
         Text {
             text: Kindil.brightness >= 0 ? Kindil.brightness + "%" : "—";
-            width: 56px;
+            width: 52px;
             font-size: 20px;
             font-weight: 600;
             color: Kindil.brightness >= 0 ? Theme.ink : Theme.ink-3;
             horizontal-alignment: center;
             vertical-alignment: center;
-        }
-        VerticalLayout {
-            alignment: center;
-            BarButton {
-                text: "+";
-                enabled: Kindil.brightness >= 0;
-                clicked => { Kindil.brighter(); }
-            }
         }
         Rectangle { width: 8px; }
         if Kindil.wifi-bars >= 0: VerticalLayout {
@@ -1240,12 +1219,31 @@ component SettingsPage {
                 }
                 Group {
                     title: "DISPLAY";
-                    Stepper {
-                        title: "Front light";
-                        enabled: Kindil.brightness >= 0;
-                        value: Kindil.brightness >= 0 ? Kindil.brightness + "%" : "—";
-                        decrease => { Kindil.dimmer(); }
-                        increase => { Kindil.brighter(); }
+                    HorizontalLayout {
+                        min-height: 88px;
+                        spacing: 8px;
+                        Text {
+                            text: "Front light";
+                            font-size: 23px;
+                            font-weight: 600;
+                            color: Kindil.brightness >= 0 ? Theme.ink : Theme.ink-3;
+                            vertical-alignment: center;
+                        }
+                        LightSlider {
+                            horizontal-stretch: 1;
+                            max-width: 10000px;
+                            value: Kindil.brightness;
+                            chosen(percent) => { Kindil.choose-brightness(percent); }
+                        }
+                        Text {
+                            text: Kindil.brightness >= 0 ? Kindil.brightness + "%" : "—";
+                            width: 64px;
+                            font-size: 23px;
+                            font-weight: 700;
+                            color: Kindil.brightness >= 0 ? Theme.ink : Theme.ink-3;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                        }
                     }
                     Divider { }
                     HorizontalLayout {

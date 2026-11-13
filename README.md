@@ -14,7 +14,7 @@ system file. A reboot always returns the Kindle to stock.
   full-bleed and pixel-exact, refreshed on each minute; or a large clock. A
   small battery gauge always shows at the top. Tap the dashboard to reveal the
   top bar and the tab bar; they hide again after 20 s.
-- **Top bar**: clock, front light down/up with its level, Wi-Fi and battery on
+- **Top bar**: clock, a front light slider with its level, Wi-Fi and battery on
   every page; in the reader also text size smaller/larger.
 - **Library and reader**: `.epub` and UTF-8 `.txt` files from `/mnt/us/books`.
   Tap the right two-thirds of a page to go forward, the left third to go back.

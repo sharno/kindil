@@ -32,18 +32,11 @@ impl Power {
 pub struct Brightness(u8);
 
 impl Brightness {
-    pub const STEP: u8 = 10;
     pub fn new(percent: u8) -> Self {
         Self(percent.min(100))
     }
     pub fn percent(self) -> u8 {
         self.0
-    }
-    pub fn brighter(self) -> Self {
-        Self::new(self.0.saturating_add(Self::STEP))
-    }
-    pub fn dimmer(self) -> Self {
-        Self::new(self.0.saturating_sub(Self::STEP))
     }
 }
 
@@ -255,10 +248,8 @@ impl Host for Simulated {
 mod tests {
     use super::*;
     #[test]
-    fn brightness_steps_stay_in_range() {
+    fn brightness_stays_in_range() {
         assert_eq!(Brightness::new(250).percent(), 100);
-        assert_eq!(Brightness::new(95).brighter().percent(), 100);
-        assert_eq!(Brightness::new(5).dimmer().percent(), 0);
     }
     #[test]
     fn signal_bars() {
