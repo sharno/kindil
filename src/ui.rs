@@ -396,7 +396,7 @@ fn show_updates(ui: &AppWindow, state: &Mutex<Updates>, updates: Updates) {
     k.set_update_status(status.into());
     k.set_update_button(button.into());
     k.set_update_enabled(enabled);
-    *lock(&state) = updates;
+    *lock(state) = updates;
 }
 
 fn install_keyboard(window: &AppWindow) {
