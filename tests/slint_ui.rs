@@ -344,19 +344,26 @@ fn settings_switch_the_simulated_device() {
     let f = Fixture::new(Arc::new(Simulated::default()));
     f.tap(SETTINGS_TAB, TAB_Y);
     assert_eq!(f.k().get_page(), Page::Settings);
-    f.tap(571.0, 246.0); // Clock
+    f.tap(380.0, 200.0); // Display row
+    assert_eq!(f.k().get_page(), Page::Display);
+    f.tap(568.0, 236.0); // Clock
     assert_eq!(f.k().get_dashboard(), DashboardKind::Clock);
     let prefs = std::fs::read_to_string(f.dir.path().join("prefs.toml")).unwrap();
     assert!(prefs.contains("dashboard = \"clock\""), "{prefs}");
     assert_eq!(f.k().get_brightness(), 40);
     f.slide(SETTINGS_LIGHT, SETTINGS_LIGHT_Y, 40.0, 70.0); // front light slider
     assert!((f.k().get_brightness() - 70).abs() <= SLACK);
+    f.tap(40.0, 112.0); // back
+    assert_eq!(f.k().get_page(), Page::Settings);
+    f.tap(380.0, 400.0); // Remote access row
+    assert_eq!(f.k().get_page(), Page::Remote);
     assert_eq!(f.k().get_ssh(), Switch::On);
-    f.tap(380.0, 829.0); // SSH server row
+    f.tap(380.0, 210.0); // SSH server row
     assert_eq!(f.k().get_ssh(), Switch::Off);
     assert_eq!(f.k().get_sync(), Switch::Unavailable);
-    drag(&f.window, 380.0, 900.0, 200.0);
-    drag(&f.window, 380.0, 900.0, 200.0);
+    // The Settings tab goes back to the index from any section.
+    f.tap(SETTINGS_TAB, TAB_Y);
+    assert_eq!(f.k().get_page(), Page::Settings);
     let facts: Vec<String> = f
         .k()
         .get_facts()
@@ -571,7 +578,9 @@ fn join_a_network_and_type_arabic() {
     let host = Arc::new(Recording::default());
     let f = Fixture::new(host.clone());
     f.tap(SETTINGS_TAB, TAB_Y);
-    f.tap(380.0, 695.0); // Choose a network
+    f.tap(380.0, 300.0); // Wi-Fi row
+    assert_eq!(f.k().get_page(), Page::Wifi);
+    f.tap(380.0, 300.0); // Choose a network
     assert_eq!(f.k().get_page(), Page::Networks);
     assert_eq!(f.k().get_networks().row_count(), 3);
     f.tap(380.0, 228.0); // Home
@@ -672,7 +681,15 @@ fn lists_follow_the_finger_in_fast_frames_while_it_moves() {
     use slint::platform::{PointerEventButton, WindowAdapter, WindowEvent};
     use std::sync::atomic::Ordering;
     let f = Fixture::new(Arc::new(Simulated::default()));
-    f.tap(SETTINGS_TAB, TAB_Y);
+    // Enough books to scroll; the library reloads when its tab opens.
+    (1..=20).for_each(|n| {
+        std::fs::write(
+            f.dir.path().join(format!("books/Book_{n:02}.txt")),
+            "Text\n",
+        )
+        .unwrap()
+    });
+    f.tap(LIBRARY_TAB, TAB_Y);
     let at = |y| slint::LogicalPosition::new(380.0, y);
     let send = |event| {
         f.window.window().dispatch_event(event);

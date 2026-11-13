@@ -11,7 +11,8 @@ import "../crates/miqat/assets/fonts/IBMPlexSansArabic-Regular.ttf";
 import "../crates/miqat/assets/fonts/IBMPlexSansArabic-SemiBold.ttf";
 import "../crates/miqat/assets/fonts/IBMPlexSansArabic-Bold.ttf";
 
-export enum Page { dashboard, library, reader, settings, networks }
+/// Settings is an index; display through about are its sections.
+export enum Page { dashboard, library, reader, settings, display, wifi, remote, power, updates, about, networks }
 export enum DashboardKind { miqat, clock }
 /// A setting's switch. `unavailable` covers "not installed" and "no hardware".
 export enum Switch { off, on, unavailable }
@@ -60,6 +61,10 @@ global Theme {
 /// directly instead of threading dozens of properties through each page.
 export global Kindil {
     in-out property <Page> page: Page.dashboard;
+    /// The Settings index or one of the pages under it.
+    out property <bool> in-settings: page == Page.settings || page == Page.display || page == Page.wifi
+        || page == Page.remote || page == Page.power || page == Page.updates || page == Page.about
+        || page == Page.networks;
     in-out property <DashboardKind> dashboard: DashboardKind.miqat;
     /// The status row and tab bar over the full-bleed dashboard; other pages always show them.
     in-out property <bool> chrome-visible: false;
@@ -760,7 +765,7 @@ component Tab {
     in property <string> label;
     in property <bool> enabled: true;
     property <bool> active: Kindil.page == root.target
-        || (root.target == Page.settings && Kindil.page == Page.networks);
+        || (root.target == Page.settings && Kindil.in-settings);
     property <color> color: !root.enabled ? Theme.dim : (root.active ? Theme.ink : Theme.ink-3);
     horizontal-stretch: 1;
     Rectangle {
@@ -1193,12 +1198,13 @@ component Segment {
 }
 
 component Group {
+    /// Empty when the page title already names it.
     in property <string> title;
     VerticalLayout {
         padding-top: 22px;
         padding-bottom: 4px;
         spacing: 2px;
-        Caption { text: root.title; }
+        if root.title != "": Caption { text: root.title; }
         @children
     }
 }
@@ -1305,9 +1311,39 @@ component SystemScreen inherits Rectangle {
     }
 }
 
-component SettingsPage {
+/// A page's title with a back arrow to the page it came from.
+component SubHeader {
+    in property <string> title;
+    in property <Page> back: Page.settings;
+    height: 96px;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: Theme.gutter;
+        padding-top: 16px;
+        spacing: 4px;
+        Button {
+            text: "‹";
+            kind: ButtonKind.quiet;
+            font-size: 40px;
+            clicked => { Kindil.go(root.back); }
+        }
+        Text {
+            text: root.title;
+            font-size: 40px;
+            font-weight: 700;
+            color: Theme.ink;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        @children
+    }
+}
+
+/// One Settings section: a page with a back arrow, scrolling only if it must.
+component SectionPage {
+    in property <string> title;
     VerticalLayout {
-        PageHeader { title: "Settings"; trailing: Kindil.version; }
+        SubHeader { title: root.title; }
         SwipeScroll {
             vertical-stretch: 1;
             content-height: content.preferred-height;
@@ -1317,197 +1353,279 @@ component SettingsPage {
                 padding-left: Theme.gutter;
                 padding-right: Theme.gutter;
                 padding-bottom: 32px;
-                Group {
-                    title: "HOME SCREEN";
-                    Rectangle {
-                        height: 72px;
-                        border-radius: Theme.radius;
-                        border-width: 2px;
-                        border-color: Theme.ink;
-                        HorizontalLayout {
-                            padding: 6px;
-                            spacing: 6px;
-                            Segment {
-                                text: "Prayer times";
-                                selected: Kindil.dashboard == DashboardKind.miqat;
-                                clicked => { Kindil.choose-dashboard(DashboardKind.miqat); }
-                            }
-                            Segment {
-                                text: "Clock";
-                                selected: Kindil.dashboard == DashboardKind.clock;
-                                clicked => { Kindil.choose-dashboard(DashboardKind.clock); }
-                            }
-                        }
-                    }
+                @children
+            }
+        }
+    }
+}
+
+/// A row of the Settings index: the section and what it is set to now.
+component SectionRow {
+    in property <string> title;
+    in property <string> summary;
+    in property <Page> target;
+    min-height: 100px;
+    HorizontalLayout {
+        spacing: 16px;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 4px;
+            Text { text: root.title; font-size: 25px; font-weight: 600; color: Theme.ink; }
+            Text { text: root.summary; font-size: 19px; color: Theme.ink-2; overflow: elide; }
+        }
+        Text { text: "›"; font-size: 34px; color: Theme.ink-2; vertical-alignment: center; }
+    }
+    TouchArea { clicked => { Kindil.go(root.target); } }
+}
+
+/// Settings is an index of sections, each its own page: a page swap is one
+/// e-ink refresh, while scrolling a long list redraws on every move.
+component SettingsPage {
+    pure function said(state: Switch) -> string {
+        state == Switch.on ? "on" : state == Switch.off ? "off" : "not installed"
+    }
+    VerticalLayout {
+        PageHeader { title: "Settings"; trailing: Kindil.version; }
+        VerticalLayout {
+            vertical-stretch: 1;
+            alignment: start;
+            padding-left: Theme.gutter;
+            padding-right: Theme.gutter;
+            SectionRow {
+                title: "Display";
+                summary: (Kindil.dashboard == DashboardKind.miqat ? "Prayer times" : "Clock")
+                    + (Kindil.brightness >= 0 ? " · light " + Kindil.brightness + "%" : "");
+                target: Page.display;
+            }
+            Divider { }
+            SectionRow { title: "Wi-Fi"; summary: Kindil.wifi-detail; target: Page.wifi; }
+            Divider { }
+            SectionRow {
+                title: "Remote access";
+                summary: "SSH " + root.said(Kindil.ssh) + " · Syncthing " + root.said(Kindil.sync);
+                target: Page.remote;
+            }
+            Divider { }
+            SectionRow {
+                title: "Power";
+                summary: "Sleep when idle: " + Kindil.sleep-choices[Kindil.auto-sleep];
+                target: Page.power;
+            }
+            Divider { }
+            SectionRow { title: "Updates"; summary: Kindil.update-status; target: Page.updates; }
+            Divider { }
+            SectionRow { title: "About"; summary: "Battery " + Kindil.battery-label; target: Page.about; }
+        }
+    }
+}
+
+component DisplaySettings inherits SectionPage {
+    title: "Display";
+    Group {
+        title: "HOME SCREEN";
+        Rectangle {
+            height: 72px;
+            border-radius: Theme.radius;
+            border-width: 2px;
+            border-color: Theme.ink;
+            HorizontalLayout {
+                padding: 6px;
+                spacing: 6px;
+                Segment {
+                    text: "Prayer times";
+                    selected: Kindil.dashboard == DashboardKind.miqat;
+                    clicked => { Kindil.choose-dashboard(DashboardKind.miqat); }
                 }
-                Group {
-                    title: "DISPLAY";
-                    LightRow { }
-                    Divider { }
-                    HorizontalLayout {
-                        min-height: 84px;
-                        spacing: 16px;
-                        VerticalLayout {
-                            alignment: center;
-                            horizontal-stretch: 1;
-                            Text { text: "Clean screen"; font-size: 23px; font-weight: 600; color: Theme.ink; }
-                            Text { text: "Flash once to clear ghosting"; font-size: 18px; color: Theme.ink-2; }
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            Button { text: "Refresh"; clicked => { Kindil.clean-screen(); } }
-                        }
-                    }
+                Segment {
+                    text: "Clock";
+                    selected: Kindil.dashboard == DashboardKind.clock;
+                    clicked => { Kindil.choose-dashboard(DashboardKind.clock); }
                 }
-                Group {
-                    title: "WI-FI";
-                    SwitchRow {
-                        title: "Wi-Fi";
-                        detail: Kindil.wifi-detail;
-                        state: Kindil.wifi;
-                        toggled => { Kindil.toggle-wifi(); }
-                    }
-                    Divider { }
-                    Rectangle {
-                        min-height: 76px;
-                        HorizontalLayout {
-                            Text {
-                                text: "Choose a network";
-                                font-size: 23px;
-                                font-weight: 600;
-                                color: Kindil.wifi == Switch.on ? Theme.ink : Theme.ink-3;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                            }
-                            Text { text: "›"; font-size: 34px; color: Theme.ink-2; vertical-alignment: center; }
-                        }
-                        TouchArea {
-                            enabled: Kindil.wifi == Switch.on;
-                            clicked => {
-                                Kindil.go(Page.networks);
-                                Kindil.scan-networks();
-                            }
-                        }
-                    }
-                }
-                Group {
-                    title: "REMOTE ACCESS";
-                    SwitchRow {
-                        title: "SSH server";
-                        detail: Kindil.ssh-detail;
-                        state: Kindil.ssh;
-                        toggled => { Kindil.toggle-ssh(); }
-                    }
-                    Divider { }
-                    SwitchRow {
-                        title: "Start SSH at boot";
-                        state: Kindil.ssh-at-boot;
-                        toggled => { Kindil.toggle-ssh-at-boot(); }
-                    }
-                    Divider { }
-                    SwitchRow {
-                        title: "Syncthing";
-                        detail: Kindil.sync-detail;
-                        state: Kindil.sync;
-                        toggled => { Kindil.toggle-sync(); }
-                    }
-                }
-                Group {
-                    title: "DEVICE";
-                    for fact in Kindil.facts: HorizontalLayout {
-                        min-height: 52px;
-                        Text {
-                            text: fact.label;
-                            font-size: 20px;
-                            color: Theme.ink-2;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                        }
-                        Text {
-                            text: fact.value;
-                            font-size: 20px;
-                            font-weight: 600;
-                            color: Theme.ink;
-                            vertical-alignment: center;
-                        }
-                    }
-                }
-                Group {
-                    title: "STARTUP";
-                    SwitchRow {
-                        title: "Start kindil at boot";
-                        detail: Kindil.boot-start-detail;
-                        state: Kindil.boot-start;
-                        toggled => { Kindil.toggle-boot-start(); }
-                    }
-                }
-                Group {
-                    title: "SLEEP WHEN IDLE";
-                    Rectangle {
-                        height: 72px;
-                        border-radius: Theme.radius;
-                        border-width: 2px;
-                        border-color: Theme.ink;
-                        HorizontalLayout {
-                            padding: 6px;
-                            spacing: 4px;
-                            for choice[i] in Kindil.sleep-choices: Segment {
-                                text: choice;
-                                selected: i == Kindil.auto-sleep;
-                                clicked => { Kindil.choose-auto-sleep(i); }
-                            }
-                        }
-                    }
-                    Text {
-                        text: "Doze keeps the dashboard updating on little battery: after 2 minutes without a touch the light goes off and the Kindle sleeps between minute updates. Press the power button to use it. Never keeps it fully awake.";
-                        font-size: 17px;
-                        color: Theme.ink-3;
-                        wrap: word-wrap;
-                    }
-                }
-                Group {
-                    title: "UPDATES";
-                    HorizontalLayout {
-                        min-height: 84px;
-                        spacing: 16px;
-                        Text {
-                            text: Kindil.update-status;
-                            font-size: 20px;
-                            color: Theme.ink;
-                            wrap: word-wrap;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            Button {
-                                text: Kindil.update-button;
-                                enabled: Kindil.update-enabled;
-                                clicked => { Kindil.update(); }
-                            }
-                        }
-                    }
-                    Text {
-                        text: "Signed releases from GitHub. A new version that fails in its first two minutes is replaced by the previous one.";
-                        font-size: 17px;
-                        color: Theme.ink-3;
-                        wrap: word-wrap;
-                    }
-                }
-                Rectangle { height: 20px; }
-                Button {
-                    text: "Exit to Kindle";
-                    clicked => { Kindil.exit-app(); }
-                }
+            }
+        }
+    }
+    Group {
+        title: "SCREEN";
+        LightRow { }
+        Divider { }
+        HorizontalLayout {
+            min-height: 84px;
+            spacing: 16px;
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 1;
+                Text { text: "Clean screen"; font-size: 23px; font-weight: 600; color: Theme.ink; }
+                Text { text: "Flash once to clear ghosting"; font-size: 18px; color: Theme.ink-2; }
+            }
+            VerticalLayout {
+                alignment: center;
+                Button { text: "Refresh"; clicked => { Kindil.clean-screen(); } }
+            }
+        }
+    }
+}
+
+component WifiSettings inherits SectionPage {
+    title: "Wi-Fi";
+    Group {
+        SwitchRow {
+            title: "Wi-Fi";
+            detail: Kindil.wifi-detail;
+            state: Kindil.wifi;
+            toggled => { Kindil.toggle-wifi(); }
+        }
+        Divider { }
+        Rectangle {
+            min-height: 76px;
+            HorizontalLayout {
                 Text {
-                    text: "Returns to Amazon's home screen. kindil never changes the system.";
-                    font-size: 17px;
-                    color: Theme.ink-3;
-                    wrap: word-wrap;
-                    horizontal-alignment: center;
+                    text: "Choose a network";
+                    font-size: 23px;
+                    font-weight: 600;
+                    color: Kindil.wifi == Switch.on ? Theme.ink : Theme.ink-3;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
                 }
-                Rectangle { height: 12px; }
-                PowerButtons { }
+                Text { text: "›"; font-size: 34px; color: Theme.ink-2; vertical-alignment: center; }
+            }
+            TouchArea {
+                enabled: Kindil.wifi == Switch.on;
+                clicked => {
+                    Kindil.go(Page.networks);
+                    Kindil.scan-networks();
+                }
+            }
+        }
+    }
+}
+
+component RemoteSettings inherits SectionPage {
+    title: "Remote access";
+    Group {
+        SwitchRow {
+            title: "SSH server";
+            detail: Kindil.ssh-detail;
+            state: Kindil.ssh;
+            toggled => { Kindil.toggle-ssh(); }
+        }
+        Divider { }
+        SwitchRow {
+            title: "Start SSH at boot";
+            state: Kindil.ssh-at-boot;
+            toggled => { Kindil.toggle-ssh-at-boot(); }
+        }
+        Divider { }
+        SwitchRow {
+            title: "Syncthing";
+            detail: Kindil.sync-detail;
+            state: Kindil.sync;
+            toggled => { Kindil.toggle-sync(); }
+        }
+    }
+}
+
+component PowerSettings inherits SectionPage {
+    title: "Power";
+    Group {
+        title: "SLEEP WHEN IDLE";
+        Rectangle {
+            height: 72px;
+            border-radius: Theme.radius;
+            border-width: 2px;
+            border-color: Theme.ink;
+            HorizontalLayout {
+                padding: 6px;
+                spacing: 4px;
+                for choice[i] in Kindil.sleep-choices: Segment {
+                    text: choice;
+                    selected: i == Kindil.auto-sleep;
+                    clicked => { Kindil.choose-auto-sleep(i); }
+                }
+            }
+        }
+        Text {
+            text: "Doze keeps the dashboard updating on little battery: after 2 minutes without a touch the light goes off and the Kindle sleeps between minute updates. Press the power button to use it. Never keeps it fully awake.";
+            font-size: 17px;
+            color: Theme.ink-3;
+            wrap: word-wrap;
+        }
+    }
+    Group {
+        title: "STARTUP";
+        SwitchRow {
+            title: "Start kindil at boot";
+            detail: Kindil.boot-start-detail;
+            state: Kindil.boot-start;
+            toggled => { Kindil.toggle-boot-start(); }
+        }
+    }
+Rectangle { height: 20px; }
+    Button {
+        text: "Exit to Kindle";
+        clicked => { Kindil.exit-app(); }
+    }
+    Text {
+        text: "Returns to Amazon's home screen. kindil never changes the system.";
+        font-size: 17px;
+        color: Theme.ink-3;
+        wrap: word-wrap;
+        horizontal-alignment: center;
+    }
+    Rectangle { height: 12px; }
+    PowerButtons { }
+}
+
+component UpdateSettings inherits SectionPage {
+    title: "Updates";
+    Group {
+        HorizontalLayout {
+            min-height: 84px;
+            spacing: 16px;
+            Text {
+                text: Kindil.update-status;
+                font-size: 20px;
+                color: Theme.ink;
+                wrap: word-wrap;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            VerticalLayout {
+                alignment: center;
+                Button {
+                    text: Kindil.update-button;
+                    enabled: Kindil.update-enabled;
+                    clicked => { Kindil.update(); }
+                }
+            }
+        }
+        Text {
+            text: "Signed releases from GitHub. A new version that fails in its first two minutes is replaced by the previous one.";
+            font-size: 17px;
+            color: Theme.ink-3;
+            wrap: word-wrap;
+        }
+    }
+}
+
+component AboutSettings inherits SectionPage {
+    title: "About";
+    Group {
+        for fact in Kindil.facts: HorizontalLayout {
+            min-height: 52px;
+            Text {
+                text: fact.label;
+                font-size: 20px;
+                color: Theme.ink-2;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: fact.value;
+                font-size: 20px;
+                font-weight: 600;
+                color: Theme.ink;
+                vertical-alignment: center;
             }
         }
     }
@@ -1515,26 +1633,9 @@ component SettingsPage {
 
 component NetworksPage {
     VerticalLayout {
-        HorizontalLayout {
-            height: 96px;
-            padding-left: 8px;
-            padding-right: Theme.gutter;
-            padding-top: 16px;
-            spacing: 4px;
-            Button {
-                text: "‹";
-                kind: ButtonKind.quiet;
-                font-size: 40px;
-                clicked => { Kindil.go(Page.settings); }
-            }
-            Text {
-                text: "Networks";
-                font-size: 40px;
-                font-weight: 700;
-                color: Theme.ink;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
-            }
+        SubHeader {
+            title: "Networks";
+            back: Page.wifi;
             VerticalLayout {
                 alignment: center;
                 Button {
@@ -1712,6 +1813,12 @@ export component AppWindow inherits Window {
             if Kindil.page == Page.library: LibraryPage { width: parent.width; height: parent.height; }
             if Kindil.page == Page.reader: ReaderPage { width: parent.width; height: parent.height; }
             if Kindil.page == Page.settings: SettingsPage { width: parent.width; height: parent.height; }
+            if Kindil.page == Page.display: DisplaySettings { width: parent.width; height: parent.height; }
+            if Kindil.page == Page.wifi: WifiSettings { width: parent.width; height: parent.height; }
+            if Kindil.page == Page.remote: RemoteSettings { width: parent.width; height: parent.height; }
+            if Kindil.page == Page.power: PowerSettings { width: parent.width; height: parent.height; }
+            if Kindil.page == Page.updates: UpdateSettings { width: parent.width; height: parent.height; }
+            if Kindil.page == Page.about: AboutSettings { width: parent.width; height: parent.height; }
             if Kindil.page == Page.networks: NetworksPage { width: parent.width; height: parent.height; }
         }
         if !root.immersive || Kindil.chrome-visible: TabBar { }

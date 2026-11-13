@@ -141,9 +141,19 @@ pub fn screens(app: &App, window: &MinimalSoftwareWindow, dir: &Path) -> anyhow:
 
     k.invoke_go(Page::Settings);
     shot("settings")?;
-    drag(window, 380.0, 900.0, 200.0);
-    drag(window, 380.0, 900.0, 200.0);
-    shot("settings-device")?;
+    [
+        (Page::Display, "settings-display"),
+        (Page::Wifi, "settings-wifi"),
+        (Page::Remote, "settings-remote"),
+        (Page::Power, "settings-power"),
+        (Page::Updates, "settings-updates"),
+        (Page::About, "settings-about"),
+    ]
+    .into_iter()
+    .try_for_each(|(page, name)| {
+        k.invoke_go(page);
+        shot(name)
+    })?;
 
     k.invoke_go(Page::Networks);
     k.invoke_scan_networks();

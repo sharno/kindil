@@ -29,10 +29,15 @@ and a reboot always returns the Kindle to stock.
   book, the text size and the home screen across restarts. Rename and Trash
   (with Undo) from a book's **···** menu; nothing is ever overwritten or
   deleted outright.
-- **Settings**: home screen, front light, a "clean screen" flash, Wi-Fi on/off
-  with network status, scan and join, SSH server and SSH-at-boot switches,
-  Syncthing, device facts (battery, memory, storage, uptime), Updates, Restart
-  and Power off.
+- **Settings**: an index of sections, each row showing what it is set to now,
+  and each section a page that fits on screen (a page swap is one e-ink
+  refresh; scrolling redraws on every move):
+  - **Display**: home screen, front light, a "clean screen" flash.
+  - **Wi-Fi**: on/off with network status, scan and join.
+  - **Remote access**: SSH server and SSH-at-boot switches, Syncthing.
+  - **Power**: sleep when idle, start at boot, Exit to Kindle, Restart and
+    Power off.
+  - **Updates** and **About** (battery, memory, storage, uptime).
 - **Updates over the air** from this repo's GitHub releases; see
   [Updates](#updates).
 - **Device duties** that Amazon's UI normally performs:
@@ -81,7 +86,7 @@ and `dist/kindil` to `/mnt/us/extensions/kindil/bin/kindil`.
 
 Then put your Miqat settings at `/mnt/us/kindil/miqat.toml` and, optionally,
 a `/mnt/us/kindil/kindil.toml` (see [examples/kindil.toml](examples/kindil.toml)).
-Start it from KUAL → **kindil → Start kindil**. **Settings → Exit to Kindle**
+Start it from KUAL → **kindil → Start kindil**. **Settings → Power → Exit to Kindle**
 returns to Amazon's UI. The log is `/var/local/kindil/kindil.log` (over SSH).
 Restart and Power off also come back to Amazon's UI on the next boot.
 

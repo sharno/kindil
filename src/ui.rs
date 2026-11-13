@@ -530,7 +530,13 @@ impl Ctx {
         }
         match page {
             Page::Library => self.reload_library(),
-            Page::Settings => {
+            Page::Settings
+            | Page::Display
+            | Page::Wifi
+            | Page::Remote
+            | Page::Power
+            | Page::Updates
+            | Page::About => {
                 self.refresh_status();
                 self.show_sync();
             }
