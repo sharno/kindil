@@ -8,7 +8,7 @@
 //! the trial ends first. Nothing outside kindil's own folders is touched.
 use serde::Deserialize;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Where releases come from.
@@ -165,46 +165,29 @@ fn verify_with(public_key: &str, binary: &[u8], signature: &str) -> anyhow::Resu
     Ok(())
 }
 
-/// A read-only GitHub token: the repo is private, so its releases need one.
-#[derive(Clone)]
-pub struct Token(String);
-
-impl Token {
-    pub fn parse(text: &str) -> Option<Self> {
-        let token = text.trim();
-        (!token.is_empty() && !token.contains(char::is_whitespace)).then(|| Self(token.to_owned()))
-    }
-}
-
-impl fmt::Debug for Token {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Token(…)")
-    }
-}
-
+/// The public repo's releases; no token needed.
 pub struct Github {
     agent: ureq::Agent,
-    token: Token,
 }
 
-impl Github {
-    pub fn new(token: Token) -> Self {
-        // ureq never forwards the token on GitHub's redirect to its asset store.
+impl Default for Github {
+    fn default() -> Self {
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(120)))
             .user_agent(concat!("kindil/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
-        Self { agent, token }
+        Self { agent }
     }
+}
 
+impl Github {
     pub fn latest(&self) -> anyhow::Result<Release> {
         let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
         let json = self
             .agent
             .get(&url)
             .header("Accept", "application/vnd.github+json")
-            .header("Authorization", &format!("Bearer {}", self.token.0))
             .call()?
             .body_mut()
             .read_to_string()?;
@@ -216,7 +199,6 @@ impl Github {
             .agent
             .get(&url.0)
             .header("Accept", "application/octet-stream")
-            .header("Authorization", &format!("Bearer {}", self.token.0))
             .call()?
             .body_mut()
             .with_config()
@@ -305,15 +287,6 @@ impl Slots {
     }
 }
 
-/// Reads the token file; `None` when there is none yet.
-pub fn token(path: &Path) -> anyhow::Result<Option<Token>> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(Token::parse(&text)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,13 +348,6 @@ SW/I/JX/SBpxgS4DThvhL91wP3EJoH7taYJoyf43DW8zZZ3wB65CwRxKLqoEs5+fTbZ4yzLmtSU3WMSU
         assert!(verify_with(TEST_KEY, fixture, "not a signature").is_err());
         // The release key did not sign it.
         assert!(verify(fixture, TEST_SIGNATURE).is_err());
-    }
-
-    #[test]
-    fn tokens_are_never_printed() {
-        let token = Token::parse("  github_pat_abc\n").unwrap();
-        assert_eq!(format!("{token:?}"), "Token(…)");
-        assert!(Token::parse(" \n").is_none());
     }
 
     #[test]

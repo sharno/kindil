@@ -90,13 +90,6 @@ downloads it. Nothing installs without a tap.
 - **Scope:** only kindil's own files change; the bootloader, kernel and system
   partition are never touched.
 
-The repo is private, so the Kindle needs a GitHub token to read releases:
-
-1. Create a fine-grained token with read-only **Contents** access to
-   `sharno/kindil` only.
-2. Save it as `kindil/github-token` on the Kindle's USB drive (that is
-   `/mnt/us/kindil/github-token`).
-
 To release: bump `version` in `Cargo.toml`, commit, then publish a GitHub
 release tagged `vX.Y.Z`. The Release workflow builds, signs and attaches
 `kindil` and `kindil.minisig`. The signing key is the `MINISIGN_SECRET_KEY`
@@ -111,7 +104,6 @@ repository secret.
 | `/mnt/us/kindil/kindil.toml` | Optional settings (every key has a default) |
 | `/mnt/us/kindil/miqat.toml` | Miqat's own settings: location, prayer method |
 | `/mnt/us/kindil/prefs.toml` | Choices made on the device; safe to delete |
-| `/mnt/us/kindil/github-token` | Read-only GitHub token for updates (never logged) |
 | `/mnt/us/books/` | Books |
 | `/mnt/us/books/.kindil-trash/` | Trashed books, recoverable |
 

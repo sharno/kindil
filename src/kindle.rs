@@ -7,7 +7,7 @@ use crate::host::{Brightness, Deliver, DeviceInfo, Host, Memory, Power, Ssh, Sto
 use crate::lipc;
 use crate::system::{self, Event};
 use crate::uevent::Uevent;
-use crate::update::{self, Check, Commit, Github, Release, Slots, Version};
+use crate::update::{Check, Commit, Github, Release, Slots, Version};
 use crate::wifi::{self, Credentials, Link, Network};
 use std::io::BufRead;
 use std::path::Path;
@@ -25,8 +25,6 @@ const USER_STORAGE: &str = "/mnt/us";
 const EXTENSION_BIN: &str = "/mnt/us/extensions/kindil/bin";
 /// The launcher's marker while a new version is on trial.
 const UPDATE_TRIAL: &str = "/var/local/kindil/trying";
-/// A read-only GitHub token for the private repo's releases.
-const GITHUB_TOKEN: &str = "/mnt/us/kindil/github-token";
 
 pub struct KindleHost {
     frontlight: Result<Frontlight, String>,
@@ -199,23 +197,17 @@ impl Host for KindleHost {
     }
 
     fn check_update(&self) -> anyhow::Result<Check> {
-        Ok(Check::of(Version::current(), github()?.latest()?))
+        Ok(Check::of(Version::current(), Github::default().latest()?))
     }
 
     fn stage_update(&self, release: &Release) -> anyhow::Result<()> {
-        let binary = github()?.download(release)?;
+        let binary = Github::default().download(release)?;
         Slots::new(EXTENSION_BIN, UPDATE_TRIAL).stage(&binary, release.version)
     }
 
     fn commit_update(&self) -> anyhow::Result<Commit> {
         Slots::new(EXTENSION_BIN, UPDATE_TRIAL).commit()
     }
-}
-
-fn github() -> anyhow::Result<Github> {
-    let token = update::token(Path::new(GITHUB_TOKEN))?
-        .ok_or_else(|| anyhow::anyhow!("Needs a GitHub token in kindil/github-token"))?;
-    Ok(Github::new(token))
 }
 
 fn run(command: &mut Command) -> anyhow::Result<()> {

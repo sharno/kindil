@@ -160,8 +160,15 @@ mod tests {
         };
         let started = Service::new(Some(config)).toggled();
         assert!(matches!(started, Service::Running(_)));
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let polled = started.polled();
+        // Poll until the crash shows: a fixed sleep flaked on a busy machine.
+        let (Ok(polled) | Err(polled)) = (0..200).try_fold(started, |service, _| {
+            let service = service.polled();
+            if matches!(service, Service::Failed(_)) {
+                return Err(service);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok(service)
+        });
         let Service::Failed(failed) = &polled else {
             panic!("crash not noticed")
         };
