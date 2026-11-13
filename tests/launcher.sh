@@ -11,6 +11,7 @@ for c in lipc-set-prop stop start eips sleep; do
   chmod +x "$T/stub/$c"
 done
 sed -e "s#^EXT=.*#EXT=$T/ext#" \
+  -e "s#^SKIP=.*#SKIP=$T/SKIP#" \
   -e "s#^export PATH=.*#export PATH=$T/stub:/usr/bin:/bin#" \
   "$SESSION" >"$T/run/session.sh"
 chmod +x "$T/run/session.sh"
@@ -88,3 +89,9 @@ rm -f "$T/runs"
 fake "$T/ext/kindil" 1.0.0 "echo ran >>$T/runs; exit 143"
 run
 expect "a kill returns to Amazon's UI" "$(runs)" "1"
+
+reset
+touch "$T/SKIP"
+fake "$T/ext/kindil" 1.0.0 "exit 0"
+run
+expect "leaving kindil brings Amazon's framework back" "$([ -f "$T/SKIP" ] && echo skip || echo framework)" "framework"

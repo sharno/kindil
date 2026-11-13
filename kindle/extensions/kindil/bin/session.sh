@@ -1,13 +1,15 @@
 #!/bin/sh
 # Runs kindil as an app on the stock OS: Amazon's UI steps aside while it runs
 # and always comes back afterwards, whether kindil exits, crashes or is killed.
-# Nothing here survives a reboot, so a reboot is always a way back.
+# Nothing here survives a reboot, so a reboot is always a way back, except
+# for a standalone start at boot, whose own guard is bin/boot.sh.
 # Upstart's stop/start and eips live in sbin; KUAL has it on PATH, SSH does not.
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 RUN="$(dirname "$0")"
 BIN="$RUN/kindil"
 EXT=/mnt/us/extensions/kindil/bin
 CONFIG=/mnt/us/kindil/kindil.toml
+SKIP=/mnt/us/DONT_START_FRAMEWORK
 # Present while a new version is on trial; kindil removes it once it has run
 # for two minutes (src/update.rs). Still present after it exits: roll back.
 TRYING="$RUN/trying"
@@ -26,6 +28,9 @@ SLOT="$EXT/kindil"
 log() { echo "$(date '+%F %T') $*"; }
 
 restore() {
+  # A standalone boot skipped Amazon's framework: without it, Amazon's UI is
+  # an empty screen. boot.sh sets the flag again after a boot kindil stays up.
+  rm -f "$SKIP"
   lipc-set-prop com.lab126.powerd preventScreenSaver 0
   lipc-set-prop com.lab126.blanket load usb
   lipc-set-prop com.lab126.blanket load splash

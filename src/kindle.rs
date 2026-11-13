@@ -4,7 +4,7 @@
 use crate::battery::{Battery, Charge};
 use crate::frontlight::Frontlight;
 use crate::host::{
-    BootStart, Brightness, Deliver, DeviceInfo, Host, Memory, Power, Ssh, Storage, Wifi,
+    Boot, BootStart, Brightness, Deliver, DeviceInfo, Host, Memory, Power, Ssh, Storage, Wifi,
 };
 use crate::lipc;
 use crate::system::{self, Event};
@@ -29,6 +29,11 @@ const USER_STORAGE: &str = "/mnt/us";
 const BOOT_JOB: &str = "/etc/upstart/kindil.conf";
 /// Present: the boot job starts kindil (`bin/boot.sh`).
 const BOOT_FLAG: &str = "/mnt/us/kindil/BOOT";
+/// The start-at-boot flag's content for a standalone boot (bin/boot.sh).
+const BOOT_STANDALONE: &str = "standalone";
+/// Amazon's framework job skips its Java framework while this exists.
+/// session.sh and boot.sh remove it on every way back to Amazon's UI.
+const SKIP_FRAMEWORK: &str = "/mnt/us/DONT_START_FRAMEWORK";
 /// Boots in a row where kindil didn't stay up; turning start at boot on
 /// gives it a fresh start.
 const BOOT_TRIES: &str = "/var/local/kindil/boot-tries";
@@ -173,26 +178,36 @@ impl Host for KindleHost {
     }
 
     fn boot_start(&self) -> BootStart {
-        match (
-            Path::new(BOOT_JOB).is_file(),
-            Path::new(BOOT_FLAG).is_file(),
-        ) {
-            (false, _) => BootStart::NotInstalled,
-            (true, flag) => BootStart::Installed(if flag { Power::On } else { Power::Off }),
+        if !Path::new(BOOT_JOB).is_file() {
+            return BootStart::NotInstalled;
         }
+        BootStart::Installed(match std::fs::read_to_string(BOOT_FLAG) {
+            Err(_) => Boot::Off,
+            Ok(mode) if mode.trim() == BOOT_STANDALONE => Boot::Standalone,
+            Ok(_) => Boot::AfterAmazon,
+        })
     }
 
-    fn set_boot_start(&self, power: Power) -> anyhow::Result<()> {
+    fn set_boot_start(&self, boot: Boot) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.boot_start() != BootStart::NotInstalled,
             "the boot job is not installed"
         );
-        match power {
-            Power::On => {
+        match boot {
+            Boot::Off => {
+                remove_if_present(BOOT_FLAG)?;
+                remove_if_present(SKIP_FRAMEWORK)
+            }
+            Boot::AfterAmazon => {
                 std::fs::write(BOOT_FLAG, b"")?;
+                remove_if_present(SKIP_FRAMEWORK)?;
                 remove_if_present(BOOT_TRIES)
             }
-            Power::Off => remove_if_present(BOOT_FLAG),
+            Boot::Standalone => {
+                std::fs::write(BOOT_FLAG, format!("{BOOT_STANDALONE}\n"))?;
+                std::fs::write(SKIP_FRAMEWORK, b"")?;
+                remove_if_present(BOOT_TRIES)
+            }
         }
     }
 

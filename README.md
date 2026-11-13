@@ -127,16 +127,25 @@ once over SSH:
 sh /mnt/us/extensions/kindil/boot/install.sh install
 ```
 
-Then KUAL → **kindil → Start at boot: on**. The job runs whenever Amazon's UI
+Then pick a mode in **Settings → Power → Start at boot**, or in KUAL →
+**kindil → Start at boot: on / standalone / off**. The job runs whenever Amazon's UI
 starts and hands over to `bin/boot.sh` on the user storage, which starts
 kindil once per boot while `/mnt/us/kindil/BOOT` exists. Amazon's UI still
 starts first and is there whenever kindil exits (Exit to Kindle, or crashes
 it can't recover from); it doesn't start kindil again until the next boot.
 
+- **Standalone:** `BOOT` holding `standalone` also sets Amazon's own
+  `/mnt/us/DONT_START_FRAMEWORK` flag, so the next boots skip Amazon's Java
+  framework: kindil comes up sooner, with more memory free. Every way back
+  to Amazon's UI removes the flag first, since without the framework it is
+  an empty screen: leaving kindil (Exit to Kindle, a crash it gives up on, a
+  kill), and any boot where kindil doesn't stay up for 2 minutes, which then
+  restarts Amazon's UI with its framework. After a boot kindil stays up in,
+  the flag is set again.
 - **Failed boots:** if kindil doesn't stay up for 2 minutes in two boots in a
-  row, the next boots go to Amazon's UI. **Start at boot: on** resets that.
-- **Off:** KUAL → **Start at boot: off**, or delete `/mnt/us/kindil/BOOT` over
-  USB. The job stays and does nothing.
+  row, the next boots go to Amazon's UI. Choosing a mode again resets that.
+- **Off:** KUAL → **Start at boot: off**, or delete `/mnt/us/kindil/BOOT` and
+  `/mnt/us/DONT_START_FRAMEWORK` over USB. The job stays and does nothing.
 - **Undo:** `sh /mnt/us/extensions/kindil/boot/install.sh remove` removes the
   job.
 
@@ -149,7 +158,8 @@ it can't recover from); it doesn't start kindil again until the next boot.
 | `/mnt/us/kindil/kindil.toml` | Optional settings (every key has a default) |
 | `/mnt/us/kindil/miqat.toml` | Miqat's own settings: location, prayer method |
 | `/mnt/us/kindil/prefs.toml` | Choices made on the device; safe to delete |
-| `/mnt/us/kindil/BOOT` | Present: start kindil at boot (see [Start at boot](#start-at-boot)) |
+| `/mnt/us/kindil/BOOT` | Present: start kindil at boot; `standalone` inside: without Amazon's framework (see [Start at boot](#start-at-boot)) |
+| `/mnt/us/DONT_START_FRAMEWORK` | Amazon's flag to skip its framework; kindil sets and clears it for a standalone boot |
 | `/etc/upstart/kindil.conf` | Only if you installed start at boot |
 | `/mnt/us/books/` | Books |
 | `/mnt/us/books/.kindil-trash/` | Trashed books, recoverable |

@@ -86,7 +86,19 @@ pub enum Ssh {
 pub enum BootStart {
     /// The boot job isn't in the system yet: a one-time install over SSH.
     NotInstalled,
-    Installed(Power),
+    Installed(Boot),
+}
+
+/// How a boot reaches kindil, once the boot job is installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Boot {
+    /// Amazon's UI, as without kindil.
+    Off,
+    /// Amazon's UI starts, then kindil takes over from it.
+    AfterAmazon,
+    /// Amazon's Java framework never starts: kindil comes up sooner and with
+    /// more memory. Leaving kindil brings the framework back.
+    Standalone,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,7 +146,7 @@ pub trait Host: Send + Sync {
     fn set_ssh_at_boot(&self, power: Power) -> anyhow::Result<()>;
     fn boot_start(&self) -> BootStart;
     /// Fails while the boot job isn't installed.
-    fn set_boot_start(&self, power: Power) -> anyhow::Result<()>;
+    fn set_boot_start(&self, boot: Boot) -> anyhow::Result<()>;
     fn info(&self) -> DeviceInfo;
     /// Starts the threads that report the power button and USB drive mode.
     fn listen(&self, deliver: Deliver);
@@ -186,7 +198,7 @@ impl Default for Simulated {
                 wifi: Power::On,
                 ssh: Power::On,
                 ssh_at_boot: Power::On,
-                boot_start: BootStart::Installed(Power::Off),
+                boot_start: BootStart::Installed(Boot::Off),
             }),
         }
     }
@@ -270,11 +282,11 @@ impl Host for Simulated {
     fn boot_start(&self) -> BootStart {
         self.with(|s| s.boot_start)
     }
-    fn set_boot_start(&self, power: Power) -> anyhow::Result<()> {
+    fn set_boot_start(&self, boot: Boot) -> anyhow::Result<()> {
         self.with(|s| match s.boot_start {
             BootStart::NotInstalled => anyhow::bail!("the boot job is not installed"),
             BootStart::Installed(_) => {
-                s.boot_start = BootStart::Installed(power);
+                s.boot_start = BootStart::Installed(boot);
                 Ok(())
             }
         })

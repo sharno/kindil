@@ -6,7 +6,9 @@ use kindil::drain::MilliampHours;
 use kindil::host::{Host, Simulated};
 use kindil::preview::{self, drag, pixels, tap};
 use kindil::system::{Drive, Event, Touches};
-use kindil::ui::{App, DashboardKind, Execution, Kindil, Options, Page, Panel, Switch, System};
+use kindil::ui::{
+    App, BootChoice, DashboardKind, Execution, Kindil, Options, Page, Panel, Switch, System,
+};
 use kindil::wifi::Credentials;
 use slint::platform::software_renderer::MinimalSoftwareWindow;
 use slint::{ComponentHandle, Model};
@@ -433,17 +435,17 @@ fn auto_sleep_is_a_saved_choice() {
 }
 
 #[test]
-fn start_at_boot_is_a_switch_once_the_boot_job_is_installed() {
+fn start_at_boot_is_a_choice_once_the_boot_job_is_installed() {
+    use kindil::host::{Boot, BootStart};
     let host = Arc::new(Simulated::default());
     let f = Fixture::new(host.clone());
-    f.k().invoke_navigated(Page::Settings);
-    assert_eq!(f.k().get_boot_start(), Switch::Off);
-    f.k().invoke_toggle_boot_start();
-    assert_eq!(f.k().get_boot_start(), Switch::On);
-    assert_eq!(
-        host.boot_start(),
-        kindil::host::BootStart::Installed(kindil::host::Power::On)
-    );
+    f.k().invoke_navigated(Page::Power);
+    assert_eq!(f.k().get_boot(), BootChoice::Off);
+    f.k().invoke_choose_boot(BootChoice::Standalone);
+    assert_eq!(f.k().get_boot(), BootChoice::Standalone);
+    assert_eq!(host.boot_start(), BootStart::Installed(Boot::Standalone));
+    f.k().invoke_choose_boot(BootChoice::AfterAmazon);
+    assert_eq!(host.boot_start(), BootStart::Installed(Boot::AfterAmazon));
 }
 
 #[test]
@@ -566,8 +568,8 @@ impl Host for Recording {
     fn boot_start(&self) -> kindil::host::BootStart {
         self.device.boot_start()
     }
-    fn set_boot_start(&self, power: kindil::host::Power) -> anyhow::Result<()> {
-        self.device.set_boot_start(power)
+    fn set_boot_start(&self, boot: kindil::host::Boot) -> anyhow::Result<()> {
+        self.device.set_boot_start(boot)
     }
     fn info(&self) -> kindil::host::DeviceInfo {
         self.device.info()

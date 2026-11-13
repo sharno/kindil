@@ -16,6 +16,8 @@ export enum Page { dashboard, library, reader, settings, display, wifi, remote, 
 export enum DashboardKind { miqat, clock }
 /// A setting's switch. `unavailable` covers "not installed" and "no hardware".
 export enum Switch { off, on, unavailable }
+/// Start at boot; `unavailable` until the boot job is installed.
+export enum BootChoice { unavailable, off, after-amazon, standalone }
 /// What owns the screen: the app, or one of the device states kindil runs
 /// in Amazon's place.
 /// Whether content is moving under a finger.
@@ -106,7 +108,7 @@ export global Kindil {
     in property <string> wifi-detail;
     in property <Switch> ssh: Switch.unavailable;
     in property <Switch> ssh-at-boot: Switch.unavailable;
-    in property <Switch> boot-start: Switch.unavailable;
+    in property <BootChoice> boot: BootChoice.unavailable;
     in property <string> boot-start-detail;
     in property <string> ssh-detail;
     in property <Switch> sync: Switch.unavailable;
@@ -143,7 +145,7 @@ export global Kindil {
     callback join-network(string, string);
     callback toggle-ssh();
     callback toggle-ssh-at-boot();
-    callback toggle-boot-start();
+    callback choose-boot(BootChoice);
     callback toggle-sync();
     callback exit-app();
     in property <System> system: System.app;
@@ -1554,21 +1556,46 @@ component PowerSettings inherits SectionPage {
         }
     }
     Group {
-        title: "STARTUP";
-        SwitchRow {
-            title: "Start kindil at boot";
-            detail: Kindil.boot-start-detail;
-            state: Kindil.boot-start;
-            toggled => { Kindil.toggle-boot-start(); }
+        title: "START AT BOOT";
+        if Kindil.boot != BootChoice.unavailable: Rectangle {
+            height: 72px;
+            border-radius: Theme.radius;
+            border-width: 2px;
+            border-color: Theme.ink;
+            HorizontalLayout {
+                padding: 6px;
+                spacing: 4px;
+                Segment {
+                    text: "Off";
+                    selected: Kindil.boot == BootChoice.off;
+                    clicked => { Kindil.choose-boot(BootChoice.off); }
+                }
+                Segment {
+                    text: "After Amazon";
+                    selected: Kindil.boot == BootChoice.after-amazon;
+                    clicked => { Kindil.choose-boot(BootChoice.after-amazon); }
+                }
+                Segment {
+                    text: "Standalone";
+                    selected: Kindil.boot == BootChoice.standalone;
+                    clicked => { Kindil.choose-boot(BootChoice.standalone); }
+                }
+            }
+        }
+        Text {
+            text: Kindil.boot-start-detail;
+            font-size: 17px;
+            color: Theme.ink-3;
+            wrap: word-wrap;
         }
     }
-Rectangle { height: 20px; }
+    Rectangle { height: 20px; }
     Button {
         text: "Exit to Kindle";
         clicked => { Kindil.exit-app(); }
     }
     Text {
-        text: "Returns to Amazon's home screen. kindil never changes the system.";
+        text: "Returns to Amazon's home screen.";
         font-size: 17px;
         color: Theme.ink-3;
         wrap: word-wrap;

@@ -1,11 +1,11 @@
 //! Domain state → what the screen shows. Pure, so wording and units are tested
 //! without a window.
 use crate::battery::{Battery, Charge};
-use crate::host::{BootStart, DeviceInfo, Power, Ssh, Wifi};
+use crate::host::{Boot, BootStart, DeviceInfo, Power, Ssh, Wifi};
 use crate::prefs::Progress;
 use crate::reader::Book;
 use crate::sync::Service;
-use crate::ui::{BookItem, Fact, NetworkItem, Switch};
+use crate::ui::{BookItem, BootChoice, Fact, NetworkItem, Switch};
 use crate::update::{Updates, Version};
 use crate::wifi::{Network, Security};
 use chrono::{DateTime, TimeZone};
@@ -95,19 +95,33 @@ pub fn ssh(ssh: Ssh, ip: Option<Ipv4Addr>) -> (Switch, Switch, String) {
     }
 }
 
-pub fn boot_start(boot: BootStart) -> (Switch, String) {
+pub fn boot_start(boot: BootStart) -> (BootChoice, String) {
     match boot {
         BootStart::NotInstalled => (
-            Switch::Unavailable,
+            BootChoice::Unavailable,
             "Needs a one-time install over SSH; see the README".into(),
         ),
-        BootStart::Installed(power) => (
-            switch(power),
-            match power {
-                Power::On => "Instead of Amazon's UI, which stays one Exit away".into(),
-                Power::Off => "Off: the Kindle starts with Amazon's UI".into(),
-            },
+        BootStart::Installed(Boot::Off) => {
+            (BootChoice::Off, "The Kindle starts with Amazon's UI".into())
+        }
+        BootStart::Installed(Boot::AfterAmazon) => (
+            BootChoice::AfterAmazon,
+            "Amazon's UI starts, then kindil takes over; Exit goes back to it".into(),
         ),
+        BootStart::Installed(Boot::Standalone) => (
+            BootChoice::Standalone,
+            "Amazon's UI doesn't load: faster, more memory. Exit loads it".into(),
+        ),
+    }
+}
+
+/// The Power page's choice back into the host's terms; None for no choice.
+pub fn boot(choice: BootChoice) -> Option<Boot> {
+    match choice {
+        BootChoice::Unavailable => None,
+        BootChoice::Off => Some(Boot::Off),
+        BootChoice::AfterAmazon => Some(Boot::AfterAmazon),
+        BootChoice::Standalone => Some(Boot::Standalone),
     }
 }
 

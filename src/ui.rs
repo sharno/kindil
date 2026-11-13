@@ -238,7 +238,7 @@ impl Snapshot {
         k.set_ssh_at_boot(at_boot);
         k.set_ssh_detail(detail.into());
         let (boot, detail) = view::boot_start(self.boot_start);
-        k.set_boot_start(boot);
+        k.set_boot(boot);
         k.set_boot_start_detail(detail.into());
         k.set_facts(model(view::facts(&self.info, env!("CARGO_PKG_VERSION"))));
         k.set_brightness(self.brightness.map_or(-1, |b| i32::from(b.percent())));
@@ -444,7 +444,7 @@ fn wire(window: &AppWindow, ctx: &Ctx) {
     on!(on_join_network => join_network(ssid, password));
     on!(on_toggle_ssh => toggle_ssh());
     on!(on_toggle_ssh_at_boot => toggle_ssh_at_boot());
-    on!(on_toggle_boot_start => toggle_boot_start());
+    on!(on_choose_boot => choose_boot(choice));
     on!(on_toggle_sync => toggle_sync());
     on!(on_exit_app => exit_app());
     on!(on_device_events => device_events());
@@ -829,12 +829,16 @@ impl Ctx {
         );
     }
 
-    fn toggle_boot_start(&self) {
-        let Some(ui) = self.ui() else { return };
-        self.switch_service(
-            ui.global::<Kindil>().get_boot_start(),
-            "Start at boot",
-            |host, power| host.set_boot_start(power),
+    fn choose_boot(&self, choice: BootChoice) {
+        let Some(boot) = view::boot(choice) else {
+            return;
+        };
+        self.background(
+            move |host| host.set_boot_start(boot).map(|()| Snapshot::read(host)),
+            |ui, result| match result {
+                Ok(snapshot) => snapshot.apply(ui),
+                Err(error) => notify(ui, &format!("Start at boot: {error}")),
+            },
         );
     }
 
