@@ -93,7 +93,7 @@ reset
 echo standalone >"$T/BOOT"
 touch "$T/SKIP"
 boot a
-expect "standalone: X and Amazon's UI never start" "$(starts) $(upstart)" "1 stop x,"
+expect "standalone: X and Amazon's UI never start, nor does the spinner stay" "$(starts) $(upstart)" "1 stop x,stop early_progress,"
 
 reset
 : >"$T/BOOT"
@@ -105,9 +105,9 @@ echo standalone >"$T/BOOT"
 touch "$T/SKIP"
 echo 0 >"$T/up"
 boot a
-expect "a standalone boot kindil doesn't stay up in gets Amazon's full UI" "$(skip) $(upstart)" "framework stop x,start x,"
+expect "a standalone boot kindil doesn't stay up in gets Amazon's full UI" "$(skip) $(upstart)" "framework stop x,stop early_progress,start x,"
 boot a
-expect "which starts nothing more in that boot" "$(starts) $(upstart)" "1 stop x,start x,"
+expect "which starts nothing more in that boot" "$(starts) $(upstart)" "1 stop x,stop early_progress,start x,"
 
 reset
 echo standalone >"$T/BOOT"

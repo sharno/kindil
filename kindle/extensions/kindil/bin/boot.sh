@@ -79,6 +79,9 @@ if [ -f "$SKIP" ]; then
   # all that waits for it go unused.
   log "skipping X and Amazon's UI"
   stop x
+  # Amazon's boot spinner stops only when X's language picker starts: left
+  # running, it keeps drawing over kindil.
+  stop early_progress
   await answers com.lab126.powerd state || log "powerd isn't answering"
   await answers com.lab126.wifid enable || log "wifid isn't answering"
   # What X's language picker does at boot to set up the front light.
