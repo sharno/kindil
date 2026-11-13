@@ -180,10 +180,25 @@ impl Host for KindleHost {
     }
 
     fn suspend(&self) -> anyhow::Result<()> {
+        // A nap's alarm must not wake a sleep the user asked for.
+        if let Ok(alarm) = wakealarm() {
+            let _ = std::fs::write(alarm, "0");
+        }
         // powerd suspends the same way; it ignores the button while kindil
         // runs, so nothing else will.
         std::fs::write("/sys/power/state", b"mem")?;
         Ok(())
+    }
+
+    fn nap(&self, wake_after: Duration) -> anyhow::Result<()> {
+        let alarm = wakealarm()?;
+        // Writing a new alarm over a pending one fails: clear it first.
+        std::fs::write(&alarm, "0")?;
+        std::fs::write(&alarm, format!("+{}", wake_after.as_secs().max(1)))?;
+        let slept = std::fs::write("/sys/power/state", b"mem");
+        // The power button may have woken it first: never leave the alarm set.
+        let _ = std::fs::write(&alarm, "0");
+        Ok(slept?)
     }
 
     fn restart(&self) -> anyhow::Result<()> {
@@ -208,6 +223,15 @@ impl Host for KindleHost {
     fn commit_update(&self) -> anyhow::Result<Commit> {
         Slots::new(EXTENSION_BIN, UPDATE_TRIAL).commit()
     }
+}
+
+/// The RTC that can wake the device: on the PW1 the PMIC's (`rtc1`); the
+/// SoC's own RTC has no wake alarm.
+fn wakealarm() -> anyhow::Result<std::path::PathBuf> {
+    (0..4)
+        .map(|n| std::path::PathBuf::from(format!("/sys/class/rtc/rtc{n}/wakealarm")))
+        .find(|path| path.exists())
+        .ok_or_else(|| anyhow::anyhow!("no RTC wake alarm"))
 }
 
 fn run(command: &mut Command) -> anyhow::Result<()> {

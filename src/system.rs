@@ -1,12 +1,13 @@
 //! The OS duties Amazon's UI performs and kindil takes over while it runs:
-//! sleeping on the power button or when idle, and stepping aside while a
-//! computer has the user storage over USB.
+//! sleeping on the power button or when idle, dozing between screen updates,
+//! and stepping aside while a computer has the user storage over USB.
 //!
 //! Events arrive from the kernel (power button), volumd (USB drive mode), the
 //! minute clock (idle) and kindil's own workers and timers, so this is a
 //! reducer: a pure `step` from (mode, event) to the next mode and the effects
 //! to run. The UI runs the effects.
 use crate::host::Brightness;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -22,17 +23,32 @@ pub const PANEL_SETTLE: Duration = Duration::from_millis(1500);
 /// A flaky cable drops and restores USB drive mode every second; the app
 /// returns only once the storage has stayed back this long.
 pub const DRIVE_SETTLE: Duration = Duration::from_secs(3);
+/// Without a touch for this long, a dozing kindil starts napping.
+pub const DOZE_AFTER: Duration = Duration::from_secs(120);
+/// Awake after a nap: long enough to render the minute and for the panel to
+/// show it.
+pub const DRAW_WINDOW: Duration = Duration::from_secs(3);
+/// While dozing, how often kindil stays up for Wi-Fi to fetch the weather.
+pub const ONLINE_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(30);
+/// Awake that long when online: Wi-Fi reconnects in about 15 s after a nap.
+pub const ONLINE_WINDOW: Duration = Duration::from_secs(45);
+/// When, in that window, the dashboard fetches.
+pub const FETCH_AFTER: Duration = Duration::from_secs(25);
+/// Shorter naps aren't worth a suspend: kindil waits for the minute awake.
+pub const MIN_NAP: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     PowerButton,
     /// Nobody touched the screen for the auto-sleep time.
     Idle,
+    /// Nobody touched the screen for [`DOZE_AFTER`], and kindil dozes.
+    Doze,
     /// The front light is off; this was its level, if it could be read.
     LightOff(Option<Brightness>),
-    /// The sleep screen has had time to reach the panel.
+    /// The sleep screen, or a dozing redraw, has had time to reach the panel.
     PanelSettled,
-    /// The device suspended and woke up again.
+    /// The device suspended, or napped, and woke up again.
     Resumed,
     /// The kernel refused to suspend; the device stayed up with the screen asleep.
     SuspendFailed,
@@ -57,6 +73,9 @@ pub enum Mode {
         since: Instant,
     },
     Asleep(Sleep),
+    /// The screen stays as it is and keeps updating; between updates the
+    /// device naps.
+    Dozing(Doze),
     /// A computer has the user storage; kindil shows the USB screen.
     UsbDrive,
     /// The storage is back; waiting to see that it stays.
@@ -75,6 +94,21 @@ pub enum Sleep {
     Suspended { light: Option<Brightness> },
 }
 
+/// Doze: suspend to RAM between minute updates. E-ink keeps the picture
+/// without power, so a wall dashboard keeps showing and updating on a fraction
+/// of the battery. Touch can't wake a suspended PW1; the power button does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Doze {
+    /// The light is being switched off.
+    DimmingLight,
+    /// Waiting for the panel before the first nap.
+    Settling { light: Option<Brightness> },
+    /// Suspended until the next minute, or about to be.
+    Napping { light: Option<Brightness> },
+    /// Back from a nap: redrawing, and online now and then for the weather.
+    Drawing { light: Option<Brightness> },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effect {
     ShowSleep,
@@ -82,8 +116,14 @@ pub enum Effect {
     /// Deliver [`Event::PanelSettled`] after [`PANEL_SETTLE`].
     AwaitPanel,
     Suspend,
+    /// Suspend until the next minute, then deliver [`Event::Resumed`].
+    Nap,
+    /// Update the screen after a nap, then deliver [`Event::PanelSettled`].
+    Redraw,
     /// Back to the app.
     Wake,
+    /// Back from dozing: the app never left the screen.
+    Rouse,
     RestoreLight(Brightness),
     ShowUsbDrive,
     /// Close everything that holds files on the user storage.
@@ -143,6 +183,26 @@ impl Mode {
             (M::Awake { .. }, E::PowerButton | E::Idle) => {
                 to(M::Asleep(Sleep::DimmingLight), FALL_ASLEEP)
             }
+            (M::Awake { .. }, E::Doze) => to(M::Dozing(Doze::DimmingLight), [Effect::LightOff]),
+            (M::Dozing(Doze::DimmingLight), E::LightOff(light)) => {
+                to(M::Dozing(Doze::Settling { light }), [Effect::AwaitPanel])
+            }
+            (M::Dozing(Doze::Settling { light } | Doze::Drawing { light }), E::PanelSettled) => {
+                to(M::Dozing(Doze::Napping { light }), [Effect::Nap])
+            }
+            // A refused nap retries after the next redraw window.
+            (M::Dozing(Doze::Napping { light }), E::Resumed | E::SuspendFailed) => {
+                to(M::Dozing(Doze::Drawing { light }), [Effect::Redraw])
+            }
+            // Whether it lands before or after the nap returns, the press wakes.
+            (M::Dozing(doze), E::PowerButton) => to(
+                awake,
+                std::iter::once(Effect::Rouse).chain(doze.light().map(Effect::RestoreLight)),
+            ),
+            (M::Dozing(doze), E::Drive(Drive::Computer)) => to(
+                M::UsbDrive,
+                wake(doze.light()).chain([Effect::ReleaseStorage, Effect::ShowUsbDrive]),
+            ),
             (M::Asleep(Sleep::DimmingLight), E::LightOff(light)) => {
                 to(M::Asleep(Sleep::Settling { light }), [Effect::AwaitPanel])
             }
@@ -172,8 +232,20 @@ impl Mode {
             }
             (M::UsbDrive | M::Returning { .. }, E::PowerButton) => Err(Ignored::InUsbDrive),
             (M::Awake { .. }, E::PanelSettled | E::Resumed | E::SuspendFailed)
-            | (M::Awake { .. } | M::Asleep(_), E::Drive(Drive::Kindle) | E::DriveSettled(_))
-            | (M::Asleep(_), E::Idle)
+            | (
+                M::Awake { .. } | M::Asleep(_) | M::Dozing(_),
+                E::Drive(Drive::Kindle) | E::DriveSettled(_),
+            )
+            | (M::Asleep(_) | M::Dozing(_), E::Idle | E::Doze)
+            | (
+                M::Dozing(Doze::Settling { .. } | Doze::Napping { .. } | Doze::Drawing { .. }),
+                E::LightOff(_),
+            )
+            | (M::Dozing(Doze::DimmingLight | Doze::Napping { .. }), E::PanelSettled)
+            | (
+                M::Dozing(Doze::DimmingLight | Doze::Settling { .. } | Doze::Drawing { .. }),
+                E::Resumed | E::SuspendFailed,
+            )
             | (M::Asleep(Sleep::Settling { .. } | Sleep::Suspended { .. }), E::LightOff(_))
             | (
                 M::Asleep(Sleep::DimmingLight | Sleep::Settling { .. }),
@@ -184,7 +256,12 @@ impl Mode {
             | (M::Returning { .. }, E::Drive(Drive::Kindle) | E::DriveSettled(_))
             | (
                 M::UsbDrive | M::Returning { .. },
-                E::Idle | E::LightOff(_) | E::PanelSettled | E::Resumed | E::SuspendFailed,
+                E::Idle
+                | E::Doze
+                | E::LightOff(_)
+                | E::PanelSettled
+                | E::Resumed
+                | E::SuspendFailed,
             ) => Err(Ignored::Stale),
         }
     }
@@ -195,6 +272,42 @@ impl Sleep {
         match self {
             Sleep::DimmingLight => None,
             Sleep::Settling { light } | Sleep::Suspended { light } => light,
+        }
+    }
+}
+
+impl Doze {
+    fn light(self) -> Option<Brightness> {
+        match self {
+            Doze::DimmingLight => None,
+            Doze::Settling { light } | Doze::Napping { light } | Doze::Drawing { light } => light,
+        }
+    }
+}
+
+/// What a dozing wake does besides drawing the minute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Window {
+    /// Draw, then nap again after [`DRAW_WINDOW`].
+    Draw,
+    /// Also let Wi-Fi reconnect and fetch, for [`ONLINE_WINDOW`].
+    Online,
+}
+
+impl Window {
+    /// Online at the first wake and then every [`ONLINE_EVERY`] of wall time;
+    /// the monotonic clock stops while the device naps.
+    pub fn after_nap(last_online: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Self {
+        match last_online {
+            Some(last) if now - last < ONLINE_EVERY => Window::Draw,
+            _ => Window::Online,
+        }
+    }
+
+    pub fn length(self) -> Duration {
+        match self {
+            Window::Draw => DRAW_WINDOW,
+            Window::Online => ONLINE_WINDOW,
         }
     }
 }
@@ -218,19 +331,25 @@ pub fn drive_mode(state: u8) -> Option<Drive> {
     }
 }
 
-/// When the device sleeps by itself. The power button always works.
+/// What the device does by itself when nobody touches it. The power button
+/// always sleeps and wakes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoSleep {
-    /// A wall dashboard: always on, updating.
+    /// A wall dashboard on little battery: keeps updating, napping between
+    /// minutes.
     #[default]
+    Doze,
+    /// Always awake, updating; drains the battery in about a day.
     Never,
+    /// The sleep screen after this many minutes.
     Minutes(u16),
 }
 
 impl AutoSleep {
     /// The choices Settings offers, in order.
-    pub const CHOICES: [AutoSleep; 5] = [
+    pub const CHOICES: [AutoSleep; 6] = [
+        AutoSleep::Doze,
         AutoSleep::Never,
         AutoSleep::Minutes(5),
         AutoSleep::Minutes(15),
@@ -240,6 +359,7 @@ impl AutoSleep {
 
     pub fn label(self) -> String {
         match self {
+            AutoSleep::Doze => "Doze".into(),
             AutoSleep::Never => "Never".into(),
             AutoSleep::Minutes(60) => "1 h".into(),
             AutoSleep::Minutes(m) => format!("{m} min"),
@@ -283,11 +403,14 @@ impl Idle {
         }
     }
 
-    pub fn due(self, setting: AutoSleep, now: Instant) -> bool {
+    /// The event the setting calls for by now, if any.
+    pub fn due(self, setting: AutoSleep, now: Instant) -> Option<Event> {
+        let idle = now.duration_since(self.since);
         match setting {
-            AutoSleep::Never => false,
+            AutoSleep::Never => None,
+            AutoSleep::Doze => (idle >= DOZE_AFTER).then_some(Event::Doze),
             AutoSleep::Minutes(minutes) => {
-                now.duration_since(self.since) >= Duration::from_secs(60 * u64::from(minutes))
+                (idle >= Duration::from_secs(60 * u64::from(minutes))).then_some(Event::Idle)
             }
         }
     }
@@ -372,6 +495,81 @@ mod tests {
     }
 
     #[test]
+    fn dozing_naps_and_redraws_each_minute_until_a_press() {
+        let light = Brightness::new(40);
+        let (mode, effects) = run(&[
+            (Event::Doze, 10_000),
+            (Event::LightOff(Some(light)), 10_100),
+            (Event::PanelSettled, 11_600),
+            (Event::Resumed, 12_000),
+            (Event::PanelSettled, 15_000),
+            (Event::Resumed, 16_000),
+            (Event::PanelSettled, 19_000),
+            // Pressed while napping; the nap returns after the press arrives.
+            (Event::PowerButton, 19_500),
+            (Event::Resumed, 19_600),
+        ]);
+        assert!(matches!(mode, Mode::Awake { .. }));
+        assert_eq!(
+            effects,
+            [
+                Effect::LightOff,
+                Effect::AwaitPanel,
+                Effect::Nap,
+                Effect::Redraw,
+                Effect::Nap,
+                Effect::Redraw,
+                Effect::Nap,
+                Effect::Rouse,
+                Effect::RestoreLight(light),
+            ]
+        );
+    }
+
+    #[test]
+    fn dozing_goes_online_every_half_hour_of_wall_time() {
+        let t0 = DateTime::from_timestamp(1_794_398_400, 0).unwrap();
+        let at = |minutes| t0 + chrono::TimeDelta::minutes(minutes);
+        assert_eq!(Window::after_nap(None, t0), Window::Online);
+        assert_eq!(Window::after_nap(Some(t0), at(29)), Window::Draw);
+        assert_eq!(Window::after_nap(Some(t0), at(30)), Window::Online);
+        assert!(FETCH_AFTER < ONLINE_WINDOW);
+    }
+
+    #[test]
+    fn a_refused_nap_is_retried_after_a_redraw() {
+        let (mode, effects) = run(&[
+            (Event::Doze, 10_000),
+            (Event::LightOff(None), 10_100),
+            (Event::PanelSettled, 11_600),
+            (Event::SuspendFailed, 11_700),
+            (Event::PanelSettled, 14_700),
+        ]);
+        assert_eq!(mode, Mode::Dozing(Doze::Napping { light: None }));
+        assert_eq!(effects[3..], [Effect::Redraw, Effect::Nap]);
+    }
+
+    #[test]
+    fn usb_while_dozing_brings_the_light_back_first() {
+        let light = Brightness::new(40);
+        let (mode, effects) = run(&[
+            (Event::Doze, 10_000),
+            (Event::LightOff(Some(light)), 10_100),
+            (Event::Drive(Drive::Computer), 11_000),
+        ]);
+        assert_eq!(mode, Mode::UsbDrive);
+        assert_eq!(
+            effects[2..],
+            [
+                Effect::Wake,
+                Effect::RestoreLight(light),
+                Effect::ReleaseStorage,
+                Effect::ShowUsbDrive
+            ]
+        );
+    }
+
+    #[test]
     fn a_flapping_cable_keeps_the_usb_screen_until_the_storage_stays() {
         let t0 = Instant::now();
         let at = |ms| t0 + Duration::from_millis(ms);
@@ -430,15 +628,32 @@ mod tests {
             .observe(5, t0 + Duration::from_secs(60))
             .observe(6, t0 + Duration::from_secs(120));
         let setting = AutoSleep::Minutes(5);
-        assert!(!idle.due(setting, t0 + Duration::from_secs(300)));
-        assert!(idle.due(setting, t0 + Duration::from_secs(420)));
-        assert!(!idle.due(AutoSleep::Never, t0 + Duration::from_secs(99_999)));
+        assert_eq!(idle.due(setting, t0 + Duration::from_secs(300)), None);
+        assert_eq!(
+            idle.due(setting, t0 + Duration::from_secs(420)),
+            Some(Event::Idle)
+        );
+        assert_eq!(
+            idle.due(AutoSleep::Never, t0 + Duration::from_secs(99_999)),
+            None
+        );
+        assert_eq!(
+            idle.due(AutoSleep::Doze, t0 + Duration::from_secs(200)),
+            None
+        );
+        assert_eq!(
+            idle.due(AutoSleep::Doze, t0 + Duration::from_secs(240)),
+            Some(Event::Doze)
+        );
     }
 
     #[test]
     fn auto_sleep_labels_and_storage() {
         let labels: Vec<String> = AutoSleep::CHOICES.iter().map(|c| c.label()).collect();
-        assert_eq!(labels, ["Never", "5 min", "15 min", "30 min", "1 h"]);
+        assert_eq!(
+            labels,
+            ["Doze", "Never", "5 min", "15 min", "30 min", "1 h"]
+        );
         #[derive(Serialize, Deserialize)]
         struct Holder {
             auto_sleep: AutoSleep,
@@ -451,6 +666,8 @@ mod tests {
         assert_eq!(back.auto_sleep, AutoSleep::Minutes(15));
         let never: Holder = toml::from_str("auto_sleep = \"never\"").unwrap();
         assert_eq!(never.auto_sleep, AutoSleep::Never);
+        let doze: Holder = toml::from_str("auto_sleep = \"doze\"").unwrap();
+        assert_eq!(doze.auto_sleep, AutoSleep::Doze);
     }
 
     #[test]

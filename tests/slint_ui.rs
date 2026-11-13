@@ -371,6 +371,8 @@ fn the_power_button_sleeps_and_the_light_comes_back() {
     let f = Fixture::new(host.clone());
     // The simulated device wakes as soon as it suspends.
     f.app.device_event(Event::PowerButton);
+    assert_eq!(f.k().get_system(), System::Asleep);
+    f.app.fire_timers();
     assert_eq!(host.suspends(), 1);
     assert_eq!(f.k().get_system(), System::App);
     assert_eq!(host.brightness().unwrap().percent(), 40);
@@ -392,6 +394,12 @@ fn usb_drive_mode_covers_the_app_until_the_storage_is_back() {
     assert_eq!(f.k().get_page(), Page::Library, "taps don't reach the app");
     std::fs::write(f.books().join("New_Book.txt"), "Copied over USB\n").unwrap();
     f.app.device_event(Event::Drive(Drive::Kindle));
+    assert_eq!(
+        f.k().get_system(),
+        System::UsbDrive,
+        "until the storage stays"
+    );
+    f.app.fire_timers();
     assert_eq!(f.k().get_system(), System::App);
     assert_eq!(f.k().get_books().row_count(), 2, "the library is reloaded");
 }
@@ -399,11 +407,33 @@ fn usb_drive_mode_covers_the_app_until_the_storage_is_back() {
 #[test]
 fn auto_sleep_is_a_saved_choice() {
     let f = Fixture::new(Arc::new(Simulated::default()));
-    assert_eq!(f.k().get_auto_sleep(), 0, "never, by default");
-    f.k().invoke_choose_auto_sleep(2);
-    assert_eq!(f.k().get_auto_sleep(), 2);
+    assert_eq!(f.k().get_auto_sleep(), 0, "doze, by default");
+    f.k().invoke_choose_auto_sleep(3);
+    assert_eq!(f.k().get_auto_sleep(), 3);
     let prefs = std::fs::read_to_string(f.dir.path().join("prefs.toml")).unwrap();
     assert!(prefs.contains("minutes = 15"), "{prefs}");
+}
+
+#[test]
+fn dozing_keeps_the_screen_and_naps_each_minute_until_a_press() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    f.app.device_event(Event::Doze);
+    assert_eq!(
+        host.brightness().unwrap().percent(),
+        0,
+        "the light goes off"
+    );
+    // Each round: the panel settles, the device naps, wakes and redraws.
+    (1..=3).for_each(|naps| {
+        f.app.fire_timers();
+        assert_eq!(host.naps(), naps);
+    });
+    assert_eq!(f.k().get_system(), System::App, "no sleep screen");
+    f.app.device_event(Event::PowerButton);
+    assert_eq!(host.brightness().unwrap().percent(), 40);
+    f.app.fire_timers();
+    assert_eq!(host.naps(), 3, "awake: no more naps");
 }
 
 #[test]
@@ -470,6 +500,9 @@ impl Host for Recording {
     }
     fn power_off(&self) -> anyhow::Result<()> {
         self.device.power_off()
+    }
+    fn nap(&self, wake_after: std::time::Duration) -> anyhow::Result<()> {
+        self.device.nap(wake_after)
     }
     fn check_update(&self) -> anyhow::Result<kindil::update::Check> {
         Ok(match &self.latest {

@@ -9,7 +9,8 @@ use crate::prefs::Store;
 use crate::reader::{self, Book, Layout, Reader};
 use crate::sync::Service;
 use crate::system::{
-    AutoSleep, Effect, Event as DeviceEvent, Idle, Mode, Step, Touches, DRIVE_SETTLE, PANEL_SETTLE,
+    AutoSleep, Effect, Event as DeviceEvent, Idle, Mode, Step, Touches, Window, DRIVE_SETTLE,
+    FETCH_AFTER, MIN_NAP, PANEL_SETTLE,
 };
 use crate::update::{self, Check, Release, Updates, Version};
 use crate::view;
@@ -103,7 +104,17 @@ enum Direction {
 
 enum Worker {
     Idle,
-    Started,
+    /// Takes ticks besides its own minute clock, which stops while dozing.
+    Started(mpsc::Sender<Tick>),
+}
+
+/// What the dashboard worker does next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tick {
+    /// Render the minute now; no network, which may still be down after a nap.
+    Draw,
+    /// Fetch what is due, then render.
+    Fetch,
 }
 
 /// UI-thread state. Borrowed briefly inside one callback, never across a
@@ -117,6 +128,8 @@ struct State {
     miqat: Worker,
     system: Mode,
     idle: Idle,
+    /// When dozing last stayed up for the network.
+    online: Option<DateTime<Utc>>,
 }
 
 /// How the app ended, for the launcher.
@@ -148,6 +161,8 @@ struct Ctx {
     /// Shared with the workers that check and install.
     updates: Arc<Mutex<Updates>>,
     exit: Arc<Mutex<Exit>>,
+    /// Timers under [`Execution::Inline`]: tests fire them one round at a time.
+    timers: Rc<RefCell<Vec<DeviceEvent>>>,
 }
 
 pub struct App {
@@ -255,6 +270,7 @@ impl App {
                 miqat: Worker::Idle,
                 system: Mode::start(Instant::now()),
                 idle: Idle::new(options.touches.count(), Instant::now()),
+                online: None,
             })),
             display: Display {
                 panel: options.panel,
@@ -269,6 +285,7 @@ impl App {
             touches: options.touches,
             updates: Arc::default(),
             exit: Arc::new(Mutex::new(Exit::Quit)),
+            timers: Rc::default(),
         };
         {
             let k = window.global::<Kindil>();
@@ -337,6 +354,13 @@ impl App {
     /// A power press, USB drive mode, ... as the device would report it.
     pub fn device_event(&self, event: DeviceEvent) {
         self.ctx.device(event);
+    }
+
+    /// Under [`Execution::Inline`], delivers the timers armed so far; timers
+    /// they arm wait for the next call. Dozing would otherwise loop forever.
+    pub fn fire_timers(&self) {
+        let due = std::mem::take(&mut *self.ctx.timers.borrow_mut());
+        due.into_iter().for_each(|event| self.ctx.device(event));
     }
 
     /// Stops Syncthing and keeps the reading position before the window goes.
@@ -923,11 +947,45 @@ impl Ctx {
                     DeviceEvent::SuspendFailed
                 }
             }),
+            Effect::Nap => {
+                // On the minute, plus a second so the clock has turned.
+                let nap = until_next_minute(Utc::now()) + Duration::from_secs(1);
+                if nap < MIN_NAP {
+                    self.after(nap, DeviceEvent::Resumed);
+                } else {
+                    self.device_later(move |host| match host.nap(nap) {
+                        Ok(()) => DeviceEvent::Resumed,
+                        Err(error) => {
+                            eprintln!("kindil: nap: {error}");
+                            DeviceEvent::SuspendFailed
+                        }
+                    });
+                }
+            }
+            Effect::Redraw => {
+                let now = Utc::now();
+                let window = {
+                    let mut state = self.state.borrow_mut();
+                    let window = Window::after_nap(state.online, now);
+                    if window == Window::Online {
+                        state.online = Some(now);
+                    }
+                    window
+                };
+                self.catch_up(Tick::Draw);
+                if window == Window::Online {
+                    let ctx = self.clone();
+                    self.later(FETCH_AFTER, move || ctx.tick_miqat(Tick::Fetch));
+                }
+                self.after(window.length(), DeviceEvent::PanelSettled);
+            }
+            Effect::Rouse => {
+                self.catch_up(Tick::Fetch);
+                self.state.borrow_mut().idle = Idle::new(self.touches.count(), Instant::now());
+            }
             Effect::Wake => {
                 self.show_system(&ui, System::App);
-                // The clock and battery moved on while the device slept.
-                self.tick_clock();
-                self.refresh_status();
+                self.catch_up(Tick::Fetch);
                 self.state.borrow_mut().idle = Idle::new(self.touches.count(), Instant::now());
             }
             Effect::RestoreLight(level) => self.background(
@@ -943,14 +1001,38 @@ impl Ctx {
         }
     }
 
-    /// Delivers `event` after `delay`; previews and tests deliver it at once.
+    /// Delivers `event` after `delay`; previews and tests deliver it on
+    /// [`App::fire_timers`].
     fn after(&self, delay: Duration, event: DeviceEvent) {
         match self.execution {
-            Execution::Inline => self.device(event),
+            Execution::Inline => self.timers.borrow_mut().push(event),
             Execution::Background => {
                 let ctx = self.clone();
                 slint::Timer::single_shot(delay, move || ctx.device(event));
             }
+        }
+    }
+
+    /// The clock, battery and dashboard moved on while the device slept.
+    fn catch_up(&self, tick: Tick) {
+        self.tick_clock();
+        self.refresh_status();
+        self.tick_miqat(tick);
+    }
+
+    fn tick_miqat(&self, tick: Tick) {
+        if let Worker::Started(ticks) = &self.state.borrow().miqat {
+            // A stopped worker has reported its error on screen already.
+            let _ = ticks.send(tick);
+        }
+    }
+
+    /// Runs `work` on the UI thread after `delay`; never under
+    /// [`Execution::Inline`], which has no timers to run it.
+    fn later(&self, delay: Duration, work: impl FnOnce() + 'static) {
+        match self.execution {
+            Execution::Inline => {}
+            Execution::Background => slint::Timer::single_shot(delay, work),
         }
     }
 
@@ -961,8 +1043,8 @@ impl Ctx {
             state.idle = state.idle.observe(self.touches.count(), now);
             state.idle.due(state.store.prefs.auto_sleep, now)
         };
-        if due {
-            self.device(DeviceEvent::Idle);
+        if let Some(event) = due {
+            self.device(event);
         }
     }
 
@@ -1120,28 +1202,28 @@ impl Ctx {
     // ── dashboard ──
 
     fn start_miqat(&self) {
-        {
-            let mut state = self.state.borrow_mut();
-            match state.miqat {
-                Worker::Started => return,
-                Worker::Idle => state.miqat = Worker::Started,
-            }
-        }
-        match self.execution {
+        match (&self.state.borrow().miqat, self.execution) {
+            (Worker::Started(_), _) => return,
             // Previews set a deterministic frame themselves; no network.
-            Execution::Inline => {}
-            Execution::Background => {
-                let path = self.config.miqat_config.clone();
-                let weak = self.weak.clone();
-                let display = self.display.clone();
-                std::thread::spawn(move || miqat_worker(&path, &weak, &display));
-            }
+            (Worker::Idle, Execution::Inline) => return,
+            (Worker::Idle, Execution::Background) => {}
         }
+        let (sender, ticks) = mpsc::channel();
+        self.state.borrow_mut().miqat = Worker::Started(sender);
+        let path = self.config.miqat_config.clone();
+        let weak = self.weak.clone();
+        let display = self.display.clone();
+        std::thread::spawn(move || miqat_worker(&path, &weak, &display, &ticks));
     }
 }
 
 /// Owns Miqat's cached weather and radar sources; renders on each minute.
-fn miqat_worker(path: &std::path::Path, weak: &slint::Weak<AppWindow>, display: &Display) {
+fn miqat_worker(
+    path: &std::path::Path,
+    weak: &slint::Weak<AppWindow>,
+    display: &Display,
+    ticks: &mpsc::Receiver<Tick>,
+) {
     let config = match miqat::config::Config::load(path) {
         Ok(config) => config,
         Err(error) => {
@@ -1174,12 +1256,20 @@ fn miqat_worker(path: &std::path::Path, weak: &slint::Weak<AppWindow>, display: 
     if show(&sources).is_err() {
         return;
     }
+    let mut tick = Tick::Fetch;
     loop {
-        sources.refresh(&config, Utc::now());
+        match tick {
+            Tick::Fetch => sources.refresh(&config, Utc::now()),
+            Tick::Draw => {}
+        }
         if show(&sources).is_err() {
             return;
         }
-        std::thread::sleep(until_next_minute(Utc::now()));
+        tick = match ticks.recv_timeout(until_next_minute(Utc::now())) {
+            Ok(tick) => tick,
+            Err(mpsc::RecvTimeoutError::Timeout) => Tick::Fetch,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
     }
 }
 

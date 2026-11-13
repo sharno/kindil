@@ -37,8 +37,12 @@ system file. A reboot always returns the Kindle to stock.
   - **Power button**: sleeps (a sleep screen, front light off, suspend to
     RAM) and wakes, with the light restored. powerd ignores the button while
     kindil runs, so kindil hears it through kernel uevents.
-  - **Sleep when idle**: Never (the default, for an always-updating wall
-    dashboard) or after 5, 15, 30 or 60 minutes without a touch.
+  - **Sleep when idle**: Doze (the default), Never, or a full sleep after
+    5, 15, 30 or 60 minutes without a touch. Doze is for an always-on wall
+    dashboard: after 2 minutes without a touch the light goes off and the
+    Kindle suspends to RAM, waking on the RTC alarm each minute to redraw the
+    clock and countdown, and every 30 minutes to fetch over Wi-Fi. The power
+    button brings it back with the light restored.
   - **USB drive mode**: plugging into a computer shows a USB screen while the
     computer has `/mnt/us`; unplugging reloads the library and resumes
     Syncthing. A cable that keeps dropping doesn't flash the screen: kindil

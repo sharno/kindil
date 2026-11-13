@@ -122,6 +122,9 @@ pub trait Host: Send + Sync {
     fn listen(&self, deliver: Deliver);
     /// Suspends to RAM; returns once the device is awake again.
     fn suspend(&self) -> anyhow::Result<()>;
+    /// Suspends to RAM with a timed wake; returns once awake, by the timer or
+    /// the power button.
+    fn nap(&self, wake_after: Duration) -> anyhow::Result<()>;
     fn restart(&self) -> anyhow::Result<()>;
     fn power_off(&self) -> anyhow::Result<()>;
     /// Asks GitHub for the latest release. Blocks: call from a worker thread.
@@ -141,6 +144,7 @@ pub struct Simulated {
 struct SimulatedState {
     brightness: Brightness,
     suspends: u32,
+    naps: u32,
     wifi: Power,
     ssh: Power,
     ssh_at_boot: Power,
@@ -152,6 +156,7 @@ impl Default for Simulated {
             state: Mutex::new(SimulatedState {
                 brightness: Brightness::new(40),
                 suspends: 0,
+                naps: 0,
                 wifi: Power::On,
                 ssh: Power::On,
                 ssh_at_boot: Power::On,
@@ -164,6 +169,11 @@ impl Simulated {
     /// How many times the device was put to sleep.
     pub fn suspends(&self) -> u32 {
         self.with(|s| s.suspends)
+    }
+
+    /// How many times the device napped while dozing.
+    pub fn naps(&self) -> u32 {
+        self.with(|s| s.naps)
     }
 
     fn with<T>(&self, f: impl FnOnce(&mut SimulatedState) -> T) -> T {
@@ -241,6 +251,11 @@ impl Host for Simulated {
     /// Wakes at once, as if the power button were pressed right away.
     fn suspend(&self) -> anyhow::Result<()> {
         self.with(|s| s.suspends += 1);
+        Ok(())
+    }
+    /// Wakes at once, as if the minute were up.
+    fn nap(&self, _: Duration) -> anyhow::Result<()> {
+        self.with(|s| s.naps += 1);
         Ok(())
     }
     fn restart(&self) -> anyhow::Result<()> {
