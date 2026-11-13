@@ -44,8 +44,10 @@ export struct Fact {
 
 global Theme {
     out property <color> ink: #000000;
-    out property <color> ink-2: #404040;
-    out property <color> ink-3: #808080;
+    out property <color> ink-2: #333333;
+    out property <color> ink-3: #4d4d4d;
+    /// Disabled text: still above the 50% black/white threshold of fast motion mode.
+    out property <color> dim: #707070;
     out property <color> line: #c0c0c0;
     out property <color> surface: #ececec;
     out property <color> paper: #ffffff;
@@ -192,7 +194,7 @@ component Button {
         text: root.text;
         font-size: root.font-size;
         font-weight: 600;
-        color: root.kind == ButtonKind.primary ? Theme.paper : (root.enabled ? Theme.ink : Theme.ink-3);
+        color: root.kind == ButtonKind.primary ? Theme.paper : (root.enabled ? Theme.ink : Theme.dim);
         horizontal-alignment: center;
         vertical-alignment: center;
     }
@@ -240,7 +242,7 @@ component SwitchRow {
                 text: root.title;
                 font-size: 23px;
                 font-weight: 600;
-                color: root.state == Switch.unavailable ? Theme.ink-3 : Theme.ink;
+                color: root.state == Switch.unavailable ? Theme.dim : Theme.ink;
             }
             if root.detail != "": Text {
                 text: root.detail;
@@ -369,7 +371,7 @@ component LightRow {
             width: 70px;
             font-size: 23px;
             font-weight: 700;
-            color: Kindil.brightness >= 0 ? Theme.ink : Theme.ink-3;
+            color: Kindil.brightness >= 0 ? Theme.ink : Theme.dim;
             horizontal-alignment: right;
             vertical-alignment: center;
         }
@@ -558,7 +560,7 @@ component BarButton {
         text: root.text;
         font-size: root.font-size;
         font-weight: 700;
-        color: root.enabled ? Theme.ink : Theme.line;
+        color: root.enabled ? Theme.ink : Theme.dim;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
@@ -749,7 +751,7 @@ component Tab {
     in property <bool> enabled: true;
     property <bool> active: Kindil.page == root.target
         || (root.target == Page.settings && Kindil.page == Page.networks);
-    property <color> color: !root.enabled ? Theme.line : (root.active ? Theme.ink : Theme.ink-3);
+    property <color> color: !root.enabled ? Theme.dim : (root.active ? Theme.ink : Theme.ink-3);
     horizontal-stretch: 1;
     Rectangle {
         x: (parent.width - self.width) / 2;
@@ -769,7 +771,7 @@ component Tab {
         Text {
             text: root.label;
             font-size: 17px;
-            font-weight: root.active ? 700 : 400;
+            font-weight: root.active ? 700 : (root.enabled ? 600 : 400);
             color: root.color;
             horizontal-alignment: center;
         }
