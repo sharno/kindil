@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use kindil::config::Config;
 use kindil::host::Simulated;
 use kindil::system::Touches;
-use kindil::ui::{App, Execution, Options, Panel};
+use kindil::ui::{App, Execution, Exit, Options, Panel};
 use slint::ComponentHandle;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -107,7 +107,7 @@ fn desktop(cli: &Cli) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "kindle")]
-fn kindle(cli: &Cli) -> anyhow::Result<()> {
+fn kindle(cli: &Cli) -> anyhow::Result<Exit> {
     use kindil::kindle::KindleHost;
     const REGULAR: &[u8] =
         include_bytes!("../crates/miqat/assets/fonts/IBMPlexSansArabic-Regular.ttf");
@@ -128,7 +128,7 @@ fn kindle(cli: &Cli) -> anyhow::Result<()> {
     kindil::signals::quit_on_termination()?;
     app.window.run()?;
     app.shutdown();
-    Ok(())
+    Ok(app.exit())
 }
 
 fn uevents() -> anyhow::Result<()> {
@@ -141,15 +141,16 @@ fn uevents() -> anyhow::Result<()> {
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let result = match &cli.mode {
-        Mode::Preview { dir } => preview(&cli, dir),
+        Mode::Preview { dir } => preview(&cli, dir).map(|()| Exit::Quit),
         #[cfg(feature = "desktop")]
-        Mode::Desktop => desktop(&cli),
+        Mode::Desktop => desktop(&cli).map(|()| Exit::Quit),
         #[cfg(feature = "kindle")]
         Mode::Kindle => kindle(&cli),
-        Mode::Uevents => uevents(),
+        Mode::Uevents => uevents().map(|()| Exit::Quit),
     };
     match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(Exit::Quit) => std::process::ExitCode::SUCCESS,
+        Ok(Exit::Restart) => std::process::ExitCode::from(kindil::update::RESTART_EXIT_CODE),
         Err(error) => {
             eprintln!("kindil: {error:#}");
             std::process::ExitCode::FAILURE

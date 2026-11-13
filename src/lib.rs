@@ -17,5 +17,6 @@ pub mod sync;
 pub mod system;
 pub mod uevent;
 pub mod ui;
+pub mod update;
 pub mod view;
 pub mod wifi;

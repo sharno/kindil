@@ -141,6 +141,11 @@ export global Kindil {
     callback device-events();
     /// Content started or stopped moving under a finger.
     callback motion(Motion);
+    /// The Updates row.
+    in property <string> update-status;
+    in property <string> update-button: "Check";
+    in property <bool> update-enabled: true;
+    callback update();
     callback restart();
     callback power-off();
     /// Auto-sleep: the choices' labels and the chosen one's index (-1: none of them).
@@ -1432,6 +1437,35 @@ component SettingsPage {
                     }
                     Text {
                         text: "The power button always sleeps and wakes. Never keeps the dashboard updating.";
+                        font-size: 17px;
+                        color: Theme.ink-3;
+                        wrap: word-wrap;
+                    }
+                }
+                Group {
+                    title: "UPDATES";
+                    HorizontalLayout {
+                        min-height: 84px;
+                        spacing: 16px;
+                        Text {
+                            text: Kindil.update-status;
+                            font-size: 20px;
+                            color: Theme.ink;
+                            wrap: word-wrap;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: Kindil.update-button;
+                                enabled: Kindil.update-enabled;
+                                clicked => { Kindil.update(); }
+                            }
+                        }
+                    }
+                    Text {
+                        text: "Signed releases from GitHub. A new version that fails in its first two minutes is replaced by the previous one.";
                         font-size: 17px;
                         color: Theme.ink-3;
                         wrap: word-wrap;

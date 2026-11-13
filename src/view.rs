@@ -6,6 +6,7 @@ use crate::prefs::Progress;
 use crate::reader::Book;
 use crate::sync::Service;
 use crate::ui::{BookItem, Fact, NetworkItem, Switch};
+use crate::update::{Updates, Version};
 use crate::wifi::{Network, Security};
 use chrono::{DateTime, TimeZone};
 use std::net::Ipv4Addr;
@@ -200,6 +201,26 @@ pub fn network(network: &Network) -> NetworkItem {
         }
         .into(),
         bars: i32::from(network.signal.bars()),
+    }
+}
+
+/// The Updates row: status line, button label, whether the button works.
+pub fn updates(updates: &Updates, current: Version) -> (String, String, bool) {
+    match updates {
+        Updates::Idle => (format!("Version {current}"), "Check".into(), true),
+        Updates::Checking => ("Checking GitHub…".into(), "Check".into(), false),
+        Updates::UpToDate => (format!("{current} is the latest"), "Check".into(), true),
+        Updates::Available(release) => (
+            format!("{} is available; you have {current}", release.version),
+            "Install".into(),
+            true,
+        ),
+        Updates::Installing(version) => (
+            format!("Installing {version}; kindil restarts when it's ready"),
+            "Install".into(),
+            false,
+        ),
+        Updates::Failed(error) => (error.clone(), "Check".into(), true),
     }
 }
 

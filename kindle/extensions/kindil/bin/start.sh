@@ -10,12 +10,12 @@ if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
   exit 0
 fi
 # Run from /var/local, not /mnt/us: in USB drive mode the computer gets /mnt/us
-# while kindil keeps running. Copied only when changed, to spare the flash.
+# while kindil keeps running. Copied only when changed, to spare the flash;
+# session.sh copies the binary it picks.
 RUN=/var/local/kindil
 mkdir -p "$RUN" /mnt/us/kindil
-for f in session.sh kindil; do
-  cmp -s "$DIR/bin/$f" "$RUN/$f" 2>/dev/null || cp "$DIR/bin/$f" "$RUN/$f"
-done
+cmp -s "$DIR/bin/session.sh" "$RUN/session.sh" 2>/dev/null ||
+  cp "$DIR/bin/session.sh" "$RUN/session.sh"
 # /var/local is 64 MB and also holds Amazon's settings: keep the log small.
 LOG="$RUN/kindil.log"
 if [ -f "$LOG" ] && [ "$(wc -c <"$LOG")" -gt 262144 ]; then

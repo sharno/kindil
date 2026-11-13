@@ -27,8 +27,10 @@ system file. A reboot always returns the Kindle to stock.
   deleted outright.
 - **Settings**: home screen, front light, a "clean screen" flash, Wi-Fi on/off
   with network status, scan and join, SSH server and SSH-at-boot switches,
-  Syncthing, device facts (battery, memory, storage, uptime), Restart and
-  Power off.
+  Syncthing, device facts (battery, memory, storage, uptime), Updates, Restart
+  and Power off.
+- **Updates over the air** from this repo's GitHub releases; see
+  [Updates](#updates).
 - **Device duties** that Amazon's UI normally performs:
   - **Power button**: sleeps (a sleep screen, front light off, suspend to
     RAM) and wakes, with the light restored. powerd ignores the button while
@@ -72,15 +74,44 @@ Restart and Power off also come back to Amazon's UI on the next boot.
 If kindil ever stops responding: SSH in and `killall kindil` (the launcher then
 restarts Amazon's UI), or hold the power button for about 20 s to reboot.
 
+## Updates
+
+**Settings → Updates → Check** asks GitHub for the latest release; **Install**
+downloads it. Nothing installs without a tap.
+
+- **Signed:** CI signs every release binary with a minisign key. kindil refuses
+  a binary that this key didn't sign, or that doesn't report the release's
+  version when run.
+- **Trial run:** the new binary goes next to the current one, and kindil
+  restarts into it (the Kindle doesn't reboot). It is kept once it has run for
+  two minutes.
+- **Rollback:** if it exits or crashes before then, or the Kindle reboots
+  mid-trial, the launcher runs the previous binary again.
+- **Scope:** only kindil's own files change; the bootloader, kernel and system
+  partition are never touched.
+
+The repo is private, so the Kindle needs a GitHub token to read releases:
+
+1. Create a fine-grained token with read-only **Contents** access to
+   `sharno/kindil` only.
+2. Save it as `kindil/github-token` on the Kindle's USB drive (that is
+   `/mnt/us/kindil/github-token`).
+
+To release: bump `version` in `Cargo.toml`, commit, then publish a GitHub
+release tagged `vX.Y.Z`. The Release workflow builds, signs and attaches
+`kindil` and `kindil.minisig`. The signing key is the `MINISIGN_SECRET_KEY`
+repository secret.
+
 ## Files on the device
 
 | Path | What |
 |---|---|
-| `/mnt/us/extensions/kindil/` | KUAL launcher and the `kindil` binary |
+| `/mnt/us/extensions/kindil/` | KUAL launcher and the `kindil` binary; during an update also `kindil.next`, `kindil.trying`, and afterwards `kindil.previous` |
 | `/var/local/kindil/` | The running copy and the log; off `/mnt/us`, which a computer takes in USB drive mode |
 | `/mnt/us/kindil/kindil.toml` | Optional settings (every key has a default) |
 | `/mnt/us/kindil/miqat.toml` | Miqat's own settings: location, prayer method |
 | `/mnt/us/kindil/prefs.toml` | Choices made on the device; safe to delete |
+| `/mnt/us/kindil/github-token` | Read-only GitHub token for updates (never logged) |
 | `/mnt/us/books/` | Books |
 | `/mnt/us/books/.kindil-trash/` | Trashed books, recoverable |
 
@@ -129,6 +160,8 @@ weather and make no requests.
 | `kindle.rs` | `Host` on the stock OS: lipc (wifid, powerd front light and battery), USBNetwork |
 | `wifi.rs` | wpa_supplicant control socket, typed SSID/passphrase |
 | `sync.rs` | Syncthing as a typed state machine |
+| `update.rs` | Over-the-air updates: GitHub releases, signature check, trial and commit |
+| `system.rs` | Sleep, wake and USB drive mode as a state machine |
 | `reader.rs`, `files.rs`, `prefs.rs` | Books, Trash, persisted choices |
 | `ghosting.rs` | When to flash the panel |
 | `vendor/slint-backend-kindle` | Display/touch backend, patched for full refresh |

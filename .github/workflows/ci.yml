@@ -33,6 +33,7 @@ jobs:
           nix develop --command bash -euo pipefail -c '
             cargo fmt --check
             cargo test --locked
+            tests/launcher.sh
             cargo clippy --locked --all-targets --features kindle -- -D warnings
           '
       - name: ARM runtime tests and static device artifact

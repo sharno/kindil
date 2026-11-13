@@ -2404,7 +2404,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "kindil"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2415,15 +2415,18 @@ dependencies = [
  "html2text",
  "i-slint-core",
  "libc",
+ "minisign-verify",
  "miqat",
  "rbook",
  "serde",
+ "serde_json",
  "slint",
  "slint-backend-kindle",
  "slint-build",
  "tempfile",
  "textwrap",
  "toml",
+ "ureq",
  "zip",
 ]
 
@@ -2641,6 +2644,12 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
+name = "minisign-verify"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e"
 
 [[package]]
 name = "miniz_oxide"

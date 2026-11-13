@@ -1,6 +1,6 @@
 [package]
 name = "kindil"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.92"
 description = "A single-process Rust shell for the first-generation Amazon Kindle Paperwhite"
@@ -17,6 +17,10 @@ clap = { version = "4.5", default-features = false, features = ["std", "derive",
 miqat = { path = "crates/miqat" }
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Over-the-air updates: GitHub's API over rustls, and CI's release signature.
+ureq = "3"
+minisign-verify = "0.2"
 toml = "1.2"
 textwrap = { version = "0.16", default-features = false }
 rbook = { version = "0.7.12", default-features = false }

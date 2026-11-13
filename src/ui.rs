@@ -11,6 +11,7 @@ use crate::sync::Service;
 use crate::system::{
     AutoSleep, Effect, Event as DeviceEvent, Idle, Mode, Step, Touches, DRIVE_SETTLE, PANEL_SETTLE,
 };
+use crate::update::{self, Check, Release, Updates, Version};
 use crate::view;
 use crate::wifi::Credentials;
 use chrono::{DateTime, Timelike, Utc};
@@ -118,6 +119,15 @@ struct State {
     idle: Idle,
 }
 
+/// How the app ended, for the launcher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exit {
+    /// Back to Amazon's UI.
+    Quit,
+    /// An update is staged: the launcher starts kindil again.
+    Restart,
+}
+
 /// Device events from any thread, queued for the UI thread.
 #[derive(Clone)]
 struct Events {
@@ -135,6 +145,9 @@ struct Ctx {
     execution: Execution,
     events: Events,
     touches: Touches,
+    /// Shared with the workers that check and install.
+    updates: Arc<Mutex<Updates>>,
+    exit: Arc<Mutex<Exit>>,
 }
 
 pub struct App {
@@ -254,11 +267,14 @@ impl App {
                 queue: Rc::new(queue),
             },
             touches: options.touches,
+            updates: Arc::default(),
+            exit: Arc::new(Mutex::new(Exit::Quit)),
         };
         {
             let k = window.global::<Kindil>();
             k.set_dashboard(dashboard.into());
             k.set_version(format!("v{}", env!("CARGO_PKG_VERSION")).into());
+            show_updates(&window, &ctx.updates, Updates::Idle);
             k.set_books_root(ctx.config.books.display().to_string().into());
             k.set_font_size(i32::from(ctx.state.borrow().store.prefs.font.px()));
             k.set_sleep_choices(model(
@@ -305,6 +321,12 @@ impl App {
         if self.ctx.state.borrow().store.prefs.sync == Power::On {
             self.ctx.toggle_sync();
         }
+        let ctx = self.ctx.clone();
+        slint::Timer::single_shot(update::SETTLE, move || ctx.commit_update());
+    }
+
+    pub fn exit(&self) -> Exit {
+        *self.ctx.exit.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn set_miqat(&self, gray: miqat::image::Gray) {
@@ -321,6 +343,15 @@ impl App {
     pub fn shutdown(&self) {
         self.ctx.release_storage();
     }
+}
+
+fn show_updates(ui: &AppWindow, state: &Mutex<Updates>, updates: Updates) {
+    let (status, button, enabled) = view::updates(&updates, Version::current());
+    let k = ui.global::<Kindil>();
+    k.set_update_status(status.into());
+    k.set_update_button(button.into());
+    k.set_update_enabled(enabled);
+    *state.lock().unwrap_or_else(|e| e.into_inner()) = updates;
 }
 
 fn install_keyboard(window: &AppWindow) {
@@ -374,6 +405,7 @@ fn wire(window: &AppWindow, ctx: &Ctx) {
     on!(on_restart => restart());
     on!(on_power_off => power_off());
     on!(on_choose_auto_sleep => choose_auto_sleep(index));
+    on!(on_update => update());
 }
 
 fn arm_clock(timer: Rc<slint::Timer>, ctx: Ctx) {
@@ -1007,6 +1039,75 @@ impl Ctx {
                     display.updated(ui, Update::Navigate);
                     notify(ui, &format!("Power off: {error}"));
                 }
+            },
+        );
+    }
+
+    // ── updates ──
+
+    /// The Updates button: check, or install what a check found.
+    fn update(&self) {
+        let Some(ui) = self.ui() else { return };
+        let updates = self
+            .updates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match updates {
+            Updates::Idle | Updates::UpToDate | Updates::Failed(_) => self.check_update(&ui),
+            Updates::Available(release) => self.install_update(&ui, release),
+            Updates::Checking | Updates::Installing(_) => {}
+        }
+    }
+
+    fn check_update(&self, ui: &AppWindow) {
+        show_updates(ui, &self.updates, Updates::Checking);
+        let updates = self.updates.clone();
+        self.background(
+            |host| host.check_update(),
+            move |ui, result| {
+                let next = match result {
+                    Ok(Check::UpToDate) => Updates::UpToDate,
+                    Ok(Check::Available(release)) => Updates::Available(release),
+                    Err(error) => Updates::Failed(format!("{error:#}")),
+                };
+                show_updates(ui, &updates, next);
+            },
+        );
+    }
+
+    fn install_update(&self, ui: &AppWindow, release: Release) {
+        show_updates(ui, &self.updates, Updates::Installing(release.version));
+        let (updates, exit) = (self.updates.clone(), self.exit.clone());
+        self.background(
+            move |host| host.stage_update(&release),
+            move |ui, result| match result {
+                Ok(()) => {
+                    *exit.lock().unwrap_or_else(|e| e.into_inner()) = Exit::Restart;
+                    // Errors only without an event loop (previews).
+                    let _ = slint::quit_event_loop();
+                }
+                Err(error) => show_updates(ui, &updates, Updates::Failed(format!("{error:#}"))),
+            },
+        );
+    }
+
+    /// A version on trial that has run for [`update::SETTLE`] is kept. Retried
+    /// while the user partition is away (USB drive mode).
+    fn commit_update(&self) {
+        self.background(
+            |host| loop {
+                match host.commit_update() {
+                    Ok(commit) => break commit,
+                    Err(error) => {
+                        eprintln!("kindil: keeping the update failed, retrying: {error:#}");
+                        std::thread::sleep(update::SETTLE);
+                    }
+                }
+            },
+            |_, commit| match commit {
+                update::Commit::Nothing => {}
+                update::Commit::Committed => eprintln!("kindil: update kept"),
             },
         );
     }

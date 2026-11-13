@@ -419,6 +419,8 @@ fn power_off_reports_a_device_that_cannot() {
 struct Recording {
     device: Simulated,
     joined: Mutex<Vec<(String, bool)>>,
+    /// What GitHub would report as the latest release.
+    latest: Option<kindil::update::Release>,
 }
 
 impl Host for Recording {
@@ -468,6 +470,20 @@ impl Host for Recording {
     }
     fn power_off(&self) -> anyhow::Result<()> {
         self.device.power_off()
+    }
+    fn check_update(&self) -> anyhow::Result<kindil::update::Check> {
+        Ok(match &self.latest {
+            Some(release) => {
+                kindil::update::Check::of(kindil::update::Version::current(), release.clone())
+            }
+            None => kindil::update::Check::UpToDate,
+        })
+    }
+    fn stage_update(&self, release: &kindil::update::Release) -> anyhow::Result<()> {
+        self.device.stage_update(release)
+    }
+    fn commit_update(&self) -> anyhow::Result<kindil::update::Commit> {
+        self.device.commit_update()
     }
 }
 
@@ -620,4 +636,42 @@ fn lists_follow_the_finger_in_fast_frames_while_it_moves() {
         pixels(&f.window) == before,
         "swiping back down returns to the top"
     );
+}
+
+#[test]
+fn updates_report_the_latest_release() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    let version = env!("CARGO_PKG_VERSION");
+    assert_eq!(f.k().get_update_status(), format!("Version {version}"));
+    f.k().invoke_update();
+    assert_eq!(
+        f.k().get_update_status(),
+        format!("{version} is the latest")
+    );
+    assert_eq!(f.k().get_update_button(), "Check");
+    assert!(f.k().get_update_enabled());
+}
+
+#[test]
+fn an_update_that_cannot_install_says_why_and_kindil_keeps_running() {
+    let release = kindil::update::Release::decode(
+        r#"{"tag_name": "v999.0.0", "assets": [
+            {"name": "kindil", "url": "https://api.github.com/a/1"},
+            {"name": "kindil.minisig", "url": "https://api.github.com/a/2"}
+        ]}"#,
+    )
+    .unwrap();
+    let f = Fixture::new(Arc::new(Recording {
+        latest: Some(release),
+        ..Recording::default()
+    }));
+    f.k().invoke_update();
+    assert!(f
+        .k()
+        .get_update_status()
+        .starts_with("999.0.0 is available"));
+    assert_eq!(f.k().get_update_button(), "Install");
+    f.k().invoke_update();
+    assert!(f.k().get_update_status().contains("cannot update"));
+    assert_eq!(f.app.exit(), kindil::ui::Exit::Quit);
 }

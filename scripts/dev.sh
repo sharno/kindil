@@ -113,6 +113,7 @@ check)
 	cargo fmt --check
 	cargo clippy --all-targets -- -D warnings
 	cargo test
+	tests/launcher.sh
 	;;
 help) sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//' ;;
 *) die "unknown command: $1" ;;

@@ -4,6 +4,7 @@
 //! USBNetwork's dropbear, the frontlight driver). [`Simulated`] returns fixtures
 //! and never opens a device, so previews and tests cannot touch hardware.
 use crate::battery::Battery;
+use crate::update::{Check, Commit, Release};
 use crate::wifi::{Credentials, Network};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
@@ -123,6 +124,12 @@ pub trait Host: Send + Sync {
     fn suspend(&self) -> anyhow::Result<()>;
     fn restart(&self) -> anyhow::Result<()>;
     fn power_off(&self) -> anyhow::Result<()>;
+    /// Asks GitHub for the latest release. Blocks: call from a worker thread.
+    fn check_update(&self) -> anyhow::Result<Check>;
+    /// Downloads, verifies and stages a release for the launcher's next start.
+    fn stage_update(&self, release: &Release) -> anyhow::Result<()>;
+    /// Keeps a version on trial once it has run long enough.
+    fn commit_update(&self) -> anyhow::Result<Commit>;
 }
 
 /// Fixture device for previews and tests. Switches remember their state so UI
@@ -241,6 +248,15 @@ impl Host for Simulated {
     }
     fn power_off(&self) -> anyhow::Result<()> {
         anyhow::bail!("a simulated device cannot power off")
+    }
+    fn check_update(&self) -> anyhow::Result<Check> {
+        Ok(Check::UpToDate)
+    }
+    fn stage_update(&self, _: &Release) -> anyhow::Result<()> {
+        anyhow::bail!("a simulated device cannot update")
+    }
+    fn commit_update(&self) -> anyhow::Result<Commit> {
+        Ok(Commit::Nothing)
     }
 }
 
