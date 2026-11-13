@@ -1,7 +1,9 @@
 //! Wires the Slint window to the device. Callbacks are one-liners into
 //! [`Ctx`]; slow device calls run on worker threads and report back through
 //! the event loop, so a timeout never freezes a tap.
+use crate::battery::{Battery, Charge};
 use crate::config::{Config, Dashboard};
+use crate::drain::{Drain, Gauge};
 use crate::files::{FileName, Files, Trashed};
 use crate::ghosting::{Ghosting, Refresh, Update};
 use crate::host::{BootStart, Brightness, DeviceInfo, Host, Power, Ssh, Wifi};
@@ -68,7 +70,7 @@ struct Display {
 impl Display {
     fn updated(&self, ui: &AppWindow, update: Update) {
         let refresh = {
-            let mut ghosting = self.ghosting.lock().unwrap_or_else(|e| e.into_inner());
+            let mut ghosting = lock(&self.ghosting);
             let (next, refresh) = ghosting.after(update);
             *ghosting = next;
             refresh
@@ -134,6 +136,11 @@ struct State {
     online: Option<DateTime<Utc>>,
 }
 
+/// A poisoned lock still holds the last value written, which is all kindil needs.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// How the app ended, for the launcher.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exit {
@@ -163,6 +170,9 @@ struct Ctx {
     /// Shared with the workers that check and install.
     updates: Arc<Mutex<Updates>>,
     exit: Arc<Mutex<Exit>>,
+    /// The gauge at this doze's last online window, on battery; shared with
+    /// the worker that reads the next one.
+    doze_gauge: Arc<Mutex<Option<Gauge>>>,
     /// Timers under [`Execution::Inline`]: tests fire them one round at a time.
     timers: Rc<RefCell<Vec<DeviceEvent>>>,
     now: fn() -> DateTime<Utc>,
@@ -295,6 +305,7 @@ impl App {
             touches: options.touches,
             updates: Arc::default(),
             exit: Arc::new(Mutex::new(Exit::Quit)),
+            doze_gauge: Arc::default(),
             timers: Rc::default(),
         };
         {
@@ -353,7 +364,7 @@ impl App {
     }
 
     pub fn exit(&self) -> Exit {
-        *self.ctx.exit.lock().unwrap_or_else(|e| e.into_inner())
+        *lock(&self.ctx.exit)
     }
 
     pub fn set_miqat(&self, gray: miqat::image::Gray) {
@@ -385,7 +396,7 @@ fn show_updates(ui: &AppWindow, state: &Mutex<Updates>, updates: Updates) {
     k.set_update_status(status.into());
     k.set_update_button(button.into());
     k.set_update_enabled(enabled);
-    *state.lock().unwrap_or_else(|e| e.into_inner()) = updates;
+    *lock(&state) = updates;
 }
 
 fn install_keyboard(window: &AppWindow) {
@@ -958,6 +969,42 @@ impl Ctx {
         }
     }
 
+    /// Compares the gauge with the last online window's and shows the draw.
+    fn measure_doze(&self, now: DateTime<Utc>) {
+        let last = self.doze_gauge.clone();
+        self.background(
+            move |host| {
+                let info = host.info();
+                match (info.battery, info.charge) {
+                    (
+                        Battery::Known {
+                            charge: Charge::Discharging,
+                            ..
+                        },
+                        Some(left),
+                    ) => Some(Gauge { at: now, left }),
+                    _ => None,
+                }
+            },
+            move |ui, gauge| {
+                let from = std::mem::replace(&mut *lock(&last), gauge);
+                if let Some(drain) = from
+                    .zip(gauge)
+                    .and_then(|(from, to)| Drain::between(from, to))
+                {
+                    eprintln!(
+                        "kindil: doze drew {} mA over {} min, {} mAh left",
+                        drain.milliamps,
+                        drain.over.num_minutes(),
+                        drain.left.0
+                    );
+                    ui.global::<Kindil>()
+                        .set_doze_draw(view::doze_draw(drain).into());
+                }
+            },
+        );
+    }
+
     fn reconnect_wifi(&self) {
         self.background(
             |host| host.reconnect_wifi(),
@@ -1016,6 +1063,7 @@ impl Ctx {
                 };
                 self.catch_up(Tick::Draw);
                 if window == Window::Online {
+                    self.measure_doze(now);
                     self.reconnect_wifi();
                     let ctx = self.clone();
                     self.later(FETCH_AFTER, move || ctx.tick_miqat(Tick::Fetch));
@@ -1023,6 +1071,8 @@ impl Ctx {
                 self.after(window.length(), DeviceEvent::PanelSettled);
             }
             Effect::Rouse => {
+                // Awake time would count against the doze.
+                *lock(&self.doze_gauge) = None;
                 self.catch_up(Tick::Fetch);
                 self.state.borrow_mut().idle = Idle::new(self.touches.count(), Instant::now());
             }
@@ -1174,11 +1224,7 @@ impl Ctx {
     /// The Updates button: check, or install what a check found.
     fn update(&self) {
         let Some(ui) = self.ui() else { return };
-        let updates = self
-            .updates
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let updates = lock(&self.updates).clone();
         match updates {
             Updates::Idle | Updates::UpToDate | Updates::Failed(_) => self.check_update(&ui),
             Updates::Available(release) => self.install_update(&ui, release),
@@ -1209,7 +1255,7 @@ impl Ctx {
             move |host| host.stage_update(&release),
             move |ui, result| match result {
                 Ok(()) => {
-                    *exit.lock().unwrap_or_else(|e| e.into_inner()) = Exit::Restart;
+                    *lock(&exit) = Exit::Restart;
                     // Errors only without an event loop (previews).
                     let _ = slint::quit_event_loop();
                 }

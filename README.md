@@ -37,7 +37,8 @@ and a reboot always returns the Kindle to stock.
   - **Remote access**: SSH server and SSH-at-boot switches, Syncthing.
   - **Power**: sleep when idle, start at boot, Exit to Kindle, Restart and
     Power off.
-  - **Updates** and **About** (battery, memory, storage, uptime).
+  - **Updates** and **About** (battery, memory, storage, uptime, and the
+    battery draw measured between doze's online windows).
 - **Updates over the air** from this repo's GitHub releases; see
   [Updates](#updates).
 - **Device duties** that Amazon's UI normally performs:

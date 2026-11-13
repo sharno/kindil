@@ -3,6 +3,7 @@
 pub mod battery;
 pub mod config;
 pub mod dashboards;
+pub mod drain;
 pub mod files;
 pub mod frontlight;
 pub mod ghosting;

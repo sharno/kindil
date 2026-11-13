@@ -19,6 +19,8 @@ use std::time::Duration;
 
 const INTERFACE: &str = "wlan0";
 const WIFI_SETTLE: Duration = Duration::from_secs(2);
+/// The PW1's fuel gauge; it stalls while suspended and catches up on resume.
+const GAUGE_CHARGE: &str = "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_mAH";
 /// USBNetwork toggles dropbear when configured with USE_WIFI_SSHD_ONLY.
 const USBNET_TOGGLE: &str = "/mnt/us/usbnet/bin/usbnetwork";
 const USBNET_AT_BOOT: &str = "/mnt/us/usbnet/auto";
@@ -197,6 +199,10 @@ impl Host for KindleHost {
     fn info(&self) -> DeviceInfo {
         DeviceInfo {
             battery: powerd_battery().unwrap_or_else(|_| crate::battery::read(Path::new("/sys"))),
+            charge: std::fs::read_to_string(GAUGE_CHARGE)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+                .map(crate::drain::MilliampHours),
             memory: std::fs::read_to_string("/proc/meminfo")
                 .ok()
                 .and_then(|text| parse_meminfo(&text)),

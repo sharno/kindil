@@ -28,7 +28,7 @@ pub const DRIVE_SETTLE: Duration = Duration::from_secs(3);
 pub const DOZE_AFTER: Duration = Duration::from_secs(120);
 /// Awake after a nap: long enough to render the minute and for the panel to
 /// show it.
-pub const DRAW_WINDOW: Duration = Duration::from_secs(3);
+pub const DRAW_WINDOW: Duration = Duration::from_millis(1500);
 /// While dozing, how often kindil stays up for Wi-Fi to fetch the weather.
 pub const ONLINE_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(30);
 /// Awake that long when online: Wi-Fi reconnects in about 15 s after a nap.

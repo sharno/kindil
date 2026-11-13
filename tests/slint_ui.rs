@@ -2,6 +2,7 @@
 //! device. Coordinates are the 758×1024 panel's; see ui/app.slint for layout.
 use kindil::battery::{Battery, Charge};
 use kindil::config::Config;
+use kindil::drain::MilliampHours;
 use kindil::host::{Host, Simulated};
 use kindil::preview::{self, drag, pixels, tap};
 use kindil::system::{Drive, Event, Touches};
@@ -40,6 +41,14 @@ struct Fixture {
 
 impl Fixture {
     fn new(host: Arc<dyn Host>) -> Self {
+        // Half a minute from the next one: dozing always naps, and the
+        // minute never turns mid-test.
+        Self::with_clock(host, || {
+            chrono::DateTime::from_timestamp(1_794_398_430, 0).unwrap()
+        })
+    }
+
+    fn with_clock(host: Arc<dyn Host>, now: fn() -> chrono::DateTime<chrono::Utc>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let books = dir.path().join("books");
         std::fs::create_dir(&books).unwrap();
@@ -64,9 +73,7 @@ impl Fixture {
             },
             execution: Execution::Inline,
             touches: Touches::default(),
-            // Half a minute from the next one: dozing always naps, and the
-            // minute never turns mid-test.
-            now: || chrono::DateTime::from_timestamp(1_794_398_430, 0).unwrap(),
+            now,
         })
         .unwrap();
         app.refresh_now();
@@ -478,6 +485,29 @@ fn dozing_keeps_the_screen_and_naps_each_minute_until_a_press() {
     assert_eq!(host.brightness().unwrap().percent(), 40);
     f.app.fire_timers();
     assert_eq!(host.naps(), 3, "awake: no more naps");
+}
+
+#[test]
+fn dozing_on_battery_measures_its_draw_each_online_window() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static CLOCK: AtomicI64 = AtomicI64::new(1_794_398_430);
+    let host = Arc::new(Simulated::default());
+    host.set_battery(Battery::Known {
+        percent: 50,
+        charge: Charge::Discharging,
+    });
+    host.set_charge(MilliampHours(623));
+    let f = Fixture::with_clock(host.clone(), || {
+        chrono::DateTime::from_timestamp(CLOCK.load(Ordering::Relaxed), 0).unwrap()
+    });
+    f.app.device_event(Event::Doze);
+    // The first nap's wake goes online and reads the gauge.
+    (0..2).for_each(|_| f.app.fire_timers());
+    assert_eq!(f.k().get_doze_draw(), "", "one reading is no draw yet");
+    CLOCK.fetch_add(30 * 60, Ordering::Relaxed);
+    host.set_charge(MilliampHours(620));
+    f.app.fire_timers();
+    assert_eq!(f.k().get_doze_draw(), "6 mA · 4 days left");
 }
 
 #[test]

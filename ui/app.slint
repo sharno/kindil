@@ -158,6 +158,8 @@ export global Kindil {
     callback update();
     callback restart();
     callback power-off();
+    /// The battery draw measured over the last stretch of dozing; empty until one is.
+    in property <string> doze-draw;
     /// Auto-sleep: the choices' labels and the chosen one's index (-1: none of them).
     in property <[string]> sleep-choices;
     in property <int> auto-sleep: 0;
@@ -1622,6 +1624,26 @@ component AboutSettings inherits SectionPage {
             }
             Text {
                 text: fact.value;
+                font-size: 20px;
+                font-weight: 600;
+                color: Theme.ink;
+                vertical-alignment: center;
+            }
+        }
+    }
+    if Kindil.doze-draw != "": Group {
+        title: "BATTERY WHILE DOZING";
+        HorizontalLayout {
+            min-height: 52px;
+            Text {
+                text: "Measured draw";
+                font-size: 20px;
+                color: Theme.ink-2;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: Kindil.doze-draw;
                 font-size: 20px;
                 font-weight: 600;
                 color: Theme.ink;

@@ -150,6 +150,15 @@ pub fn duration(duration: Duration) -> String {
     }
 }
 
+/// The About page's doze row: the draw and how long a charge lasts at it.
+pub fn doze_draw(drain: crate::drain::Drain) -> String {
+    match drain.hours_left() {
+        Some(hours) if hours >= 48 => format!("{} mA · {} days left", drain.milliamps, hours / 24),
+        Some(hours) => format!("{} mA · {hours} h left", drain.milliamps),
+        None => format!("{} mA", drain.milliamps),
+    }
+}
+
 pub fn facts(info: &DeviceInfo, version: &str) -> Vec<Fact> {
     let fact = |label: &str, value: String| Fact {
         label: label.into(),
@@ -291,6 +300,7 @@ mod tests {
                 percent: 82,
                 charge: Charge::Charging,
             },
+            charge: None,
             memory: Some(Memory {
                 total_kib: 255_000,
                 available_kib: 171_000,

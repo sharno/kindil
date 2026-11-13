@@ -105,6 +105,8 @@ pub struct Storage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub battery: Battery,
+    /// The fuel gauge's remaining charge, where the board reports it.
+    pub charge: Option<crate::drain::MilliampHours>,
     pub memory: Option<Memory>,
     pub storage: Option<Storage>,
     pub uptime: Option<Duration>,
@@ -162,6 +164,7 @@ struct SimulatedState {
     suspends: u32,
     naps: u32,
     battery: Battery,
+    charge: Option<crate::drain::MilliampHours>,
     wifi: Power,
     ssh: Power,
     ssh_at_boot: Power,
@@ -179,6 +182,7 @@ impl Default for Simulated {
                     percent: 82,
                     charge: crate::battery::Charge::Charging,
                 },
+                charge: None,
                 wifi: Power::On,
                 ssh: Power::On,
                 ssh_at_boot: Power::On,
@@ -196,6 +200,10 @@ impl Simulated {
 
     pub fn set_battery(&self, battery: Battery) {
         self.with(|s| s.battery = battery);
+    }
+
+    pub fn set_charge(&self, charge: crate::drain::MilliampHours) {
+        self.with(|s| s.charge = Some(charge));
     }
 
     /// How many times the device napped while dozing.
@@ -274,6 +282,7 @@ impl Host for Simulated {
     fn info(&self) -> DeviceInfo {
         DeviceInfo {
             battery: self.with(|s| s.battery),
+            charge: self.with(|s| s.charge),
             memory: Some(Memory {
                 total_kib: 255_000,
                 available_kib: 171_000,
