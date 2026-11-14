@@ -210,14 +210,11 @@ impl Wpa {
     /// access point; returns its id.
     fn add(&self, credentials: &Credentials, priority: u32) -> anyhow::Result<u32> {
         let id: u32 = self.command("ADD_NETWORK")?.trim().parse()?;
-        let hex = |ssid: &Ssid| {
-            ssid.0
-                .bytes()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        };
+        // Quoted: the PW1's wpa_supplicant takes an unquoted name literally,
+        // not as hex. Everything between the first and last quote is the
+        // value, so quotes inside need no escaping (and get none).
         let mut settings = vec![
-            format!("SET_NETWORK {id} ssid {}", hex(credentials.ssid())),
+            format!("SET_NETWORK {id} ssid \"{}\"", credentials.ssid().0),
             // Also finds a network that hides its name.
             format!("SET_NETWORK {id} scan_ssid 1"),
             format!("SET_NETWORK {id} priority {priority}"),
@@ -229,12 +226,8 @@ impl Wpa {
                 format!("SET_NETWORK {id} proto RSN WPA"),
                 format!("SET_NETWORK {id} pairwise CCMP TKIP"),
                 format!("SET_NETWORK {id} group CCMP TKIP"),
-                // Printable ASCII without quotes or backslashes needs no escaping;
-                // the quoted form is wpa_supplicant's passphrase syntax.
-                format!(
-                    "SET_NETWORK {id} psk \"{}\"",
-                    passphrase.0.replace('\\', "\\\\").replace('"', "\\\"")
-                ),
+                // A quoted passphrase; taken literally, as the name is.
+                format!("SET_NETWORK {id} psk \"{}\"", passphrase.0),
             ]),
         }
         let result = settings
@@ -373,6 +366,76 @@ mod tests {
         let wpa = Wpa::open_path(&server_path).unwrap();
         assert_eq!(wpa.command("PING").unwrap(), "PONG\n");
         handle.join().unwrap();
+    }
+
+    /// A fake wpa_supplicant that records every command and answers like
+    /// the real one: a network id for ADD_NETWORK, OK otherwise.
+    fn recording_supplicant(
+        dir: &Path,
+        commands: usize,
+    ) -> (PathBuf, std::thread::JoinHandle<Vec<String>>) {
+        let path = dir.join("wlan0");
+        let server = UnixDatagram::bind(&path).unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut next_id = 0;
+            (0..commands)
+                .map(|_| {
+                    let mut buffer = [0u8; 512];
+                    let (n, from) = server.recv_from(&mut buffer).unwrap();
+                    let command = String::from_utf8_lossy(&buffer[..n]).into_owned();
+                    let reply = if command == "ADD_NETWORK" {
+                        next_id += 1;
+                        format!("{}\n", next_id - 1)
+                    } else {
+                        "OK\n".to_string()
+                    };
+                    server
+                        .send_to(reply.as_bytes(), from.as_pathname().unwrap())
+                        .unwrap();
+                    command
+                })
+                .collect()
+        });
+        (path, handle)
+    }
+
+    #[test]
+    fn loads_networks_with_quoted_names_and_passwords_most_preferred_first() {
+        let dir = tempfile::tempdir().unwrap();
+        // AP_SCAN, REMOVE_NETWORK, then ADD, 8 SETs and ENABLE for the WPA
+        // network, ADD, 4 SETs and ENABLE for the open one.
+        let (path, handle) = recording_supplicant(dir.path(), 2 + 10 + 6);
+        let wpa = Wpa::open_path(&path).unwrap();
+        let networks = [
+            Credentials::parse("Café \"Home\"".into(), "pa\\ss \"word\"".into()).unwrap(),
+            Credentials::parse("Library".into(), String::new()).unwrap(),
+        ];
+        wpa.load(&networks).unwrap();
+        let sent = handle.join().unwrap();
+        assert_eq!(
+            sent,
+            [
+                "AP_SCAN 1",
+                "REMOVE_NETWORK all",
+                "ADD_NETWORK",
+                // Taken literally between the outer quotes: no hex, no escapes.
+                "SET_NETWORK 0 ssid \"Café \"Home\"\"",
+                "SET_NETWORK 0 scan_ssid 1",
+                "SET_NETWORK 0 priority 2",
+                "SET_NETWORK 0 key_mgmt WPA-PSK",
+                "SET_NETWORK 0 proto RSN WPA",
+                "SET_NETWORK 0 pairwise CCMP TKIP",
+                "SET_NETWORK 0 group CCMP TKIP",
+                "SET_NETWORK 0 psk \"pa\\ss \"word\"\"",
+                "ENABLE_NETWORK 0",
+                "ADD_NETWORK",
+                "SET_NETWORK 1 ssid \"Library\"",
+                "SET_NETWORK 1 scan_ssid 1",
+                "SET_NETWORK 1 priority 1",
+                "SET_NETWORK 1 key_mgmt NONE",
+                "ENABLE_NETWORK 1",
+            ]
+        );
     }
 
     #[test]

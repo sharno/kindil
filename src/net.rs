@@ -379,9 +379,12 @@ fn terminate(file: &str) {
 /// answers on its control socket.
 fn spawn_supplicant() -> anyhow::Result<Child> {
     let mut child = Command::new(WPA)
-        .args(["-i", INTERFACE, "-D", "wext", "-c", WPA_CONF, "-P", WPA_PID])
+        .args(["-i", INTERFACE, "-D", "wext", "-c", WPA_CONF])
         .stdout(std::process::Stdio::null())
         .spawn()?;
+    // wpa_supplicant writes a pid file only when it daemonizes; kindil's
+    // own stop and bin/session.sh find it by this one.
+    std::fs::write(WPA_PID, child.id().to_string())?;
     let since = Instant::now();
     while wifi::open(INTERFACE).is_err() {
         if let Some(status) = child.try_wait()? {
@@ -454,7 +457,13 @@ pub fn network_id(reply: &str, ssid: &str) -> Option<u32> {
     reply.lines().skip(1).find_map(|line| {
         let mut columns = line.split('\t');
         let id = columns.next()?.trim().parse().ok()?;
-        (columns.next()? == ssid).then_some(id)
+        // The PW1's wpa_supplicant shows names in brackets.
+        let name = columns.next()?;
+        let name = name
+            .strip_prefix('[')
+            .and_then(|n| n.strip_suffix(']'))
+            .unwrap_or(name);
+        (name == ssid).then_some(id)
     })
 }
 
