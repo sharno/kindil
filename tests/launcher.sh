@@ -21,7 +21,7 @@ chmod +x "$T"/stub/*
 SERVICES="$(sed -n 's/^SERVICES="\(.*\)"$/\1/p' "$SESSION")"
 BOOT_SERVICES="$(sed -n 's/^SERVICES="\(.*\)"$/\1/p' "$(dirname "$SESSION")/boot.sh")"
 # Started from KUAL: Amazon's services, X and Amazon's UI are up.
-kual() { { echo "$SERVICES" | tr ' ' '\n'; printf 'x\nlab126_gui\n'; } >"$T/jobs"; }
+kual() { { echo "$SERVICES" | tr ' ' '\n'; printf 'wifid\nx\nlab126_gui\n'; } >"$T/jobs"; }
 [ -n "$SERVICES" ] || { echo "FAIL no SERVICES in session.sh"; exit 1; }
 kual
 sed -e "s#^EXT=.*#EXT=$T/ext#" \
@@ -134,6 +134,6 @@ rm -f "$T/upstart"
 : >"$T/jobs"
 run
 expect "after a standalone boot, leaving starts Amazon's services, then X and with it Amazon's UI" \
-  "$(tr '\n' ',' <"$T/upstart")" "$(for j in $SERVICES; do printf 'start %s,' "$j"; done)start x,"
+  "$(tr '\n' ',' <"$T/upstart")" "start wifid,$(for j in $SERVICES; do printf 'start %s,' "$j"; done)start x,"
 
 expect "session.sh and boot.sh stop and start the same services" "$SERVICES" "$BOOT_SERVICES"

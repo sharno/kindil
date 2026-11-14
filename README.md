@@ -53,8 +53,13 @@ and a reboot always returns the Kindle to stock.
     clock and countdown, and every 30 minutes to fetch over Wi-Fi. The power
     button brings it back with the light restored. wifid never hears of a
     suspend kindil starts, so kindil switches Wi-Fi off and on after one.
-    And whatever else leaves Wi-Fi on but not connected, kindil switches it
-    off and on once it has been down for 4 minutes it was awake.
+    While kindil runs, it runs Wi-Fi itself instead of Amazon's wifid: once
+    wifid has handed wpa_supplicant the saved networks, kindil stops it and
+    does the DHCP, so after a nap it is back online in about a second instead
+    of the 10 s wifid's off-and-on takes. Leaving kindil starts wifid again.
+    Whatever else leaves Wi-Fi on but not connected, kindil joins again once
+    it has been down for 4 minutes it was awake, and hands Wi-Fi back to
+    wifid if that fails twice.
   - **USB drive mode**: plugging into a computer shows a USB screen while the
     computer has `/mnt/us`; unplugging reloads the library and resumes
     Syncthing. A cable that keeps dropping doesn't flash the screen: kindil

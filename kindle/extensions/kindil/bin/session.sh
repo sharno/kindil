@@ -38,6 +38,7 @@ restore() {
   lipc-set-prop com.lab126.blanket load usb
   lipc-set-prop com.lab126.blanket load splash
   log "starting the Kindle UI"
+  wifi_back
   # A standalone boot stopped these and X: Amazon's UI needs them all.
   for job in $SERVICES; do running "$job" || start "$job"; done
   if running x; then start lab126_gui; else start x; fi
@@ -46,6 +47,17 @@ restore() {
 
 # Starting or running, by upstart's goal.
 running() { status "$1" 2>/dev/null | grep -q start/; }
+
+# kindil ran Wi-Fi itself (src/net.rs): its DHCP client goes, wifid comes
+# back and takes over wpa_supplicant again.
+DHCP_PID=/var/run/kindil-udhcpc.pid
+wifi_back() {
+  if [ -f "$DHCP_PID" ]; then
+    kill "$(cat "$DHCP_PID")" 2>/dev/null
+    rm -f "$DHCP_PID"
+  fi
+  running wifid || start wifid
+}
 
 # Copies the binary to run into /var/local, which stays when a computer takes
 # /mnt/us. A staged update (kindil.next, written by kindil after checking its

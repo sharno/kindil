@@ -68,6 +68,9 @@ amazon_ui() {
   [ -f "$SKIP" ] || return 0
   rm -f "$SKIP"
   log "starting Amazon's UI with its framework"
+  # kindil stops wifid while it runs Wi-Fi itself; session.sh starts it
+  # again, unless kindil never got that far.
+  running wifid || start wifid
   services start
   if ! running x; then
     # Stopped by a standalone boot: X brings up the rest of Amazon's UI.

@@ -48,7 +48,7 @@ tries() { cat "$T/state/boot-tries" 2>/dev/null || echo 0; }
 reset() {
   rm -rf "$T/state" "$T/starts" "$T/pid" "$T/BOOT" "$T/SKIP" "$T/upstart"
   echo 1 >"$T/up"
-  { echo "$SERVICES" | tr ' ' '\n'; echo x; } >"$T/jobs"
+  { echo "$SERVICES" | tr ' ' '\n'; printf 'wifid\nx\n'; } >"$T/jobs"
 }
 skip() { if [ -f "$T/SKIP" ]; then echo skip; else echo framework; fi; }
 upstart() { cat "$T/upstart" 2>/dev/null | tr '\n' ','; }
@@ -123,10 +123,10 @@ boot a
 boot b
 touch "$T/SKIP"
 rm -f "$T/upstart"
-{ echo "$SERVICES" | tr ' ' '\n'; echo x; } >"$T/jobs"
+{ echo "$SERVICES" | tr ' ' '\n'; printf 'wifid\nx\n'; } >"$T/jobs"
 boot c
 expect "past the failed-boot limit Amazon's UI comes with its framework" "$(starts) $(skip) $(upstart)" "2 framework "
-{ echo "$SERVICES" | tr ' ' '\n'; printf 'x\nlab126_gui\n'; } >"$T/jobs"
+{ echo "$SERVICES" | tr ' ' '\n'; printf 'wifid\nx\nlab126_gui\n'; } >"$T/jobs"
 touch "$T/SKIP"
 boot d
 expect "a job from before 0.6.2 restarts Amazon's UI, which is already up" "$(skip) $(upstart)" "framework stop lab126_gui,start lab126_gui,"

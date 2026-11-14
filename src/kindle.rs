@@ -6,7 +6,7 @@ use crate::frontlight::Frontlight;
 use crate::host::{
     Boot, BootStart, Brightness, Deliver, DeviceInfo, Host, Memory, Power, Ssh, Storage, Wifi,
 };
-use crate::lipc;
+use crate::net::Net;
 use crate::system::{self, Event};
 use crate::uevent::Uevent;
 use crate::update::{Check, Commit, Github, Release, Slots, Version};
@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const INTERFACE: &str = "wlan0";
-const WIFI_SETTLE: Duration = Duration::from_secs(2);
+/// How long wifid may take at boot to hand wpa_supplicant the networks.
+const WIFI_TAKEOVER: Duration = Duration::from_secs(180);
 /// udhcpc's lease for [`INTERFACE`] (`/usr/share/udhcpc/default.script`).
 const DHCP_LEASE: &str = "/tmp/wlan0";
 /// The name servers udhcpc got, and where the resolver reads them
@@ -56,6 +57,7 @@ const UPDATE_TRIAL: &str = "/var/local/kindil/trying";
 
 pub struct KindleHost {
     frontlight: Result<Frontlight, String>,
+    net: Arc<Net>,
 }
 
 impl KindleHost {
@@ -63,15 +65,8 @@ impl KindleHost {
     pub fn open() -> Self {
         Self {
             frontlight: Frontlight::open().map_err(|e| e.to_string()),
+            net: Arc::default(),
         }
-    }
-}
-
-fn wifi_power() -> anyhow::Result<Power> {
-    match lipc::get("com.lab126.wifid", "enable")?.as_str() {
-        "1" => Ok(Power::On),
-        "0" => Ok(Power::Off),
-        other => anyhow::bail!("unexpected wifid enable value {other:?}"),
     }
 }
 
@@ -94,22 +89,6 @@ pub fn parse_capacity(text: &str) -> Option<u8> {
     Some(percent.min(100))
 }
 
-impl KindleHost {
-    /// Switches wifid off and on again, if it is on.
-    fn cycle_wifi() -> anyhow::Result<()> {
-        match wifi_power()? {
-            Power::Off => Ok(()),
-            Power::On => {
-                lipc::set("com.lab126.wifid", "enable", "0")?;
-                // wifid applies a change asynchronously: an immediate switch
-                // back on can land before it has gone down.
-                std::thread::sleep(WIFI_SETTLE);
-                lipc::set("com.lab126.wifid", "enable", "1")
-            }
-        }
-    }
-}
-
 impl Host for KindleHost {
     fn brightness(&self) -> anyhow::Result<Brightness> {
         let light = self
@@ -128,7 +107,7 @@ impl Host for KindleHost {
     }
 
     fn wifi(&self) -> Wifi {
-        match wifi_power() {
+        match self.net.power() {
             Err(e) => Wifi::Unavailable(e.to_string()),
             Ok(Power::Off) => Wifi::Off,
             Ok(Power::On) => match wifi::open(INTERFACE).and_then(|wpa| Ok((wpa.link()?, wpa))) {
@@ -144,15 +123,11 @@ impl Host for KindleHost {
     }
 
     fn set_wifi(&self, power: Power) -> anyhow::Result<()> {
-        let value = match power {
-            Power::On => "1",
-            Power::Off => "0",
-        };
-        lipc::set("com.lab126.wifid", "enable", value)
+        self.net.set(power)
     }
 
     fn reconnect_wifi(&self) -> anyhow::Result<()> {
-        Self::cycle_wifi()
+        self.net.reconnect()
     }
 
     fn scan(&self) -> anyhow::Result<Vec<Network>> {
@@ -274,7 +249,11 @@ impl Host for KindleHost {
                 eprintln!("kindil: Wi-Fi: {error}");
             }
         });
-        std::thread::spawn(|| watch_wifi(self_reconnect));
+        let net = self.net.clone();
+        std::thread::spawn(move || {
+            take_over_wifi(&net);
+            watch_wifi(&net);
+        });
     }
 
     fn suspend(&self) -> anyhow::Result<()> {
@@ -380,8 +359,8 @@ fn wifid() -> anyhow::Result<()> {
 }
 
 /// Whether Wi-Fi, switched on, has a connection with an address.
-fn wifi_seen() -> system::WifiSeen {
-    match wifi_power() {
+fn wifi_seen(net: &Net) -> system::WifiSeen {
+    match net.power() {
         Ok(Power::Off) => system::WifiSeen::Off,
         Err(_) => system::WifiSeen::Down,
         Ok(Power::On) => match wifi::open(INTERFACE).and_then(|wpa| wpa.link()) {
@@ -391,25 +370,54 @@ fn wifi_seen() -> system::WifiSeen {
     }
 }
 
-fn self_reconnect() {
-    if let Err(error) = KindleHost::cycle_wifi() {
-        eprintln!("kindil: Wi-Fi watchdog: {error}");
+/// Waits for wifid to give wpa_supplicant the saved networks, then runs
+/// Wi-Fi without it; until then, and if this fails, wifid keeps it.
+fn take_over_wifi(net: &Net) {
+    let since = std::time::Instant::now();
+    while since.elapsed() < WIFI_TAKEOVER {
+        match net.take_over() {
+            Ok(true) => {
+                eprintln!("kindil: running Wi-Fi without wifid");
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!("kindil: Wi-Fi takeover: {error}"),
+        }
+        std::thread::sleep(Duration::from_secs(5));
     }
+    eprintln!("kindil: no saved networks reached wpa_supplicant; wifid keeps Wi-Fi");
 }
 
-/// Whatever left Wi-Fi on but stuck (a suspend wifid never heard of, a
-/// script, the router), cycling wifid brings it back: checked each minute
-/// kindil is awake. Time suspended doesn't count, so a dozing Kindle,
-/// which reconnects in its online windows, is rarely touched.
-fn watch_wifi(reconnect: fn()) {
+/// Whatever left Wi-Fi on but stuck (a suspend nobody heard of, a script,
+/// the router), joining again brings it back: checked each minute kindil is
+/// awake. Time suspended doesn't count, so a dozing Kindle, which
+/// reconnects in its online windows, is rarely touched.
+fn watch_wifi(net: &Net) {
     let mut watchdog = system::WifiWatchdog::default();
+    // Firings with no connection seen in between.
+    let mut stuck_in_a_row = 0u8;
     loop {
         std::thread::sleep(system::WifiWatchdog::EVERY);
-        let (next, stuck) = watchdog.saw(wifi_seen());
+        let (next, stuck) = watchdog.saw(wifi_seen(net));
         watchdog = next;
-        if stuck {
-            eprintln!("kindil: Wi-Fi stuck; switching it off and on");
-            reconnect();
+        if !stuck {
+            if next == system::WifiWatchdog::default() {
+                stuck_in_a_row = 0;
+            }
+            continue;
+        }
+        stuck_in_a_row += 1;
+        // kindil's own way failed twice: wifid's full restart is the fallback.
+        let result = if stuck_in_a_row >= 2 {
+            stuck_in_a_row = 0;
+            eprintln!("kindil: Wi-Fi still stuck; handing it back to wifid");
+            net.hand_back()
+        } else {
+            eprintln!("kindil: Wi-Fi stuck; joining again");
+            net.reconnect()
+        };
+        if let Err(error) = result {
+            eprintln!("kindil: Wi-Fi watchdog: {error}");
         }
     }
 }
