@@ -53,6 +53,8 @@ and a reboot always returns the Kindle to stock.
     clock and countdown, and every 30 minutes to fetch over Wi-Fi. The power
     button brings it back with the light restored. wifid never hears of a
     suspend kindil starts, so kindil switches Wi-Fi off and on after one.
+    And whatever else leaves Wi-Fi on but not connected, kindil switches it
+    off and on once it has been down for 4 minutes it was awake.
   - **USB drive mode**: plugging into a computer shows a USB screen while the
     computer has `/mnt/us`; unplugging reloads the library and resumes
     Syncthing. A cable that keeps dropping doesn't flash the screen: kindil

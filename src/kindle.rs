@@ -94,6 +94,22 @@ pub fn parse_capacity(text: &str) -> Option<u8> {
     Some(percent.min(100))
 }
 
+impl KindleHost {
+    /// Switches wifid off and on again, if it is on.
+    fn cycle_wifi() -> anyhow::Result<()> {
+        match wifi_power()? {
+            Power::Off => Ok(()),
+            Power::On => {
+                lipc::set("com.lab126.wifid", "enable", "0")?;
+                // wifid applies a change asynchronously: an immediate switch
+                // back on can land before it has gone down.
+                std::thread::sleep(WIFI_SETTLE);
+                lipc::set("com.lab126.wifid", "enable", "1")
+            }
+        }
+    }
+}
+
 impl Host for KindleHost {
     fn brightness(&self) -> anyhow::Result<Brightness> {
         let light = self
@@ -136,16 +152,7 @@ impl Host for KindleHost {
     }
 
     fn reconnect_wifi(&self) -> anyhow::Result<()> {
-        match wifi_power()? {
-            Power::Off => Ok(()),
-            Power::On => {
-                self.set_wifi(Power::Off)?;
-                // wifid applies a change asynchronously: an immediate switch
-                // back on can land before it has gone down.
-                std::thread::sleep(WIFI_SETTLE);
-                self.set_wifi(Power::On)
-            }
-        }
+        Self::cycle_wifi()
     }
 
     fn scan(&self) -> anyhow::Result<Vec<Network>> {
@@ -263,6 +270,7 @@ impl Host for KindleHost {
                 eprintln!("kindil: Wi-Fi: {error}");
             }
         });
+        std::thread::spawn(|| watch_wifi(self_reconnect));
     }
 
     fn suspend(&self) -> anyhow::Result<()> {
@@ -365,6 +373,41 @@ fn wifid() -> anyhow::Result<()> {
     };
     route();
     lipc_events("com.lab126.wifid", "cmConnected", |_| route())
+}
+
+/// Whether Wi-Fi, switched on, has a connection with an address.
+fn wifi_seen() -> system::WifiSeen {
+    match wifi_power() {
+        Ok(Power::Off) => system::WifiSeen::Off,
+        Err(_) => system::WifiSeen::Down,
+        Ok(Power::On) => match wifi::open(INTERFACE).and_then(|wpa| wpa.link()) {
+            Ok(Link::Associated { ip: Some(_), .. }) => system::WifiSeen::Up,
+            _ => system::WifiSeen::Down,
+        },
+    }
+}
+
+fn self_reconnect() {
+    if let Err(error) = KindleHost::cycle_wifi() {
+        eprintln!("kindil: Wi-Fi watchdog: {error}");
+    }
+}
+
+/// Whatever left Wi-Fi on but stuck (a suspend wifid never heard of, a
+/// script, the router), cycling wifid brings it back: checked each minute
+/// kindil is awake. Time suspended doesn't count, so a dozing Kindle,
+/// which reconnects in its online windows, is rarely touched.
+fn watch_wifi(reconnect: fn()) {
+    let mut watchdog = system::WifiWatchdog::default();
+    loop {
+        std::thread::sleep(system::WifiWatchdog::EVERY);
+        let (next, stuck) = watchdog.saw(wifi_seen());
+        watchdog = next;
+        if stuck {
+            eprintln!("kindil: Wi-Fi stuck; switching it off and on");
+            reconnect();
+        }
+    }
 }
 
 fn route_wifi() -> anyhow::Result<()> {
