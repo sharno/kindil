@@ -201,6 +201,10 @@ impl Net {
     fn start(self: &Arc<Self>, saved: &[Credentials]) -> anyhow::Result<()> {
         // Off even if this fails part way, so On tries it all again.
         self.stop();
+        // From a clean slate whoever left what behind: a wifid started behind
+        // kindil's back, or a stray supplicant holding the control socket,
+        // would fight kindil's own.
+        stop_amazon();
         *lock(&self.saved) = saved.to_vec();
         load_driver()?;
         std::fs::write(WPA_CONF, WPA_CONF_TEXT)?;
@@ -287,16 +291,20 @@ impl Net {
     }
 }
 
-/// wifid and the supplicant it drives; the driver stays, as kindil's own
-/// start loads it anyway and reloading costs seconds.
+/// wifid and the supplicant it drives, and any wpa_supplicant or udhcpc
+/// that isn't kindil's (kindil's own are stopped before this runs). The
+/// driver stays: kindil's start loads it anyway, and reloading costs seconds.
 fn stop_amazon() {
     for job in ["wifid", "wifis"] {
         if running(job) {
             let _ = run(Command::new("/sbin/stop").arg(job));
         }
     }
-    // Amazon's DHCP client, if wifid left one.
-    let _ = Command::new("/usr/bin/killall").arg("udhcpc").status();
+    for stray in ["wpa_supplicant", "udhcpc"] {
+        let _ = Command::new("killall").arg(stray).status();
+    }
+    // A dead supplicant's socket: the new one would think it in use.
+    let _ = std::fs::remove_file(format!("/var/run/wpa_supplicant/{INTERFACE}"));
 }
 
 /// Starting or running, by upstart's goal.

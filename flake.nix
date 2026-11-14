@@ -50,6 +50,51 @@
             chmod +x $out/bin/armv7l-unknown-linux-gnueabihf-gcc
           '';
           target = "armv7-unknown-linux-musleabihf";
+          # kindil's own wpa_supplicant: nixpkgs' pinned upstream source, built
+          # with the same Zig cross compiler into one static binary. Only what
+          # the PW1 needs: its wireless-extensions driver, WPA/WPA2 personal,
+          # the control socket kindil talks to, and built-in crypto (no
+          # OpenSSL, libnl or D-Bus).
+          wpaSupplicant = pkgs.stdenv.mkDerivation {
+            pname = "wpa_supplicant-device";
+            inherit (pkgs.wpa_supplicant) version src;
+            nativeBuildInputs = [ pkgs.zig ];
+            dontConfigure = true;
+            config = ''
+              CONFIG_DRIVER_WEXT=y
+              CONFIG_CTRL_IFACE=y
+              CONFIG_BACKEND=file
+              CONFIG_NO_CONFIG_WRITE=y
+              CONFIG_L2_PACKET=linux
+              CONFIG_ELOOP=eloop
+              CONFIG_TLS=internal
+              CONFIG_CRYPTO=internal
+              CONFIG_INTERNAL_LIBTOMMATH=y
+              CONFIG_NO_WPA_PASSPHRASE=y
+            '';
+            passAsFile = [ "config" ];
+            buildPhase = ''
+              runHook preBuild
+              export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
+              export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
+              cd wpa_supplicant
+              cp "$configPath" .config
+              # From the environment: the Makefile appends its include paths,
+              # which make variables on the command line would override.
+              export CFLAGS="-Os -MMD -Wall" LDFLAGS="-static -s"
+              make -j"$NIX_BUILD_CORES" \
+                CC="${linker}/bin/armv7l-unknown-linux-gnueabihf-gcc" \
+                wpa_supplicant wpa_cli
+              runHook postBuild
+            '';
+            installPhase = ''
+              mkdir -p $out/bin
+              install -m755 wpa_supplicant wpa_cli $out/bin/
+            '';
+            dontStrip = true;
+            dontFixup = true;
+            meta.license = pkgs.lib.licenses.bsd3;
+          };
           common = {
             pname = "kindil";
             version = "0.4.0";
@@ -95,6 +140,7 @@
             kindil = host;
             kindil-device = device;
             armv7-linker = linker;
+            wpa-supplicant-device = wpaSupplicant;
           };
           checks = {
             host = host;
