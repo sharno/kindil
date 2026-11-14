@@ -42,7 +42,10 @@ pub struct Networks {
 
 impl Networks {
     /// A missing file is no networks; entries that no longer parse are skipped.
+    /// Amazon's startup re-permissions /var/local, so the file is made root
+    /// only again each time.
     pub fn open(path: &Path) -> Self {
+        let _ = root_only(path);
         let file: File = std::fs::read_to_string(path)
             .ok()
             .and_then(|text| toml::from_str(&text).ok())
@@ -103,8 +106,14 @@ impl Networks {
             .open(&temp)?
             .write_all(text.as_bytes())?;
         std::fs::rename(&temp, &self.path)?;
+        root_only(&self.path)?;
         Ok(())
     }
+}
+
+fn root_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 #[cfg(test)]
@@ -149,6 +158,11 @@ mod tests {
         Networks::open(&path)
             .add(wpa("Home", "correct horse"))
             .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // Opened again after something else widened it.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+        Networks::open(&path);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
