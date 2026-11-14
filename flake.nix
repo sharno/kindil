@@ -117,6 +117,7 @@
               '';
               RUSTFLAGS = "-C linker=${linker}/bin/armv7l-unknown-linux-gnueabihf-gcc -C target-feature=+crt-static -C link-self-contained=no";
               CC_armv7_unknown_linux_musleabihf = "${linker}/bin/armv7l-unknown-linux-gnueabihf-gcc";
+              KINDIL_WPA_SUPPLICANT = "${wpaSupplicant}/bin/wpa_supplicant";
               preBuild = ''
                 # Nix's sandbox HOME is intentionally unwritable. Zig needs a
                 # writable cache for its musl/CRT artifacts as well as ring C.

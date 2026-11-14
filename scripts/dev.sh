@@ -51,6 +51,9 @@ device_build() {
 	local cc
 	cc=$(arm_linker)
 	export CC_armv7_unknown_linux_musleabihf="$cc"
+	# kindil carries its own wpa_supplicant (build.rs).
+	KINDIL_WPA_SUPPLICANT="$(nix build --no-link --print-out-paths .#wpa-supplicant-device)/bin/wpa_supplicant"
+	export KINDIL_WPA_SUPPLICANT
 	RUSTFLAGS="-C linker=$cc -C target-feature=+crt-static -C link-self-contained=no" \
 		cargo build --locked --release --features kindle --target "$TARGET"
 	mkdir -p "$DIST"

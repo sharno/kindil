@@ -20,11 +20,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const INTERFACE: &str = "wlan0";
-const WPA: &str = "/usr/bin/wpa_supplicant";
+/// kindil's own wpa_supplicant (upstream, built by the flake), carried
+/// inside kindil and written out here, off /mnt/us, which goes away in USB
+/// drive mode under a running program.
+const WPA: &str = "/var/local/kindil/wpa_supplicant";
+const WPA_BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wpa_supplicant"));
 /// kindil's own wpa_supplicant config: no networks in it, they are loaded
-/// over the control socket from kindil's store.
+/// over the control socket from kindil's store. Built without config
+/// writing, it rejects `update_config`.
 const WPA_CONF: &str = "/var/local/kindil/wpa_supplicant.conf";
-const WPA_CONF_TEXT: &str = "ctrl_interface=/var/run/wpa_supplicant\nap_scan=1\nupdate_config=0\n";
+const WPA_CONF_TEXT: &str = "ctrl_interface=/var/run/wpa_supplicant\nap_scan=1\n";
 const WPA_PID: &str = "/var/run/kindil-wpa.pid";
 /// udhcpc's hook, on the system storage: /mnt/us goes away in USB drive
 /// mode, and a renewal then would find no script.
@@ -207,6 +212,7 @@ impl Net {
         stop_amazon();
         *lock(&self.saved) = saved.to_vec();
         load_driver()?;
+        install_supplicant()?;
         std::fs::write(WPA_CONF, WPA_CONF_TEXT)?;
         std::fs::write(DHCP_SCRIPT, SCRIPT)?;
         set_executable(DHCP_SCRIPT)?;
@@ -381,6 +387,22 @@ fn terminate(file: &str) {
         }
     }
     let _ = std::fs::remove_file(file);
+}
+
+/// Writes kindil's wpa_supplicant out when it differs from the one there.
+fn install_supplicant() -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !WPA_BINARY.is_empty(),
+        "this kindil was built without its wpa_supplicant"
+    );
+    if std::fs::read(WPA).ok().as_deref() == Some(WPA_BINARY) {
+        return Ok(());
+    }
+    let part = format!("{WPA}.part");
+    std::fs::write(&part, WPA_BINARY)?;
+    set_executable(&part)?;
+    std::fs::rename(&part, WPA)?;
+    Ok(())
 }
 
 /// wpa_supplicant in the foreground, as kindil's child; returns once it
