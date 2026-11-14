@@ -109,6 +109,10 @@ if [ -f "$TRYING" ]; then
   rm -f "$TRYING" "$EXT/kindil.trying"
   log "dropped an update whose trial was cut short"
 fi
+# Event watchers an earlier kindil left behind (orphans, now init's).
+for watcher in $(pidof lipc-wait-event); do
+  [ "$(cut -d' ' -f4 "/proc/$watcher/stat" 2>/dev/null)" = 1 ] && kill "$watcher"
+done
 pick
 if [ ! -x "$BIN" ]; then
   log "missing $BIN"

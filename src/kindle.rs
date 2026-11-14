@@ -479,7 +479,7 @@ fn lipc_events(publisher: &str, events: &str, mut each: impl FnMut(&str)) -> any
         // SAFETY: prctl is async-signal-safe and touches only this child.
         unsafe {
             command.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
                 Ok(())
             });
         }

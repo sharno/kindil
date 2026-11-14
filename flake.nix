@@ -70,8 +70,9 @@
               CONFIG_TLS=internal
               CONFIG_CRYPTO=internal
               CONFIG_INTERNAL_LIBTOMMATH=y
-              CONFIG_NO_WPA_PASSPHRASE=y
             '';
+            # Not CONFIG_NO_WPA_PASSPHRASE: besides the wpa_passphrase tool it
+            # drops PBKDF2, and with it every typed (quoted) password.
             passAsFile = [ "config" ];
             buildPhase = ''
               runHook preBuild

@@ -101,10 +101,17 @@ impl Net {
                 let power = wifid_power().unwrap_or(Power::On);
                 stop_amazon();
                 self.set_owner(Owner::Kindil(Power::Off));
-                match power {
+                let started = match power {
                     Power::On => self.start(saved),
                     Power::Off => Ok(()),
+                };
+                if started.is_err() {
+                    // Not taken over: a retry starts again from the top, it
+                    // doesn't find an Off that looks like success.
+                    self.stop();
+                    self.set_owner(Owner::Amazon);
                 }
+                started
             }
             Owner::Kindil(_) if saved.is_empty() => self.hand_back(),
             Owner::Kindil(Power::Off) => Ok(()),
@@ -218,10 +225,17 @@ impl Net {
         set_executable(DHCP_SCRIPT)?;
         let generation = self.generation.load(Ordering::SeqCst);
         self.supervise("wpa_supplicant", generation, |net| {
-            let child = spawn_supplicant()?;
-            let wpa = wifi::open(INTERFACE)?;
-            wpa.load(&lock(&net.saved))?;
-            wpa.command("REASSOCIATE")?;
+            let mut child = spawn_supplicant()?;
+            let loaded = wifi::open(INTERFACE).and_then(|wpa| {
+                wpa.load(&lock(&net.saved))?;
+                wpa.command("REASSOCIATE").map(drop)
+            });
+            if let Err(error) = loaded {
+                // Without its networks it is no use; never leave it behind.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
             Ok(child)
         })?;
         self.supervise("udhcpc", generation, |_| spawn_dhcp())?;
