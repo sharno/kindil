@@ -5,7 +5,7 @@
 //! and never opens a device, so previews and tests cannot touch hardware.
 use crate::battery::Battery;
 use crate::update::{Check, Commit, Release};
-use crate::wifi::{Credentials, Network};
+use crate::wifi::{Credentials, Network, Ssid};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
@@ -153,7 +153,11 @@ pub trait Host: Send + Sync {
     /// Blocks for a few seconds: call from a worker thread.
     fn scan(&self) -> anyhow::Result<Vec<Network>>;
     /// Joins for this session only; nothing is written to Amazon's Wi-Fi profiles.
+    /// Joins the network and saves it, first among the saved ones.
     fn join(&self, credentials: &Credentials) -> anyhow::Result<()>;
+    /// The saved networks' names, most recently joined first.
+    fn saved_networks(&self) -> Vec<String>;
+    fn forget_network(&self, ssid: &Ssid) -> anyhow::Result<()>;
     fn ssh(&self) -> Ssh;
     fn set_ssh(&self, power: Power) -> anyhow::Result<()>;
     fn set_ssh_at_boot(&self, power: Power) -> anyhow::Result<()>;
@@ -191,6 +195,7 @@ struct SimulatedState {
     battery: Battery,
     charge: Option<crate::drain::MilliampHours>,
     wifi: Power,
+    saved: Vec<String>,
     ssh: Power,
     ssh_at_boot: Power,
     boot_start: BootStart,
@@ -209,6 +214,7 @@ impl Default for Simulated {
                 },
                 charge: None,
                 wifi: Power::On,
+                saved: Vec::new(),
                 ssh: Power::On,
                 ssh_at_boot: Power::On,
                 boot_start: BootStart::Installed(Boot::Off),
@@ -274,8 +280,20 @@ impl Host for Simulated {
             Network::new("Café", Signal(-83), Open),
         ])
     }
-    fn join(&self, _: &Credentials) -> anyhow::Result<()> {
-        self.with(|s| s.wifi = Power::On);
+    fn join(&self, credentials: &Credentials) -> anyhow::Result<()> {
+        let ssid = credentials.ssid().as_str().to_owned();
+        self.with(|s| {
+            s.wifi = Power::On;
+            s.saved.retain(|saved| *saved != ssid);
+            s.saved.insert(0, ssid);
+        });
+        Ok(())
+    }
+    fn saved_networks(&self) -> Vec<String> {
+        self.with(|s| s.saved.clone())
+    }
+    fn forget_network(&self, ssid: &Ssid) -> anyhow::Result<()> {
+        self.with(|s| s.saved.retain(|saved| saved != ssid.as_str()));
         Ok(())
     }
     fn ssh(&self) -> Ssh {

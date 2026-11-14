@@ -26,6 +26,7 @@ kual() { { echo "$SERVICES" | tr ' ' '\n'; printf 'wifid\nx\nlab126_gui\n'; } >"
 kual
 sed -e "s#^EXT=.*#EXT=$T/ext#" \
   -e "s#^SKIP=.*#SKIP=$T/SKIP#" \
+  -e "s#^KINDIL_WIFI=.*#KINDIL_WIFI=\"$T/udhcpc.pid $T/wpa.pid\"#" \
   -e "s#^export PATH=.*#export PATH=$T/stub:/usr/bin:/bin#" \
   "$SESSION" >"$T/run/session.sh"
 chmod +x "$T/run/session.sh"
@@ -137,3 +138,15 @@ expect "after a standalone boot, leaving starts Amazon's services, then X and wi
   "$(tr '\n' ',' <"$T/upstart")" "start wifid,$(for j in $SERVICES; do printf 'start %s,' "$j"; done)start x,"
 
 expect "session.sh and boot.sh stop and start the same services" "$SERVICES" "$BOOT_SERVICES"
+
+reset
+rm -f "$T/upstart"
+fake "$T/ext/kindil" 1.0.0 "exit 0"
+: >"$T/jobs"
+# kindil ran Wi-Fi itself; these name no live process.
+echo 999998 >"$T/udhcpc.pid"
+echo 999999 >"$T/wpa.pid"
+run
+expect "leaving after kindil ran Wi-Fi resets Amazon's Wi-Fi jobs for wifid" \
+  "$(tr '\n' ',' <"$T/upstart" | cut -d, -f1-3)$([ -f "$T/wpa.pid" ] && echo ' pid left')" \
+  "stop wifis,stop wifim,start wifid"

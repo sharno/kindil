@@ -34,7 +34,8 @@ and a reboot always returns the Kindle to stock.
   and each section a page that fits on screen (a page swap is one e-ink
   refresh; scrolling redraws on every move):
   - **Display**: home screen, front light, a "clean screen" flash.
-  - **Wi-Fi**: on/off with network status, scan and join.
+  - **Wi-Fi**: on/off with network status, scan and join, and the saved
+    networks, each with Forget.
   - **Remote access**: SSH server and SSH-at-boot switches, Syncthing.
   - **Power**: sleep when idle, start at boot, Exit to Kindle, Restart and
     Power off.
@@ -51,15 +52,14 @@ and a reboot always returns the Kindle to stock.
     dashboard: after 2 minutes without a touch the light goes off and the
     Kindle suspends to RAM, waking on the RTC alarm each minute to redraw the
     clock and countdown, and every 30 minutes to fetch over Wi-Fi. The power
-    button brings it back with the light restored. wifid never hears of a
-    suspend kindil starts, so kindil switches Wi-Fi off and on after one.
-    While kindil runs, it runs Wi-Fi itself instead of Amazon's wifid: once
-    wifid has handed wpa_supplicant the saved networks, kindil stops it and
-    does the DHCP, so after a nap it is back online in about a second instead
-    of the 10 s wifid's off-and-on takes. Leaving kindil starts wifid again.
-    Whatever else leaves Wi-Fi on but not connected, kindil joins again once
-    it has been down for 4 minutes it was awake, and hands Wi-Fi back to
-    wifid if that fails twice.
+    button brings it back with the light restored, and Wi-Fi rejoins.
+  - **Wi-Fi of its own**: kindil runs Wi-Fi itself with the networks joined
+    in it, saved in `/var/local/kindil/networks.toml` (plain text, readable
+    by root only; a network is saved once it has joined). It loads the
+    driver, runs wpa_supplicant and DHCP as its own children, starting one
+    again if it exits, and Off unloads the driver. Back online about a
+    second after a nap. Amazon's wifid runs Wi-Fi only until the first
+    network is joined in kindil, and again after leaving kindil.
   - **USB drive mode**: plugging into a computer shows a USB screen while the
     computer has `/mnt/us`; unplugging reloads the library and resumes
     Syncthing. A cable that keeps dropping doesn't flash the screen: kindil
@@ -149,10 +149,10 @@ faster.
   `/mnt/us/DONT_START_FRAMEWORK` flag. The next boots then skip X, Amazon's
   UI and its Java framework, since kindil draws to the screen itself, and
   stop Amazon's boot spinner and the services kindil doesn't use (connections,
-  apps, archive, updates, sync and the like). Of Amazon's system only powerd,
-  wifid and volumd stay, and kindil sets the default route and name servers
-  each time Wi-Fi connects, as Amazon's connection manager would. kindil
-  comes up about 20 s after the kernel, with more memory free. Every way back to Amazon's UI removes the flag first and
+  apps, archive, updates, sync and the like). With networks of its own,
+  kindil runs Wi-Fi itself and wifid doesn't start either. Of Amazon's
+  system powerd and volumd stay, for now. kindil comes up about 20 s after
+  the kernel, with more memory free. Every way back to Amazon's UI removes the flag first and
   starts those services and X if they aren't running:
   leaving kindil (Exit to Kindle, a crash it gives up on, a kill), and any
   boot where kindil doesn't stay up for 2 minutes. After a boot kindil stays
@@ -170,6 +170,7 @@ faster.
 |---|---|
 | `/mnt/us/extensions/kindil/` | KUAL launcher and the `kindil` binary; during an update also `kindil.next`, `kindil.trying`, and afterwards `kindil.previous` |
 | `/var/local/kindil/` | The running copy and the log; off `/mnt/us`, which a computer takes in USB drive mode |
+| `/var/local/kindil/networks.toml` | The Wi-Fi networks joined in kindil, with their passwords (root only) |
 | `/mnt/us/kindil/kindil.toml` | Optional settings (every key has a default) |
 | `/mnt/us/kindil/miqat.toml` | Miqat's own settings: location, prayer method |
 | `/mnt/us/kindil/prefs.toml` | Choices made on the device; safe to delete |
@@ -223,6 +224,8 @@ weather and make no requests.
 | `host.rs` | The `Host` trait the UI uses, and the `Simulated` device |
 | `kindle.rs` | `Host` on the stock OS: lipc (wifid, powerd front light and battery), USBNetwork |
 | `wifi.rs` | wpa_supplicant control socket, typed SSID/passphrase |
+| `net.rs` | Wi-Fi run by kindil: driver, supervised wpa_supplicant and udhcpc |
+| `networks.rs` | The saved Wi-Fi networks |
 | `sync.rs` | Syncthing as a typed state machine |
 | `update.rs` | Over-the-air updates: GitHub releases, signature check, trial and commit |
 | `system.rs` | Sleep, wake and USB drive mode as a state machine |

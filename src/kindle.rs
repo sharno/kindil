@@ -7,18 +7,19 @@ use crate::host::{
     Boot, BootStart, Brightness, Deliver, DeviceInfo, Host, Memory, Power, Ssh, Storage, Wifi,
 };
 use crate::net::Net;
+use crate::networks::{self, Networks};
 use crate::system::{self, Event};
 use crate::uevent::Uevent;
 use crate::update::{Check, Commit, Github, Release, Slots, Version};
-use crate::wifi::{self, Credentials, Link, Network};
+use crate::wifi::{self, Credentials, Link, Network, Ssid};
 use std::io::BufRead;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const INTERFACE: &str = "wlan0";
-/// How long wifid may take at boot to hand wpa_supplicant the networks.
+/// How long kindil keeps retrying its Wi-Fi at start (a slow driver).
 const WIFI_TAKEOVER: Duration = Duration::from_secs(180);
 /// udhcpc's lease for [`INTERFACE`] (`/usr/share/udhcpc/default.script`).
 const DHCP_LEASE: &str = "/tmp/wlan0";
@@ -58,6 +59,7 @@ const UPDATE_TRIAL: &str = "/var/local/kindil/trying";
 pub struct KindleHost {
     frontlight: Result<Frontlight, String>,
     net: Arc<Net>,
+    networks: Arc<Mutex<Networks>>,
 }
 
 impl KindleHost {
@@ -66,6 +68,7 @@ impl KindleHost {
         Self {
             frontlight: Frontlight::open().map_err(|e| e.to_string()),
             net: Arc::default(),
+            networks: Arc::new(Mutex::new(Networks::open(Path::new(networks::PATH)))),
         }
     }
 }
@@ -123,7 +126,8 @@ impl Host for KindleHost {
     }
 
     fn set_wifi(&self, power: Power) -> anyhow::Result<()> {
-        self.net.set(power)
+        let saved = lock(&self.networks).list().to_vec();
+        self.net.set(power, &saved)
     }
 
     fn reconnect_wifi(&self) -> anyhow::Result<()> {
@@ -135,7 +139,32 @@ impl Host for KindleHost {
     }
 
     fn join(&self, credentials: &Credentials) -> anyhow::Result<()> {
-        wifi::open(INTERFACE)?.join(credentials)
+        let saved = lock(&self.networks).list().to_vec();
+        // The new network first, preferred over the others; saved only once
+        // it has joined, so a wrong password never sticks.
+        let candidate: Vec<Credentials> = std::iter::once(credentials.clone())
+            .chain(
+                saved
+                    .iter()
+                    .filter(|c| c.ssid() != credentials.ssid())
+                    .cloned(),
+            )
+            .collect();
+        self.net.try_join(&candidate, &saved)?;
+        lock(&self.networks).add(credentials.clone())
+    }
+
+    fn saved_networks(&self) -> Vec<String> {
+        lock(&self.networks).ssids()
+    }
+
+    fn forget_network(&self, ssid: &Ssid) -> anyhow::Result<()> {
+        let saved = {
+            let mut networks = lock(&self.networks);
+            networks.forget(ssid)?;
+            networks.list().to_vec()
+        };
+        self.net.load(&saved)
     }
 
     fn ssh(&self) -> Ssh {
@@ -250,9 +279,9 @@ impl Host for KindleHost {
             }
         });
         let net = self.net.clone();
+        let networks = self.networks.clone();
         std::thread::spawn(move || {
-            take_over_wifi(&net);
-            watch_wifi(&net);
+            take_over_wifi(&net, &networks);
         });
     }
 
@@ -358,66 +387,29 @@ fn wifid() -> anyhow::Result<()> {
     lipc_events("com.lab126.wifid", "cmConnected", |_| route())
 }
 
-/// Whether Wi-Fi, switched on, has a connection with an address.
-fn wifi_seen(net: &Net) -> system::WifiSeen {
-    match net.power() {
-        Ok(Power::Off) => system::WifiSeen::Off,
-        Err(_) => system::WifiSeen::Down,
-        Ok(Power::On) => match wifi::open(INTERFACE).and_then(|wpa| wpa.link()) {
-            Ok(Link::Associated { ip: Some(_), .. }) => system::WifiSeen::Up,
-            _ => system::WifiSeen::Down,
-        },
+/// With networks of its own, kindil runs Wi-Fi from the start; with none
+/// (first run), Amazon's wifid does until one is joined.
+fn take_over_wifi(net: &Arc<Net>, networks: &Mutex<Networks>) {
+    let saved = lock(networks).list().to_vec();
+    if saved.is_empty() {
+        eprintln!("kindil: no saved networks yet; wifid runs Wi-Fi until one is joined");
+        return;
     }
-}
-
-/// Waits for wifid to give wpa_supplicant the saved networks, then runs
-/// Wi-Fi without it; until then, and if this fails, wifid keeps it.
-fn take_over_wifi(net: &Net) {
     let since = std::time::Instant::now();
-    while since.elapsed() < WIFI_TAKEOVER {
-        match net.take_over() {
-            Ok(true) => {
-                eprintln!("kindil: running Wi-Fi without wifid");
+    loop {
+        match net.load(&saved) {
+            Ok(()) => {
+                eprintln!("kindil: running Wi-Fi with {} saved networks", saved.len());
                 return;
             }
-            Ok(false) => {}
-            Err(error) => eprintln!("kindil: Wi-Fi takeover: {error}"),
-        }
-        std::thread::sleep(Duration::from_secs(5));
-    }
-    eprintln!("kindil: no saved networks reached wpa_supplicant; wifid keeps Wi-Fi");
-}
-
-/// Whatever left Wi-Fi on but stuck (a suspend nobody heard of, a script,
-/// the router), joining again brings it back: checked each minute kindil is
-/// awake. Time suspended doesn't count, so a dozing Kindle, which
-/// reconnects in its online windows, is rarely touched.
-fn watch_wifi(net: &Net) {
-    let mut watchdog = system::WifiWatchdog::default();
-    // Firings with no connection seen in between.
-    let mut stuck_in_a_row = 0u8;
-    loop {
-        std::thread::sleep(system::WifiWatchdog::EVERY);
-        let (next, stuck) = watchdog.saw(wifi_seen(net));
-        watchdog = next;
-        if !stuck {
-            if next == system::WifiWatchdog::default() {
-                stuck_in_a_row = 0;
+            Err(error) if since.elapsed() < WIFI_TAKEOVER => {
+                eprintln!("kindil: Wi-Fi start: {error}; trying again");
+                std::thread::sleep(Duration::from_secs(5));
             }
-            continue;
-        }
-        stuck_in_a_row += 1;
-        // kindil's own way failed twice: wifid's full restart is the fallback.
-        let result = if stuck_in_a_row >= 2 {
-            stuck_in_a_row = 0;
-            eprintln!("kindil: Wi-Fi still stuck; handing it back to wifid");
-            net.hand_back()
-        } else {
-            eprintln!("kindil: Wi-Fi stuck; joining again");
-            net.reconnect()
-        };
-        if let Err(error) = result {
-            eprintln!("kindil: Wi-Fi watchdog: {error}");
+            Err(error) => {
+                eprintln!("kindil: Wi-Fi start: {error}; switch Wi-Fi off and on to try again");
+                return;
+            }
         }
     }
 }
@@ -547,6 +539,12 @@ fn storage(path: &Path) -> Option<Storage> {
         total_bytes: stats.f_blocks as u64 * block,
         free_bytes: stats.f_bavail as u64 * block,
     })
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn remove_if_present(path: &str) -> anyhow::Result<()> {

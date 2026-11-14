@@ -48,13 +48,22 @@ restore() {
 # Starting or running, by upstart's goal.
 running() { status "$1" 2>/dev/null | grep -q start/; }
 
-# kindil ran Wi-Fi itself (src/net.rs): its DHCP client goes, wifid comes
-# back and takes over wpa_supplicant again.
-DHCP_PID=/var/run/kindil-udhcpc.pid
+# kindil ran Wi-Fi itself (src/net.rs): its DHCP client and wpa_supplicant
+# go, and wifid starts Amazon's driver and supplicant jobs afresh (stopping
+# wifim unloads the driver kindil may have loaded or unloaded itself).
+KINDIL_WIFI="/var/run/kindil-udhcpc.pid /var/run/kindil-wpa.pid"
 wifi_back() {
-  if [ -f "$DHCP_PID" ]; then
-    kill "$(cat "$DHCP_PID")" 2>/dev/null
-    rm -f "$DHCP_PID"
+  ran=""
+  for pidfile in $KINDIL_WIFI; do
+    if [ -f "$pidfile" ]; then
+      kill "$(cat "$pidfile")" 2>/dev/null
+      rm -f "$pidfile"
+      ran=1
+    fi
+  done
+  if [ -n "$ran" ] && ! running wifid; then
+    stop wifis
+    stop wifim
   fi
   running wifid || start wifid
 }

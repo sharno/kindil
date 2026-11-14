@@ -16,7 +16,7 @@ use crate::system::{
 };
 use crate::update::{self, Check, Release, Updates, Version};
 use crate::view;
-use crate::wifi::Credentials;
+use crate::wifi::{Credentials, Ssid};
 use chrono::{DateTime, Timelike, Utc};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use std::cell::RefCell;
@@ -206,6 +206,7 @@ impl From<DashboardKind> for Dashboard {
 /// Everything the Settings screen and status bar show, read in one go.
 struct Snapshot {
     wifi: Wifi,
+    saved_networks: Vec<String>,
     ssh: Ssh,
     boot_start: BootStart,
     info: DeviceInfo,
@@ -216,6 +217,7 @@ impl Snapshot {
     fn read(host: &dyn Host) -> Self {
         Self {
             wifi: host.wifi(),
+            saved_networks: host.saved_networks(),
             ssh: host.ssh(),
             boot_start: host.boot_start(),
             info: host.info(),
@@ -233,6 +235,12 @@ impl Snapshot {
         let (wifi, detail) = view::wifi(&self.wifi);
         k.set_wifi(wifi);
         k.set_wifi_detail(detail.into());
+        k.set_saved_networks(model(
+            self.saved_networks
+                .iter()
+                .map(|ssid| ssid.as_str().into())
+                .collect(),
+        ));
         let (server, at_boot, detail) = view::ssh(self.ssh, view::ip(&self.wifi));
         k.set_ssh(server);
         k.set_ssh_at_boot(at_boot);
@@ -443,6 +451,7 @@ fn wire(window: &AppWindow, ctx: &Ctx) {
     on!(on_toggle_wifi => toggle_wifi());
     on!(on_scan_networks => scan_networks());
     on!(on_join_network => join_network(ssid, password));
+    on!(on_forget_network => forget_network(ssid));
     on!(on_toggle_ssh => toggle_ssh());
     on!(on_toggle_ssh_at_boot => toggle_ssh_at_boot());
     on!(on_choose_boot => choose_boot(choice));
@@ -877,6 +886,8 @@ impl Ctx {
                 k.set_network_busy(false);
                 match result {
                     Ok(networks) => {
+                        let saved: Vec<slint::SharedString> =
+                            slint::Model::iter(&k.get_saved_networks()).collect();
                         k.set_network_status(
                             match networks.len() {
                                 1 => "1 network nearby".to_string(),
@@ -884,7 +895,18 @@ impl Ctx {
                             }
                             .into(),
                         );
-                        k.set_networks(model(networks.iter().map(view::network).collect()));
+                        k.set_networks(model(
+                            networks
+                                .iter()
+                                .map(|network| {
+                                    let mut item = view::network(network);
+                                    if saved.contains(&item.ssid) {
+                                        item.detail = format!("Saved · {}", item.detail).into();
+                                    }
+                                    item
+                                })
+                                .collect(),
+                        ));
                     }
                     Err(error) => k.set_network_status(error.to_string().into()),
                 }
@@ -911,7 +933,7 @@ impl Ctx {
                 k.set_network_busy(false);
                 k.set_network_status(
                     match result {
-                        Ok(()) => format!("Joining {ssid}. Status shows in Settings."),
+                        Ok(()) => format!("Saved {ssid}; joining. Status shows in Settings."),
                         Err(error) => error.to_string(),
                     }
                     .into(),
@@ -919,6 +941,19 @@ impl Ctx {
             },
         );
         self.refresh_after(Duration::from_secs(10));
+    }
+
+    fn forget_network(&self, ssid: slint::SharedString) {
+        let Ok(ssid) = Ssid::try_from(ssid.to_string()) else {
+            return;
+        };
+        self.background(
+            move |host| host.forget_network(&ssid).map(|()| Snapshot::read(host)),
+            |ui, result| match result {
+                Ok(snapshot) => snapshot.apply(ui),
+                Err(error) => notify(ui, &format!("Wi-Fi: {error}")),
+            },
+        );
     }
 
     fn show_sync(&self) {

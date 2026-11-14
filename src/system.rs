@@ -468,72 +468,9 @@ impl Idle {
     }
 }
 
-/// What a Wi-Fi check found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WifiSeen {
-    /// Switched off on purpose: nothing to fix.
-    Off,
-    /// On, connected, with an address.
-    Up,
-    /// On but not connected, or wifid not answering.
-    Down,
-}
-
-/// Counts checks in a row that found Wi-Fi on but down; after
-/// [`WifiWatchdog::STUCK`] of them it is stuck and gets switched off and on.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WifiWatchdog {
-    misses: u8,
-}
-
-impl WifiWatchdog {
-    pub const EVERY: Duration = Duration::from_secs(60);
-    /// Joining takes up to about 15 s; four minutes is surely stuck.
-    pub const STUCK: u8 = 4;
-
-    /// The watchdog after a check, and whether to reconnect now.
-    pub fn saw(self, seen: WifiSeen) -> (Self, bool) {
-        match seen {
-            WifiSeen::Off | WifiSeen::Up => (Self::default(), false),
-            WifiSeen::Down if self.misses + 1 >= Self::STUCK => (Self::default(), true),
-            WifiSeen::Down => (
-                Self {
-                    misses: self.misses + 1,
-                },
-                false,
-            ),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
 
-    #[test]
-    fn wifi_stuck_for_four_checks_is_switched_off_and_on() {
-        let run = |seen: &[WifiSeen]| -> Vec<bool> {
-            seen.iter()
-                .scan(WifiWatchdog::default(), |watchdog, &seen| {
-                    let (next, stuck) = watchdog.saw(seen);
-                    *watchdog = next;
-                    Some(stuck)
-                })
-                .collect()
-        };
-        use WifiSeen::{Down, Off, Up};
-        assert_eq!(run(&[Down, Down, Down, Down]), [false, false, false, true]);
-        assert_eq!(
-            run(&[Down, Down, Down, Up, Down, Down, Down]),
-            [false; 7],
-            "a connection in between starts the count again"
-        );
-        assert_eq!(run(&[Off; 6]), [false; 6], "off on purpose is left alone");
-        assert_eq!(
-            run(&[Down; 8]),
-            [false, false, false, true, false, false, false, true],
-            "still stuck: tries again four checks later"
-        );
-    }
     use super::*;
 
     /// Runs events at offsets in milliseconds; returns the last mode and all effects.

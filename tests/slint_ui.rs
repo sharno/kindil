@@ -28,6 +28,8 @@ const PANEL_LIGHT_Y: f32 = 104.0;
 const SETTINGS_LIGHT: (f32, f32) = (100.0, 588.0);
 const SETTINGS_LIGHT_Y: f32 = 372.0;
 const SLACK: i32 = 2;
+// The first saved network's Forget button on the Wi-Fi page.
+const FORGET: (f32, f32) = (676.0, 431.0);
 // Text size buttons in the reader's panel.
 const TEXT_SIZE_Y: f32 = 186.0;
 const SMALLER_TEXT: f32 = 533.0;
@@ -590,6 +592,12 @@ impl Host for Recording {
         self.joined.lock().unwrap().push(entry);
         self.device.join(credentials)
     }
+    fn saved_networks(&self) -> Vec<String> {
+        self.device.saved_networks()
+    }
+    fn forget_network(&self, ssid: &kindil::wifi::Ssid) -> anyhow::Result<()> {
+        self.device.forget_network(ssid)
+    }
     fn ssh(&self) -> kindil::host::Ssh {
         self.device.ssh()
     }
@@ -693,6 +701,43 @@ fn join_a_network_and_type_arabic() {
     }
     f.tap(42.0, 742.0); // Esc
     assert!(!f.keyboard_visible());
+}
+
+#[test]
+fn a_joined_network_is_saved_and_can_be_forgotten() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    f.k()
+        .invoke_join_network("Home".into(), "correct horse".into());
+    f.app.refresh_now();
+    f.tap(SETTINGS_TAB, TAB_Y);
+    f.tap(380.0, 300.0); // Wi-Fi row
+    assert_eq!(f.k().get_page(), Page::Wifi);
+    let saved: Vec<String> = f
+        .k()
+        .get_saved_networks()
+        .iter()
+        .map(String::from)
+        .collect();
+    assert_eq!(saved, ["Home"]);
+    if let Some(dir) = std::env::var_os("KINDIL_TEST_PREVIEW_DIR") {
+        std::fs::create_dir_all(&dir).unwrap();
+        preview::snapshot(&f.window, &Path::new(&dir).join("wifi-saved.ppm")).unwrap();
+    }
+
+    // Scanning marks it.
+    f.tap(380.0, 300.0); // Choose a network
+    let home = f.k().get_networks().row_data(0).unwrap();
+    assert_eq!(home.ssid, "Home");
+    assert!(home.detail.starts_with("Saved"), "{}", home.detail);
+    f.tap(40.0, 112.0); // back
+
+    // Forget takes two taps.
+    f.tap(FORGET.0, FORGET.1);
+    assert_eq!(host.saved_networks(), ["Home"], "one tap only asks");
+    f.tap(FORGET.0, FORGET.1);
+    assert!(host.saved_networks().is_empty());
+    assert_eq!(f.k().get_saved_networks().row_count(), 0);
 }
 
 #[test]

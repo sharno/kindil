@@ -1,8 +1,9 @@
 //! Talking to `wpa_supplicant` over its control socket.
 //!
-//! On the stock Kindle OS, Amazon's `wifid` owns `wpa_supplicant`; kindil only
-//! reads status, scans, and (for this session) selects a network. It never saves
-//! the supplicant config, so Amazon's stored Wi-Fi profiles are left untouched.
+//! Amazon's `wifid` starts `wpa_supplicant` and feeds it the networks it keeps;
+//! once kindil runs Wi-Fi itself (src/net.rs), it feeds it its own
+//! (src/networks.rs). It never saves the supplicant config, so Amazon's stored
+//! Wi-Fi profiles are left untouched.
 //!
 //! Replies are plain text: either `key=value` lines (`STATUS`), or tab-separated
 //! tables with a `/`-separated header (`SCAN_RESULTS`).
@@ -56,6 +57,20 @@ pub enum Credentials {
 }
 
 impl Credentials {
+    pub fn ssid(&self) -> &Ssid {
+        match self {
+            Self::Open(ssid) | Self::Wpa(ssid, _) => ssid,
+        }
+    }
+
+    /// For saving it (src/networks.rs); never for logs.
+    pub fn password(&self) -> Option<&str> {
+        match self {
+            Self::Open(_) => None,
+            Self::Wpa(_, passphrase) => Some(&passphrase.0),
+        }
+    }
+
     /// An empty password means an open network.
     pub fn parse(ssid: String, password: String) -> Result<Self, &'static str> {
         let ssid = Ssid::try_from(ssid)?;
@@ -171,6 +186,29 @@ impl Wpa {
 
     /// Add and select a network in memory only (no SAVE_CONFIG).
     pub fn join(&self, credentials: &Credentials) -> anyhow::Result<()> {
+        let id = self.add(credentials, 0)?;
+        self.command(&format!("SELECT_NETWORK {id}")).map(drop)
+    }
+
+    /// Replaces every network wpa_supplicant holds with `networks`, the
+    /// first preferred most, and lets it pick among them from its own scans
+    /// (Amazon's wifid runs it with ap_scan 2 and picks itself).
+    pub fn load(&self, networks: &[Credentials]) -> anyhow::Result<()> {
+        self.command("AP_SCAN 1")?;
+        self.command("REMOVE_NETWORK all")?;
+        let count = networks.len() as u32;
+        networks
+            .iter()
+            .zip((1..=count).rev())
+            .try_for_each(|(credentials, priority)| {
+                let id = self.add(credentials, priority)?;
+                self.command(&format!("ENABLE_NETWORK {id}")).map(drop)
+            })
+    }
+
+    /// Adds a network, disabled, with settings that suit any WPA or WPA2
+    /// access point; returns its id.
+    fn add(&self, credentials: &Credentials, priority: u32) -> anyhow::Result<u32> {
         let id: u32 = self.command("ADD_NETWORK")?.trim().parse()?;
         let hex = |ssid: &Ssid| {
             ssid.0
@@ -178,29 +216,35 @@ impl Wpa {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         };
-        let settings = match credentials {
-            Credentials::Open(ssid) => vec![
-                format!("SET_NETWORK {id} ssid {}", hex(ssid)),
-                format!("SET_NETWORK {id} key_mgmt NONE"),
-            ],
-            Credentials::Wpa(ssid, passphrase) => vec![
-                format!("SET_NETWORK {id} ssid {}", hex(ssid)),
+        let mut settings = vec![
+            format!("SET_NETWORK {id} ssid {}", hex(credentials.ssid())),
+            // Also finds a network that hides its name.
+            format!("SET_NETWORK {id} scan_ssid 1"),
+            format!("SET_NETWORK {id} priority {priority}"),
+        ];
+        match credentials {
+            Credentials::Open(_) => settings.push(format!("SET_NETWORK {id} key_mgmt NONE")),
+            Credentials::Wpa(_, passphrase) => settings.extend([
+                format!("SET_NETWORK {id} key_mgmt WPA-PSK"),
+                format!("SET_NETWORK {id} proto RSN WPA"),
+                format!("SET_NETWORK {id} pairwise CCMP TKIP"),
+                format!("SET_NETWORK {id} group CCMP TKIP"),
                 // Printable ASCII without quotes or backslashes needs no escaping;
                 // the quoted form is wpa_supplicant's passphrase syntax.
                 format!(
                     "SET_NETWORK {id} psk \"{}\"",
                     passphrase.0.replace('\\', "\\\\").replace('"', "\\\"")
                 ),
-            ],
-        };
+            ]),
+        }
         let result = settings
             .iter()
-            .chain(std::iter::once(&format!("SELECT_NETWORK {id}")))
             .try_for_each(|command| self.command(command).map(drop));
-        if result.is_err() {
+        if let Err(error) = result {
             let _ = self.command(&format!("REMOVE_NETWORK {id}"));
+            return Err(error);
         }
-        result
+        Ok(id)
     }
 }
 

@@ -118,6 +118,8 @@ export global Kindil {
 
     // Wi-Fi networks
     in property <[NetworkItem]> networks;
+    /// Saved networks' names, most recently joined first.
+    in property <[string]> saved-networks;
     in property <string> network-status;
     in property <bool> network-busy: false;
     in-out property <bool> join-open: false;
@@ -143,6 +145,7 @@ export global Kindil {
     callback toggle-wifi();
     callback scan-networks();
     callback join-network(string, string);
+    callback forget-network(string);
     callback toggle-ssh();
     callback toggle-ssh-at-boot();
     callback choose-boot(BootChoice);
@@ -1470,6 +1473,47 @@ component DisplaySettings inherits SectionPage {
     }
 }
 
+/// A saved network; Forget asks for a second tap.
+component SavedNetworkRow {
+    in property <string> ssid;
+    property <bool> asking: false;
+    min-height: 76px;
+    HorizontalLayout {
+        spacing: 16px;
+        Text {
+            text: root.ssid;
+            font-size: 23px;
+            font-weight: 600;
+            color: Theme.ink;
+            overflow: elide;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        if root.asking: VerticalLayout {
+            alignment: center;
+            Button {
+                text: "Keep";
+                clicked => { root.asking = false; }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Button {
+                text: root.asking ? "Forget it" : "Forget";
+                kind: root.asking ? ButtonKind.primary : ButtonKind.outline;
+                clicked => {
+                    if root.asking {
+                        root.asking = false;
+                        Kindil.forget-network(root.ssid);
+                    } else {
+                        root.asking = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
 component WifiSettings inherits SectionPage {
     title: "Wi-Fi";
     Group {
@@ -1500,6 +1544,13 @@ component WifiSettings inherits SectionPage {
                     Kindil.scan-networks();
                 }
             }
+        }
+    }
+    if Kindil.saved-networks.length > 0: Group {
+        title: "SAVED NETWORKS";
+        for ssid[i] in Kindil.saved-networks: VerticalLayout {
+            if i > 0: Divider { }
+            SavedNetworkRow { ssid: ssid; }
         }
     }
 }
