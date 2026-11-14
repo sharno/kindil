@@ -256,8 +256,12 @@ impl Host for KindleHost {
         let deliver = Arc::new(deliver);
         let power = deliver.clone();
         std::thread::spawn(move || {
-            if let Err(error) = power_button(|| power(Event::PowerButton)) {
-                eprintln!("kindil: power button: {error}");
+            // Without it the power button does nothing: never give up on it.
+            loop {
+                if let Err(error) = power_button(|| power(Event::PowerButton)) {
+                    eprintln!("kindil: power button: {error}; listening again");
+                }
+                std::thread::sleep(Duration::from_secs(1));
             }
         });
         std::thread::spawn(move || {
@@ -419,7 +423,12 @@ fn route_wifi() -> anyhow::Result<()> {
     let Some(gateway) = lease_gateway(&lease) else {
         return Ok(());
     };
-    if !has_default_route(&std::fs::read_to_string(ROUTES)?) {
+    let routes = std::fs::read_to_string(ROUTES)?;
+    // No address on Wi-Fi (an old lease, Wi-Fi down): the router is out of reach.
+    if !routes_through(&routes, INTERFACE) {
+        return Ok(());
+    }
+    if !has_default_route(&routes) {
         let gateway = gateway.to_string();
         run(Command::new("/sbin/route").args(["add", "default", "gw", &gateway, "dev", INTERFACE]))?;
     }
@@ -439,6 +448,14 @@ pub fn lease_gateway(lease: &str) -> Option<std::net::Ipv4Addr> {
         .next()?
         .parse()
         .ok()
+}
+
+/// True if `/proc/net/route` has any route through `interface`: it has an address.
+pub fn routes_through(table: &str, interface: &str) -> bool {
+    table
+        .lines()
+        .skip(1)
+        .any(|line| line.split_whitespace().next() == Some(interface))
 }
 
 /// True if `/proc/net/route` has a default route, on any interface.
@@ -575,6 +592,8 @@ mod tests {
         let local = "wlan0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
         let default = "wlan0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n";
         assert!(!has_default_route(&format!("{header}{local}")));
+        assert!(routes_through(&format!("{header}{local}"), "wlan0"));
+        assert!(!routes_through(header, "wlan0"), "no address, no route");
         assert!(has_default_route(&format!("{header}{local}{default}")));
     }
 

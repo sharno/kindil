@@ -106,6 +106,7 @@ mod socket {
 
     /// The kernel's uevent broadcast group.
     const KERNEL_GROUP: u32 = 1;
+    const RECEIVE_BUFFER: libc::c_int = 256 * 1024;
 
     pub struct Listener(OwnedFd);
 
@@ -139,6 +140,19 @@ mod socket {
             if rc < 0 {
                 return Err(io::Error::last_os_error());
             }
+            // Room for a burst (a resume brings dozens); best effort, as the
+            // kernel caps it at rmem_max.
+            let size: libc::c_int = RECEIVE_BUFFER;
+            // SAFETY: size outlives the call and its length is passed.
+            unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    (&raw const size).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
             Ok(Self(fd))
         }
 
@@ -159,8 +173,14 @@ mod socket {
                     0 => return Err(io::ErrorKind::UnexpectedEof.into()),
                     _ => {
                         let error = io::Error::last_os_error();
-                        if error.kind() != io::ErrorKind::Interrupted {
-                            return Err(error);
+                        match error.raw_os_error() {
+                            Some(libc::EINTR) => {}
+                            // The buffer overflowed and some events were
+                            // dropped; the socket itself still works.
+                            Some(libc::ENOBUFS) => {
+                                eprintln!("kindil: uevents overflowed; some were missed")
+                            }
+                            _ => return Err(error),
                         }
                     }
                 }
