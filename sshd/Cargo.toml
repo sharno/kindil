@@ -25,3 +25,9 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "process", "time", 
 [dev-dependencies]
 tempfile = "3.27"
 libc = "0.2"
+
+# The AEADs russh uses here (vendor/russh's RustCrypto backend) are tested
+# against ring's. Tests only, and not for the Kindle's ARM: nothing of ring
+# (or C) in kindil-sshd itself.
+[target.'cfg(not(target_arch = "arm"))'.dev-dependencies]
+ring = "0.17"

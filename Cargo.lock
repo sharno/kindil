@@ -5541,6 +5541,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "libc",
+ "ring",
  "russh",
  "tempfile",
  "tokio",
