@@ -85,7 +85,9 @@ impl TouchInput {
             )
         })?;
         let c_path = std::ffi::CString::new(path).unwrap();
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        // Close-on-exec: a child of the app (a daemon it runs) must not keep
+        // the grabbed device, or the app can't open it again after a crash.
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -149,7 +151,7 @@ impl TouchInput {
         for n in 0..10 {
             let path = format!("/dev/input/event{n}");
             let c_path = std::ffi::CString::new(path.as_str()).unwrap();
-            let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+            let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
             if fd < 0 {
                 continue;
             }

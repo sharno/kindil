@@ -141,12 +141,17 @@ expect "session.sh and boot.sh stop and start the same services" "$SERVICES" "$B
 
 reset
 rm -f "$T/upstart"
-fake "$T/ext/kindil" 1.0.0 "exit 0"
 : >"$T/jobs"
-# kindil ran Wi-Fi itself; these name no live process.
-echo 999998 >"$T/udhcpc.pid"
-echo 999999 >"$T/wpa.pid"
+# kindil runs Wi-Fi itself; these name no live process.
+fake "$T/ext/kindil" 1.0.0 "echo 999998 >$T/udhcpc.pid; echo 999999 >$T/wpa.pid; exit 0"
 run
 expect "leaving after kindil ran Wi-Fi resets Amazon's Wi-Fi jobs for wifid" \
   "$(tr '\n' ',' <"$T/upstart" | cut -d, -f1-3)$([ -f "$T/wpa.pid" ] && echo ' pid left')" \
   "stop wifis,stop wifim,start wifid"
+
+reset
+rm -f "$T/runs"
+# A crash leaves kindil's Wi-Fi children behind; the restart must not find them.
+fake "$T/ext/kindil" 1.0.0 "echo ran >>$T/runs; [ -f $T/wpa.pid ] && echo found >>$T/runs; [ \$(grep -c ran $T/runs) -ge 2 ] && exit 0; echo 999999 >$T/wpa.pid; exit 139"
+run
+expect "a run after a crash doesn't find the crashed run's Wi-Fi children" "$(tr '\n' ' ' <"$T/runs")" "ran ran "

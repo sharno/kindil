@@ -144,7 +144,17 @@ if [ -f "$CONFIG" ]; then
 else
   set --
 fi
+# kindil's own Wi-Fi children (src/net.rs) from a run that crashed or was
+# killed: stopped before it runs again, which starts its Wi-Fi afresh.
+stop_children() {
+  for pidfile in $KINDIL_WIFI; do
+    [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null
+    rm -f "$pidfile"
+  done
+}
+
 while :; do
+  stop_children
   log "$("$BIN" --version)"
   "$BIN" "$@" kindle
   status=$?
