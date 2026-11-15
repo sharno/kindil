@@ -6,6 +6,7 @@
 //! shells, on a pseudo-terminal when one is asked for. No passwords, port
 //! forwarding, agent, X11 or subsystems (so no sftp). Its host key is its own
 //! ed25519 key, made on the first start. It runs on one thread.
+pub mod log;
 pub mod pty;
 
 use bytes::Bytes;
@@ -33,8 +34,6 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 pub const PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 /// The only user: everything runs as root, the server's own user.
 pub const USER: &str = "root";
-/// What one connection gets to authenticate, from its first byte.
-const LOGIN_TIME: Duration = Duration::from_secs(30);
 /// Bytes typed or piped into a session's program but not yet read by it.
 /// Past this, the connection waits for the program.
 const INPUT_BACKLOG: usize = 8 << 20;
@@ -45,9 +44,11 @@ const CHUNK: usize = 32 << 10;
 const DRAIN_QUIET: Duration = Duration::from_millis(100);
 const DRAIN_MAX: Duration = Duration::from_secs(2);
 
-fn log(message: std::fmt::Arguments) {
-    eprintln!("kindil-sshd: {message}");
-}
+use log::{line as log, noise};
+
+/// After the login deadline, how long a connection's task gets to wind
+/// down before its slot is given back anyway.
+const WIND_DOWN: Duration = Duration::from_secs(1);
 
 /// What the server serves, and where its files are.
 #[derive(Clone, Debug)]
@@ -61,6 +62,12 @@ pub struct Settings {
     pub path: String,
     pub max_connections: usize,
     pub max_auth_attempts: usize,
+    /// What a connection gets to log in, from its accept: then it is cut.
+    pub login_time: Duration,
+    /// New connections let in: this many a second on average, in bursts of
+    /// at most `admission_burst`.
+    pub admissions_per_second: f64,
+    pub admission_burst: f64,
 }
 
 impl Settings {
@@ -72,6 +79,9 @@ impl Settings {
             path: PATH.into(),
             max_connections: 8,
             max_auth_attempts: 6,
+            login_time: Duration::from_secs(30),
+            admissions_per_second: 2.0,
+            admission_burst: 6.0,
         }
     }
 
@@ -84,12 +94,14 @@ impl Settings {
     }
 }
 
-/// `kindil-sshd [--port N] [--dir DIR] [--listen ADDR]`.
+/// `kindil-sshd [--port N] [--dir DIR] [--listen ADDR] [--log FILE]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Args {
     pub port: u16,
     pub dir: PathBuf,
     pub listen: IpAddr,
+    /// The log file (capped, see [`log`]); stderr without one.
+    pub log: Option<PathBuf>,
 }
 
 impl Args {
@@ -98,12 +110,14 @@ impl Args {
             port: 22,
             dir: "/var/local/kindil/ssh".into(),
             listen: Ipv4Addr::UNSPECIFIED.into(),
+            log: None,
         };
         while let Some(arg) = args.next() {
             let mut value = || args.next().ok_or(format!("{arg} needs a value"));
             match arg.as_str() {
                 "--port" => parsed.port = value()?.parse().map_err(|e| format!("--port: {e}"))?,
                 "--dir" => parsed.dir = value()?.into(),
+                "--log" => parsed.log = Some(value()?.into()),
                 "--listen" => {
                     parsed.listen = value()?.parse().map_err(|e| format!("--listen: {e}"))?
                 }
@@ -243,8 +257,8 @@ pub fn config(key: PrivateKey, settings: &Settings) -> russh::server::Config {
 }
 
 /// Serves `listener` until it fails: each connection in a task, at most
-/// `max_connections` at a time (more are closed at once), each given
-/// [`LOGIN_TIME`] to log in.
+/// `max_connections` at a time and `admissions_per_second` new ones (more
+/// are closed at once), each cut at its login deadline unless logged in.
 pub async fn serve(listener: TcpListener, settings: Settings) -> io::Result<()> {
     std::fs::create_dir_all(&settings.dir)?;
     let key = host_key(&settings.host_key())?;
@@ -256,57 +270,126 @@ pub async fn serve(listener: TcpListener, settings: Settings) -> io::Result<()> 
     let config = Arc::new(config(key, &settings));
     let settings = Arc::new(settings);
     let live = Arc::new(AtomicUsize::new(0));
+    let mut bucket = Bucket::new(settings.admissions_per_second, settings.admission_burst);
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(error) => {
                 // Out of descriptors, say: the server carries on.
-                log(format_args!("accept: {error}"));
+                noise(format_args!("accept: {error}"));
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             }
         };
         if live.load(Ordering::SeqCst) >= settings.max_connections {
-            log(format_args!("{peer}: too many connections"));
+            noise(format_args!("{peer}: too many connections"));
+            continue;
+        }
+        if !bucket.admit(std::time::Instant::now()) {
+            noise(format_args!("{peer}: too many new connections"));
             continue;
         }
         let guard = Live::new(&live);
         let (config, settings) = (config.clone(), settings.clone());
         tokio::spawn(async move {
             let _guard = guard;
-            let (logged_in_tx, logged_in) = oneshot::channel();
-            let handler = Connection {
-                settings,
-                peer,
-                logged_in: Some(logged_in_tx),
-                channels: HashMap::new(),
-            };
-            let session = match tokio::time::timeout(
-                LOGIN_TIME,
-                russh::server::run_stream(config, socket, handler),
-            )
-            .await
-            {
-                Ok(Ok(session)) => session,
-                Ok(Err(error)) => return log(format_args!("{peer}: {error}")),
-                Err(_) => return log(format_args!("{peer}: no handshake")),
-            };
-            let handle = session.handle();
-            tokio::spawn(async move {
-                if tokio::time::timeout(LOGIN_TIME, logged_in).await.is_err() {
-                    let _ = handle
-                        .disconnect(
-                            russh::Disconnect::ByApplication,
-                            "login timed out".into(),
-                            "".into(),
-                        )
-                        .await;
-                }
-            });
-            if let Err(error) = session.await {
-                log(format_args!("{peer}: {error}"));
-            }
+            connection(config, settings, socket, peer).await;
         });
+    }
+}
+
+/// One connection, from accept to its end. Until it logs in it has one
+/// deadline, `login_time` from now: then its socket is shut down under
+/// russh (which may be busy, or waiting on a peer that sends nothing), and
+/// its slot is given back within [`WIND_DOWN`] whatever russh does.
+async fn connection(
+    config: Arc<russh::server::Config>,
+    settings: Arc<Settings>,
+    socket: tokio::net::TcpStream,
+    peer: SocketAddr,
+) {
+    let deadline = tokio::time::Instant::now() + settings.login_time;
+    // A second descriptor for the same socket, to shut it down from here.
+    let (socket, cutter) = match socket
+        .into_std()
+        .and_then(|socket| Ok((socket.try_clone()?, socket)))
+        .and_then(|(cutter, socket)| Ok((tokio::net::TcpStream::from_std(socket)?, cutter)))
+    {
+        Ok(pair) => pair,
+        Err(error) => return noise(format_args!("{peer}: {error}")),
+    };
+    let cut = || {
+        let _ = cutter.shutdown(std::net::Shutdown::Both);
+    };
+    let (logged_in_tx, logged_in) = oneshot::channel();
+    let handler = Connection {
+        settings,
+        peer,
+        logged_in: Some(logged_in_tx),
+        channels: HashMap::new(),
+    };
+    let started =
+        tokio::time::timeout_at(deadline, russh::server::run_stream(config, socket, handler));
+    let mut session = match started.await {
+        Ok(Ok(session)) => session,
+        Ok(Err(error)) => return noise(format_args!("{peer}: {error}")),
+        Err(_) => {
+            cut();
+            return noise(format_args!("{peer}: no handshake in time"));
+        }
+    };
+    let in_time = tokio::select! {
+        ended = &mut session => {
+            if let Err(error) = ended {
+                noise(format_args!("{peer}: {error}"));
+            }
+            return;
+        }
+        logged_in = logged_in => logged_in.is_ok(),
+        () = tokio::time::sleep_until(deadline) => false,
+    };
+    if !in_time {
+        cut();
+        noise(format_args!("{peer}: no login in time"));
+        let _ = tokio::time::timeout(WIND_DOWN, session).await;
+        return;
+    }
+    if let Err(error) = session.await {
+        noise(format_args!("{peer}: {error}"));
+    }
+}
+
+/// Admission: a token bucket.
+pub struct Bucket {
+    rate: f64,
+    burst: f64,
+    tokens: f64,
+    last: Option<std::time::Instant>,
+}
+
+impl Bucket {
+    pub fn new(rate: f64, burst: f64) -> Self {
+        Self {
+            rate,
+            burst,
+            tokens: burst,
+            last: None,
+        }
+    }
+
+    /// Whether one more may come in now.
+    pub fn admit(&mut self, now: std::time::Instant) -> bool {
+        if let Some(last) = self.last {
+            let refill = now.saturating_duration_since(last).as_secs_f64() * self.rate;
+            self.tokens = (self.tokens + refill).min(self.burst);
+        }
+        self.last = Some(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -330,7 +413,7 @@ impl Drop for Live {
 struct Connection {
     settings: Arc<Settings>,
     peer: SocketAddr,
-    /// Fired (dropped) once it has logged in, or once it ends.
+    /// Fired once it has logged in (dropped unfired if it ends before).
     logged_in: Option<oneshot::Sender<()>>,
     channels: HashMap<ChannelId, Chan>,
 }
@@ -376,7 +459,7 @@ impl Connection {
             return false;
         }
         authorized(&self.settings.authorized_keys(), key).unwrap_or_else(|error| {
-            log(format_args!("{}: {error}", self.peer));
+            noise(format_args!("{}: {error}", self.peer));
             false
         })
     }
@@ -591,7 +674,7 @@ impl russh::server::Handler for Connection {
         key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         if !signs_well(key.algorithm) || !self.allowed(user, key.public_key) {
-            log(format_args!("{}: refused {user}", self.peer));
+            noise(format_args!("{}: refused {user}", self.peer));
             return Ok(Auth::reject());
         }
         log(format_args!(
@@ -600,7 +683,9 @@ impl russh::server::Handler for Connection {
             key.public_key.algorithm(),
             key.public_key.fingerprint(HashAlg::Sha256)
         ));
-        self.logged_in.take();
+        if let Some(logged_in) = self.logged_in.take() {
+            let _ = logged_in.send(());
+        }
         Ok(Auth::Accept)
     }
 
@@ -786,6 +871,12 @@ mod tests {
         assert_eq!(parsed.port, 2222);
         assert_eq!(parsed.dir, Path::new("/var/local/kindil/ssh"));
         assert_eq!(parsed.listen, IpAddr::from(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(parsed.log, None);
+        let parsed = args(&["--log", "/var/local/kindil/sshd.log"]).unwrap();
+        assert_eq!(
+            parsed.log.as_deref(),
+            Some(Path::new("/var/local/kindil/sshd.log"))
+        );
         let parsed = args(&["--listen", "127.0.0.1"]).unwrap();
         assert_eq!(
             (parsed.port, parsed.listen),
@@ -794,6 +885,21 @@ mod tests {
         assert!(args(&["--port"]).is_err());
         assert!(args(&["--port", "x"]).is_err());
         assert!(args(&["--password"]).is_err());
+    }
+
+    #[test]
+    fn admits_bursts_then_a_steady_rate() {
+        let mut bucket = Bucket::new(2.0, 3.0);
+        let start = std::time::Instant::now();
+        assert!((0..3).all(|_| bucket.admit(start)));
+        assert!(!bucket.admit(start));
+        assert!(!bucket.admit(start + Duration::from_millis(400)));
+        assert!(bucket.admit(start + Duration::from_millis(600)));
+        assert!(!bucket.admit(start + Duration::from_millis(700)));
+        // A long quiet refills to the burst, no more.
+        let later = start + Duration::from_secs(60);
+        assert!((0..3).all(|_| bucket.admit(later)));
+        assert!(!bucket.admit(later));
     }
 
     #[test]

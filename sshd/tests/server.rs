@@ -39,7 +39,15 @@ impl Server {
 }
 
 async fn serve(authorized: &str, max_connections: usize) -> Server {
+    serve_with(authorized, |settings| {
+        settings.max_connections = max_connections
+    })
+    .await
+}
+
+async fn serve_with(authorized: &str, adjust: impl FnOnce(&mut sshd::Settings)) -> Server {
     let (dir, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let keys = dir.path().join("authorized_keys");
     std::fs::write(&keys, authorized).unwrap();
     std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -51,7 +59,10 @@ async fn serve(authorized: &str, max_connections: usize) -> Server {
         sshd::PATH,
         std::env::var("PATH").unwrap_or_default()
     );
-    settings.max_connections = max_connections;
+    // Tests connect often and quickly.
+    settings.admissions_per_second = 1000.0;
+    settings.admission_burst = 1000.0;
+    adjust(&mut settings);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(sshd::serve(listener, settings));
@@ -376,4 +387,64 @@ async fn refuses_rsa_signatures_with_sha1() {
         .await
         .unwrap()
         .success());
+}
+
+/// Seconds until the server closes `stream`, sending SSH_MSG_IGNORE (in
+/// the clear, as before any key exchange) every 200 ms if `chatty`.
+async fn seconds_until_cut(mut stream: tokio::net::TcpStream, chatty: bool) -> f64 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let since = std::time::Instant::now();
+    // uint32 length 12, padding length 6, SSH_MSG_IGNORE (2), empty string,
+    // 6 bytes of padding: 16 bytes in all.
+    let ignore = [0, 0, 0, 12, 6, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut buf = [0u8; 4096];
+    loop {
+        let tick = tokio::time::sleep(Duration::from_millis(200));
+        tokio::select! {
+            read = stream.read(&mut buf) => match read {
+                Ok(0) | Err(_) => return since.elapsed().as_secs_f64(),
+                Ok(_) => {}
+            },
+            () = tick => {
+                if chatty && stream.write_all(&ignore).await.is_err() {
+                    return since.elapsed().as_secs_f64();
+                }
+                assert!(since.elapsed() < Duration::from_secs(20), "never cut");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn cuts_a_peer_that_never_logs_in_and_frees_its_slot() {
+    use tokio::io::AsyncWriteExt;
+    let key = ed25519(1);
+    let server = serve_with(&line(key.public_key()), |settings| {
+        settings.max_connections = 1;
+        settings.login_time = Duration::from_secs(2);
+    })
+    .await;
+    for chatty in [true, false] {
+        let mut stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+        if chatty {
+            stream.write_all(b"SSH-2.0-stall\r\n").await.unwrap();
+        }
+        let cut = seconds_until_cut(stream, chatty).await;
+        assert!((1.5..3.5).contains(&cut), "cut after {cut} s");
+        // Its slot is free again: a real client gets in.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(login(server.addr, "root", key.clone()).await.is_some());
+    }
+}
+
+#[tokio::test]
+async fn a_peer_that_logs_in_outlives_the_deadline() {
+    let key = ed25519(1);
+    let server = serve_with(&line(key.public_key()), |settings| {
+        settings.login_time = Duration::from_secs(1);
+    })
+    .await;
+    let handle = login(server.addr, "root", key).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(exec(&handle, "exit 4", None).await.status, Some(4));
 }
