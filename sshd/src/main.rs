@@ -6,11 +6,14 @@ fn main() -> ExitCode {
     let args = match sshd::Args::parse(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(error) => {
-            eprintln!("kindil-sshd: {error}");
-            eprintln!("usage: kindil-sshd [--port N] [--dir DIR] [--listen ADDR]");
+            sshd::log::line(format_args!("{error}"));
+            sshd::log::line(format_args!(
+                "usage: kindil-sshd [--port N] [--dir DIR] [--listen ADDR] [--log FILE]"
+            ));
             return ExitCode::from(2);
         }
     };
+    sshd::log::to_file(args.log.clone());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build();
@@ -23,7 +26,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("kindil-sshd: {error}");
+            sshd::log::line(format_args!("{error}"));
             ExitCode::FAILURE
         }
     }

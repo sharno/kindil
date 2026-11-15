@@ -2955,6 +2955,7 @@ name = "kindil"
 version = "0.10.2"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "chrono-tz",
  "clap",
@@ -4740,9 +4741,10 @@ dependencies = [
 [[package]]
 name = "russh"
 version = "0.65.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94be3d86c71b9ed220a675c405e35c7a02565a009bf8da2e9cc13a700320a5c5"
 dependencies = [
  "aes",
- "aes-gcm",
  "bitflags 2.13.2",
  "block-padding",
  "byteorder",
@@ -4784,6 +4786,7 @@ dependencies = [
  "polyval",
  "rand",
  "rand_core",
+ "ring",
  "rsa",
  "russh-cryptovec",
  "russh-util",
@@ -4795,7 +4798,6 @@ dependencies = [
  "sha3",
  "signature",
  "spki",
- "ssh-cipher",
  "ssh-encoding",
  "ssh-key",
  "subtle",

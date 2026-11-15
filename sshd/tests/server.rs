@@ -39,7 +39,15 @@ impl Server {
 }
 
 async fn serve(authorized: &str, max_connections: usize) -> Server {
+    serve_with(authorized, |settings| {
+        settings.max_connections = max_connections
+    })
+    .await
+}
+
+async fn serve_with(authorized: &str, adjust: impl FnOnce(&mut sshd::Settings)) -> Server {
     let (dir, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let keys = dir.path().join("authorized_keys");
     std::fs::write(&keys, authorized).unwrap();
     std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -51,7 +59,10 @@ async fn serve(authorized: &str, max_connections: usize) -> Server {
         sshd::PATH,
         std::env::var("PATH").unwrap_or_default()
     );
-    settings.max_connections = max_connections;
+    // Tests connect often and quickly.
+    settings.admissions_per_second = 1000.0;
+    settings.admission_burst = 1000.0;
+    adjust(&mut settings);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(sshd::serve(listener, settings));
@@ -295,4 +306,337 @@ fn makes_its_host_key_once_root_only() {
     let pem = std::fs::read_to_string(&path).unwrap();
     assert!(pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
     let _ = made.to_openssh(LineEnding::LF).unwrap();
+}
+
+/// Connects offering only `kex` and `cipher`; whether it logs in.
+async fn login_with(
+    addr: SocketAddr,
+    key: PrivateKey,
+    kex: russh::kex::Name,
+    cipher: russh::cipher::Name,
+) -> bool {
+    let mut config = client::Config::default();
+    config.preferred.kex = vec![kex, russh::kex::EXTENSION_SUPPORT_AS_CLIENT].into();
+    config.preferred.cipher = vec![cipher].into();
+    let Ok(mut handle) = client::connect(Arc::new(config), addr, Client).await else {
+        return false;
+    };
+    let key = PrivateKeyWithHashAlg::new(Arc::new(key), None);
+    matches!(handle.authenticate_publickey("root", key).await, Ok(r) if r.success())
+}
+
+#[tokio::test]
+async fn offers_only_elliptic_curve_kex_and_aead_ciphers() {
+    use russh::{cipher, kex};
+    let key = ed25519(1);
+    let server = serve(&line(key.public_key()), 8).await;
+    for kex in [
+        kex::MLKEM768X25519_SHA256,
+        kex::CURVE25519,
+        kex::CURVE25519_PRE_RFC_8731,
+    ] {
+        for cipher in [
+            cipher::CHACHA20_POLY1305,
+            cipher::AES_256_GCM,
+            cipher::AES_128_GCM,
+        ] {
+            assert!(
+                login_with(server.addr, key.clone(), kex, cipher).await,
+                "{kex:?} {cipher:?}"
+            );
+        }
+    }
+    for kex in [
+        kex::DH_G14_SHA256,
+        kex::DH_G16_SHA512,
+        kex::DH_G18_SHA512,
+        kex::DH_GEX_SHA256,
+    ] {
+        assert!(
+            !login_with(server.addr, key.clone(), kex, cipher::CHACHA20_POLY1305).await,
+            "{kex:?}"
+        );
+    }
+    for cipher in [
+        cipher::AES_128_CTR,
+        cipher::AES_256_CTR,
+        cipher::AES_256_CBC,
+    ] {
+        assert!(
+            !login_with(server.addr, key.clone(), kex::CURVE25519, cipher).await,
+            "{cipher:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn refuses_rsa_signatures_with_sha1() {
+    let key = rsa();
+    let server = serve(&line(key.public_key()), 8).await;
+    let config = Arc::new(client::Config::default());
+    let mut handle = client::connect(config, server.addr, Client).await.unwrap();
+    let sha1 = PrivateKeyWithHashAlg::new(Arc::new(key.clone()), None);
+    assert!(!handle
+        .authenticate_publickey("root", sha1)
+        .await
+        .unwrap()
+        .success());
+    let sha512 = PrivateKeyWithHashAlg::new(Arc::new(key), Some(russh::keys::HashAlg::Sha512));
+    assert!(handle
+        .authenticate_publickey("root", sha512)
+        .await
+        .unwrap()
+        .success());
+}
+
+/// Seconds until the server closes `stream`, sending SSH_MSG_IGNORE (in
+/// the clear, as before any key exchange) every 200 ms if `chatty`.
+async fn seconds_until_cut(mut stream: tokio::net::TcpStream, chatty: bool) -> f64 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let since = std::time::Instant::now();
+    // uint32 length 12, padding length 6, SSH_MSG_IGNORE (2), empty string,
+    // 6 bytes of padding: 16 bytes in all.
+    let ignore = [0, 0, 0, 12, 6, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut buf = [0u8; 4096];
+    loop {
+        let tick = tokio::time::sleep(Duration::from_millis(200));
+        tokio::select! {
+            read = stream.read(&mut buf) => match read {
+                Ok(0) | Err(_) => return since.elapsed().as_secs_f64(),
+                Ok(_) => {}
+            },
+            () = tick => {
+                if chatty && stream.write_all(&ignore).await.is_err() {
+                    return since.elapsed().as_secs_f64();
+                }
+                assert!(since.elapsed() < Duration::from_secs(20), "never cut");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn cuts_a_peer_that_never_logs_in_and_frees_its_slot() {
+    use tokio::io::AsyncWriteExt;
+    let key = ed25519(1);
+    for chatty in [true, false] {
+        // One slot, so the cut peer's slot is the one a real client needs.
+        let server = serve_with(&line(key.public_key()), |settings| {
+            settings.max_connections = 1;
+            settings.login_time = Duration::from_secs(2);
+        })
+        .await;
+        let mut stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+        if chatty {
+            stream.write_all(b"SSH-2.0-stall\r\n").await.unwrap();
+        }
+        let cut = seconds_until_cut(stream, chatty).await;
+        assert!((1.5..5.0).contains(&cut), "cut after {cut} s");
+        // Its slot is free again: a real client gets in.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(login(server.addr, "root", key.clone()).await.is_some());
+    }
+}
+
+#[tokio::test]
+async fn a_peer_that_logs_in_outlives_the_deadline() {
+    let key = ed25519(1);
+    // Long enough to log in under an emulator, too.
+    let server = serve_with(&line(key.public_key()), |settings| {
+        settings.login_time = Duration::from_secs(5);
+    })
+    .await;
+    let handle = login(server.addr, "root", key).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(exec(&handle, "exit 4", None).await.status, Some(4));
+}
+
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// The pids a command wrote to `file`, once it has.
+async fn pids(file: &Path) -> Vec<i32> {
+    for _ in 0..100 {
+        if let Ok(text) = std::fs::read_to_string(file) {
+            if text.ends_with('\n') {
+                return text
+                    .split_whitespace()
+                    .map(|p| p.parse().unwrap())
+                    .collect();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no pids in {}", file.display());
+}
+
+/// Whether all of `pids` are gone within `within`.
+async fn gone(pids: &[i32], within: Duration) -> bool {
+    let since = std::time::Instant::now();
+    while since.elapsed() < within {
+        if !pids.iter().any(|&pid| alive(pid)) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn closing_a_channel_ends_its_program_and_process_group() {
+    let key = ed25519(1);
+    let server = serve(&line(key.public_key()), 8).await;
+    let handle = login(server.addr, "root", key).await.unwrap();
+    let file = server.home.path().join("pids");
+    // A background job, and a job that ignores SIGHUP and SIGTERM.
+    let command = format!(
+        "sleep 300 & trap '' HUP TERM; echo $$ $! > {}; while :; do sleep 1; done",
+        file.display()
+    );
+    let channel = handle.channel_open_session().await.unwrap();
+    channel.exec(true, command).await.unwrap();
+    let pids = pids(&file).await;
+    assert!(pids.iter().all(|&pid| alive(pid)));
+    channel.close().await.unwrap();
+    // SIGKILL comes 2 s after SIGTERM.
+    assert!(
+        gone(&pids, Duration::from_secs(6)).await,
+        "{pids:?} still there"
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_connection_ends_its_programs() {
+    let key = ed25519(1);
+    let server = serve(&line(key.public_key()), 8).await;
+    let handle = login(server.addr, "root", key).await.unwrap();
+    let (piped, typed) = (
+        server.home.path().join("piped"),
+        server.home.path().join("typed"),
+    );
+    let channel = handle.channel_open_session().await.unwrap();
+    let command = format!("echo $$ > {}; sleep 300", piped.display());
+    channel.exec(true, command).await.unwrap();
+    let mut pids_seen = pids(&piped).await;
+    if Path::new("/dev/ptmx").exists() {
+        let shell = handle.channel_open_session().await.unwrap();
+        shell
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        shell.request_shell(true).await.unwrap();
+        let typing = format!("echo $$ > {}; sleep 300\n", typed.display());
+        shell.data(typing.as_bytes()).await.unwrap();
+        pids_seen.extend(pids(&typed).await);
+    }
+    handle
+        .disconnect(russh::Disconnect::ByApplication, "", "")
+        .await
+        .unwrap();
+    drop(handle);
+    assert!(
+        gone(&pids_seen, Duration::from_secs(6)).await,
+        "{pids_seen:?} still there"
+    );
+}
+
+#[tokio::test]
+async fn a_finished_commands_background_jobs_stay() {
+    let key = ed25519(1);
+    let server = serve(&line(key.public_key()), 8).await;
+    let handle = login(server.addr, "root", key).await.unwrap();
+    let out = exec(
+        &handle,
+        "sleep 30 </dev/null >/dev/null 2>&1 & echo $!",
+        None,
+    )
+    .await;
+    assert_eq!(out.status, Some(0));
+    let pid: i32 = out.stdout().trim().parse().unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(alive(pid), "the background job went with its channel");
+    // SAFETY: the test's own sleep.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+}
+
+#[tokio::test]
+async fn a_program_that_stops_reading_keeps_its_output_and_status() {
+    let key = ed25519(1);
+    let server = serve(&line(key.public_key()), 8).await;
+    let handle = login(server.addr, "root", key).await.unwrap();
+    let channel = handle.channel_open_session().await.unwrap();
+    channel.exec(true, "head -c 3; exit 5").await.unwrap();
+    let (mut read, write) = channel.split();
+    // Sent alongside: the server closes the channel before it is all sent.
+    let sending = tokio::spawn(async move {
+        let data = vec![b'x'; 3 << 20];
+        let _ = write.data(&data[..]).await;
+    });
+    let mut out = Output::default();
+    while let Some(msg) = tokio::time::timeout(Duration::from_secs(20), read.wait())
+        .await
+        .expect("the server went quiet")
+    {
+        match msg {
+            ChannelMsg::Data { data } => out.stdout.extend_from_slice(&data),
+            ChannelMsg::ExitStatus { exit_status } => out.status = Some(exit_status),
+            _ => {}
+        }
+    }
+    sending.abort();
+    assert_eq!(out.stdout(), "xxx");
+    assert_eq!(out.status, Some(5));
+}
+
+#[tokio::test]
+async fn opens_at_most_four_channels_per_connection() {
+    let key = ed25519(1);
+    let server = serve(&line(key.public_key()), 8).await;
+    let handle = login(server.addr, "root", key).await.unwrap();
+    let mut open = Vec::new();
+    for _ in 0..4 {
+        open.push(handle.channel_open_session().await.unwrap());
+    }
+    assert!(handle.channel_open_session().await.is_err());
+    // A closed one makes room.
+    open.pop().unwrap().close().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(handle.channel_open_session().await.is_ok());
+}
+
+#[tokio::test]
+async fn a_program_that_never_reads_is_ended_rather_than_stall_the_connection() {
+    let key = ed25519(1);
+    let server = serve_with(&line(key.public_key()), |settings| {
+        settings.input_wait = Duration::from_secs(1);
+    })
+    .await;
+    let handle = login(server.addr, "root", key).await.unwrap();
+    let file = server.home.path().join("pid");
+    let channel = handle.channel_open_session().await.unwrap();
+    channel
+        .exec(
+            true,
+            format!("echo $$ > {}; exec sleep 300", file.display()),
+        )
+        .await
+        .unwrap();
+    let pid = pids(&file).await;
+    let (mut read, write) = channel.split();
+    let sending = tokio::spawn(async move {
+        let data = vec![b'x'; 8 << 20];
+        let _ = write.data(&data[..]).await;
+    });
+    // Ended: no exit status, the channel just closes.
+    while tokio::time::timeout(Duration::from_secs(20), read.wait())
+        .await
+        .expect("the server went quiet")
+        .is_some()
+    {}
+    sending.abort();
+    assert!(gone(&pid, Duration::from_secs(6)).await);
+    // The connection is still good.
+    assert_eq!(exec(&handle, "exit 2", None).await.status, Some(2));
 }

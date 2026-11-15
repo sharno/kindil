@@ -36,6 +36,9 @@ pub trait Os: Sync {
     fn module_loaded(&self, module: &str) -> bool;
     /// `modprobe -r MODULE`.
     fn unload_module(&self, module: &str);
+    /// Deletes every copy of the firewall rule kindil adds to let `port` in
+    /// over Wi-Fi (src/ssh.rs).
+    fn close_port(&self, port: u16);
 }
 
 /// The PW1 itself.
@@ -123,6 +126,19 @@ impl Os for Device {
 
     fn stop(&self, job: &str) {
         quiet("/sbin/stop", &[job]);
+    }
+
+    fn close_port(&self, port: u16) {
+        let port = port.to_string();
+        let rule = [
+            "-D", "INPUT", "-i", "wlan0", "-p", "tcp", "--dport", &port, "-j", "ACCEPT",
+        ];
+        // Its iptables (1.3.8) has no -C: delete until there is none.
+        for _ in 0..8 {
+            if !quiet("/usr/sbin/iptables", &rule) {
+                break;
+            }
+        }
     }
 
     fn sleep(&self, time: Duration) {
@@ -418,6 +434,8 @@ pub mod fake {
         pub during: Mutex<Option<BTreeSet<String>>>,
         /// The pid files ended.
         pub ended: Mutex<Vec<std::path::PathBuf>>,
+        /// Ports whose firewall rule was deleted.
+        pub closed_ports: Mutex<Vec<u16>>,
         /// At boot: Amazon's UI comes up while the launcher waits, if X
         /// runs to bring it.
         pub gui_coming: Mutex<bool>,
@@ -540,6 +558,10 @@ pub mod fake {
         }
 
         fn kill_orphaned_watchers(&self) {}
+
+        fn close_port(&self, port: u16) {
+            self.closed_ports.lock().unwrap().push(port);
+        }
 
         fn alive(&self, pid: i32) -> bool {
             pid == UP && !*self.died.lock().unwrap()

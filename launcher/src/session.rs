@@ -371,6 +371,8 @@ fn restore(paths: &Paths, os: &dyn Os, gui: bool, usb: Option<UsbDrive>) {
     }
     log("starting the Kindle UI");
     wifi_back(paths, os);
+    // kindil, even one that crashed, may have let its SSH port in.
+    os.close_port(crate::SSH_PORT);
     for job in SERVICES {
         if !os.running(job) {
             os.start(job);
@@ -781,6 +783,17 @@ mod tests {
         );
         assert!(os.running("wifid"));
         assert!(!wpa.exists() && !dhcp.exists());
+        // And kindil's SSH port is shut again.
+        assert_eq!(*os.closed_ports.lock().unwrap(), [2222]);
+    }
+
+    #[test]
+    fn a_crashed_kindils_ssh_port_is_shut_on_the_way_out() {
+        let env = Env::new();
+        let os = Fake::default();
+        env.fake(&env.ext("kindil"), "1.0.0", "kill -SEGV $$");
+        env.session(&os);
+        assert!(os.closed_ports.lock().unwrap().contains(&crate::SSH_PORT));
     }
 
     #[test]

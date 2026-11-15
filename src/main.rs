@@ -170,6 +170,8 @@ fn kindle(cli: &Cli) -> anyhow::Result<Exit> {
     kindil::signals::quit_on_termination()?;
     app.window.run()?;
     app.shutdown();
+    // Its SSH server goes with it, and its port is shut.
+    kindil::ssh::stop();
     Ok(app.exit())
 }
 

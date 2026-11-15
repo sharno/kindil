@@ -792,7 +792,9 @@ pub(crate) fn terminate(file: &str) {
         if !gone_within(libc::SIGTERM, Duration::from_secs(3))
             && !gone_within(libc::SIGKILL, Duration::from_secs(2))
         {
-            eprintln!("kindil: process {pid} ({file}) won't exit");
+            // Never panics, unlike eprintln!: a full /var/local.
+            let line = format!("kindil: process {pid} ({file}) won't exit\n");
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
         }
     }
     let _ = std::fs::remove_file(file);

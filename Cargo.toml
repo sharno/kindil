@@ -28,6 +28,8 @@ ureq = "3"
 minisign-verify = "0.2"
 # kindil install: the bundle's checksum, unpacking it and backing up.
 sha2 = "0.10"
+# SSH key fingerprints, as ssh-keygen prints them (src/ssh_keys.rs).
+base64 = "0.23"
 tar = "0.4"
 flate2 = "1.1"
 toml = "1.2"
@@ -59,8 +61,6 @@ slint-build = "=1.18.1"
 # Vendored to add request_full_refresh() for ghosting control; upstream candidate.
 [patch.crates-io]
 slint-backend-kindle = { path = "vendor/slint-backend-kindle" }
-# Vendored to add a pure-Rust (RustCrypto) AEAD backend: no ring, no aws-lc-rs.
-russh = { path = "vendor/russh" }
 
 [profile.release]
 # Speed over size: the binary is a few MB either way, and page turns matter more.

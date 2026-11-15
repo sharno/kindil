@@ -62,12 +62,14 @@ and a reboot always returns the Kindle to stock.
     a nap. None of Amazon's Wi-Fi services run while kindil does; on a
     first run it starts with no networks, ready to join one.
   - **SSH of its own**: kindil carries kindil-sshd (`sshd/`, Rust, on
-    russh with pure-Rust crypto) and runs it as its child on port 2222 for
-    now, beside USBNetwork's on 22: keys only (ed25519, RSA), commands and
-    shells. It uses USBNetwork's `usbnet/etc/authorized_keys`, copied to
-    `/var/local/kindil/ssh/` whenever it is there, and a host key of its own;
-    nothing of it is on `/mnt/us`. It ends with kindil, and its sessions with
-    it.
+    russh) and runs it as its child on port 2222 for now, beside
+    USBNetwork's on 22: keys only (ed25519, RSA), commands and shells. Its trusted keys are its own list in `/var/local/kindil/ssh/`,
+    which USBNetwork's `usbnet/etc/authorized_keys` seeds on the first start
+    only: keys added on the USB storage later (anyone with the Kindle on a
+    cable can) show in Settings → Remote access with their fingerprints, to
+    Trust or Ignore. Its host key is its own; nothing of it is on `/mnt/us`.
+    It ends with kindil, and its sessions with it; its log is
+    `/var/local/kindil/sshd.log`, kept under 64 KiB.
   - **USB drive mode**: plugging into a computer shows a USB screen while the
     computer has `/mnt/us`; unplugging reloads the library and resumes
     Syncthing. A cable that keeps dropping doesn't flash the screen: kindil
@@ -201,9 +203,10 @@ faster.
 | `/mnt/us/extensions/kindil/` | KUAL launcher and the `kindil` binary; during an update also `kindil.next`, `kindil.trying`, and afterwards `kindil.previous` |
 | `/var/local/kindil/` | The running copy, the launcher and the log; off `/mnt/us`, which a computer takes in USB drive mode |
 | `/var/local/kindil/networks.toml` | The Wi-Fi networks joined in kindil, with their passwords (root only) |
-| `/var/local/kindil/kindil-sshd`, `/var/local/kindil/ssh/` | kindil's SSH server, its host key and authorized keys (root only) |
 | `/var/local/kindil/usb-drive` | `kindil` inside: kindil runs USB drive mode instead of volumd (off by default; [docs/USB-DRIVE-TEST.md](docs/USB-DRIVE-TEST.md)) |
 | `/var/local/kindil/usb-exported` | Present while a computer may have the storage: the next start checks it |
+| `/var/local/kindil/kindil-sshd`, `/var/local/kindil/ssh/` | kindil's SSH server, its host key, trusted and ignored keys (root only) |
+| `/var/local/kindil/sshd.log` | kindil's SSH server's log (and `sshd.log.1`), under 64 KiB each |
 | `/mnt/us/kindil/kindil.toml` | Optional settings (every key has a default) |
 | `/mnt/us/kindil/miqat.toml` | Miqat's own settings: location, prayer method |
 | `/mnt/us/kindil/prefs.toml` | Choices made on the device; safe to delete |
@@ -282,7 +285,8 @@ someone nearby to press the power button, or must end on their own first.
 | `net.rs` | Wi-Fi run by kindil: driver, supervised wpa_supplicant and udhcpc |
 | `station.rs`, `wext.rs`, `pmk.rs` | kindil's own Wi-Fi without wpa_supplicant, behind the `/var/local/kindil/wifi` switch (see [docs/WIFI-RUST-TEST.md](docs/WIFI-RUST-TEST.md)): the AR6003 firmware's WPA2-PSK offload through wireless-extension ioctls |
 | `networks.rs` | The saved Wi-Fi networks |
-| `ssh.rs` | SSH run by kindil: its kindil-sshd, keys, firewall port, supervised |
+| `ssh.rs` | SSH run by kindil: its kindil-sshd, firewall port, supervised |
+| `ssh_keys.rs` | The keys it trusts: seeded once from USBNetwork's, then trusted in Settings by fingerprint |
 | `sync.rs` | Syncthing as a typed state machine |
 | `update.rs` | Over-the-air updates: GitHub releases, signature check, trial and commit |
 | `system.rs` | Sleep, wake and USB drive mode as a state machine |
@@ -291,7 +295,6 @@ someone nearby to press the power button, or must end on their own first.
 | `ghosting.rs` | When to flash the panel |
 | `launcher.rs` | Writes out the launcher kindil carries, once it has run two minutes |
 | `vendor/slint-backend-kindle` | Display/touch backend, patched for full refresh |
-| `vendor/russh` | russh 0.65.1 with a pure-Rust AEAD backend (see its `KINDIL.md`) |
 | `sshd/` | kindil-sshd, its own small crate: keys-only SSH server (exec, shells on a pty) |
 | `launcher/` | The launcher, its own small crate: the session around kindil (Amazon's UI and services aside, crash restart, update trial, restore) and the boot guard |
 

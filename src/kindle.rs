@@ -5,7 +5,8 @@
 use crate::battery::{Battery, Charge};
 use crate::frontlight::Frontlight;
 use crate::host::{
-    Boot, BootStart, Brightness, Deliver, DeviceInfo, Host, Memory, Power, Ssh, Storage, Wifi,
+    Boot, BootStart, Brightness, Deliver, DeviceInfo, Host, Memory, OwnSsh, Power, Ssh, SshKey,
+    Storage, Wifi,
 };
 use crate::net::Net;
 use crate::networks::{self, Networks};
@@ -227,6 +228,39 @@ impl Host for KindleHost {
             Power::On => Ok(std::fs::write(USBNET_AT_BOOT, b"")?),
             Power::Off => remove_if_present(USBNET_AT_BOOT),
         }
+    }
+
+    fn own_ssh(&self) -> OwnSsh {
+        let layout = crate::ssh::Layout::default();
+        let usb = Path::new(crate::ssh::USBNET_AUTHORIZED_KEYS);
+        let keys = |list: anyhow::Result<Vec<crate::ssh_keys::Key>>| {
+            list.unwrap_or_default().iter().map(SshKey::from).collect()
+        };
+        OwnSsh {
+            port: crate::ssh::PORT,
+            running: crate::ssh::running(),
+            trusted: keys(crate::ssh_keys::trusted(&layout.authorized_keys())),
+            new_on_usb: keys(crate::ssh_keys::new_on_usb(
+                usb,
+                &layout.authorized_keys(),
+                &layout.ignored_keys(),
+            )),
+        }
+    }
+
+    fn trust_ssh_keys(&self, fingerprints: &[String]) -> anyhow::Result<()> {
+        let layout = crate::ssh::Layout::default();
+        crate::ssh_keys::trust(
+            Path::new(crate::ssh::USBNET_AUTHORIZED_KEYS),
+            &layout.authorized_keys(),
+            &layout.ignored_keys(),
+            fingerprints,
+        )?;
+        Ok(())
+    }
+
+    fn ignore_ssh_keys(&self, fingerprints: &[String]) -> anyhow::Result<()> {
+        crate::ssh_keys::ignore(&crate::ssh::Layout::default().ignored_keys(), fingerprints)
     }
 
     fn boot_start(&self) -> BootStart {

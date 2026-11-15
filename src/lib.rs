@@ -23,6 +23,7 @@ pub mod preview;
 pub mod reader;
 pub mod signals;
 pub mod ssh;
+pub mod ssh_keys;
 pub mod station;
 pub mod sync;
 pub mod system;

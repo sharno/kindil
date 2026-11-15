@@ -6,6 +6,7 @@
 //! shells, on a pseudo-terminal when one is asked for. No passwords, port
 //! forwarding, agent, X11 or subsystems (so no sftp). Its host key is its own
 //! ed25519 key, made on the first start. It runs on one thread.
+pub mod log;
 pub mod pty;
 
 use bytes::Bytes;
@@ -13,7 +14,8 @@ use russh::keys::ssh_key::private::Ed25519Keypair;
 use russh::keys::ssh_key::{AuthorizedKeys, LineEnding};
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
 use russh::server::{Auth, ChannelOpenHandle, Handle, Msg, Session};
-use russh::{Channel, ChannelId, MethodKind, MethodSet, SshId};
+use russh::{Channel, ChannelId, MethodKind, MethodSet, Preferred, SshId};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -26,17 +28,22 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 
 /// Sessions' PATH: the Kindle's usual one, sbin (upstart's tools) included.
 pub const PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 /// The only user: everything runs as root, the server's own user.
 pub const USER: &str = "root";
-/// What one connection gets to authenticate, from its first byte.
-const LOGIN_TIME: Duration = Duration::from_secs(30);
-/// Bytes typed or piped into a session's program but not yet read by it.
-/// Past this, the connection waits for the program.
-const INPUT_BACKLOG: usize = 8 << 20;
+/// Bytes typed or piped into a session's program but not yet read by it,
+/// and the messages they came in. Past this, the connection waits for the
+/// program, for at most `Settings::input_wait`: then the channel's program
+/// is ended.
+const INPUT_BACKLOG: usize = 2 << 20;
+const INPUT_MESSAGES: usize = 256;
+/// Session channels one connection may have open.
+const CHANNELS: usize = 4;
+/// How long a channel's programs get between SIGTERM and SIGKILL.
+const GRACE: Duration = Duration::from_secs(2);
 /// Output read from a program at a time.
 const CHUNK: usize = 32 << 10;
 /// How long a shell's last output may take to come through its terminal
@@ -44,9 +51,11 @@ const CHUNK: usize = 32 << 10;
 const DRAIN_QUIET: Duration = Duration::from_millis(100);
 const DRAIN_MAX: Duration = Duration::from_secs(2);
 
-fn log(message: std::fmt::Arguments) {
-    eprintln!("kindil-sshd: {message}");
-}
+use log::{line as log, noise};
+
+/// After the login deadline, how long a connection's task gets to wind
+/// down before its slot is given back anyway.
+const WIND_DOWN: Duration = Duration::from_secs(1);
 
 /// What the server serves, and where its files are.
 #[derive(Clone, Debug)]
@@ -60,6 +69,15 @@ pub struct Settings {
     pub path: String,
     pub max_connections: usize,
     pub max_auth_attempts: usize,
+    /// What a connection gets to log in, from its accept: then it is cut.
+    pub login_time: Duration,
+    /// New connections let in: this many a second on average, in bursts of
+    /// at most `admission_burst`.
+    pub admissions_per_second: f64,
+    pub admission_burst: f64,
+    /// How long the connection waits for a program to take its input
+    /// before the program is ended.
+    pub input_wait: Duration,
 }
 
 impl Settings {
@@ -71,6 +89,10 @@ impl Settings {
             path: PATH.into(),
             max_connections: 8,
             max_auth_attempts: 6,
+            login_time: Duration::from_secs(30),
+            admissions_per_second: 2.0,
+            admission_burst: 6.0,
+            input_wait: Duration::from_secs(60),
         }
     }
 
@@ -83,12 +105,14 @@ impl Settings {
     }
 }
 
-/// `kindil-sshd [--port N] [--dir DIR] [--listen ADDR]`.
+/// `kindil-sshd [--port N] [--dir DIR] [--listen ADDR] [--log FILE]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Args {
     pub port: u16,
     pub dir: PathBuf,
     pub listen: IpAddr,
+    /// The log file (capped, see [`log`]); stderr without one.
+    pub log: Option<PathBuf>,
 }
 
 impl Args {
@@ -97,12 +121,14 @@ impl Args {
             port: 22,
             dir: "/var/local/kindil/ssh".into(),
             listen: Ipv4Addr::UNSPECIFIED.into(),
+            log: None,
         };
         while let Some(arg) = args.next() {
             let mut value = || args.next().ok_or(format!("{arg} needs a value"));
             match arg.as_str() {
                 "--port" => parsed.port = value()?.parse().map_err(|e| format!("--port: {e}"))?,
                 "--dir" => parsed.dir = value()?.into(),
+                "--log" => parsed.log = Some(value()?.into()),
                 "--listen" => {
                     parsed.listen = value()?.parse().map_err(|e| format!("--listen: {e}"))?
                 }
@@ -113,12 +139,58 @@ impl Args {
     }
 }
 
+/// Opens `path` to read, refusing a symlink (the last component).
+fn open_no_symlink(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+fn euid() -> u32 {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+/// The server's directory: made if missing, and then a real directory,
+/// the server user's (root's), 0700.
+pub fn own_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.uid() != euid() {
+        return Err(io::Error::other(format!(
+            "{} is not a directory of this user's",
+            dir.display()
+        )));
+    }
+    if meta.mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// The host key at `path`, made (ed25519, root's only) if there is none. A
 /// file beside it is renamed over it, so a half-written key never stays.
+/// A symlink, or a key file of another user's, is refused.
 pub fn host_key(path: &Path) -> io::Result<PrivateKey> {
-    match std::fs::read_to_string(path) {
-        Ok(pem) => {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    match open_no_symlink(path) {
+        Ok(mut file) => {
+            let meta = file.metadata()?;
+            if !meta.is_file() || meta.uid() != euid() {
+                return Err(io::Error::other(format!(
+                    "{} is not a file of this user's",
+                    path.display()
+                )));
+            }
+            if meta.mode() & 0o077 != 0 {
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            let mut pem = String::new();
+            io::Read::read_to_string(&mut file, &mut pem)?;
             return PrivateKey::from_openssh(pem).map_err(io::Error::other);
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -130,6 +202,7 @@ pub fn host_key(path: &Path) -> io::Result<PrivateKey> {
     seed.fill(0);
     let pem = key.to_openssh(LineEnding::LF).map_err(io::Error::other)?;
     let part = path.with_extension("part");
+    // A stale one (even a symlink) goes; O_EXCL then makes a new file.
     let _ = std::fs::remove_file(&part);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -148,21 +221,23 @@ pub fn host_key(path: &Path) -> io::Result<PrivateKey> {
 
 /// Whether `key` is in the authorized keys at `file`. Only ed25519 and RSA
 /// keys count, and only those without options (`command=`, `from=`...),
-/// which this server doesn't enforce. A file others could change is refused.
+/// which this server doesn't enforce. A symlink, a file of another user's
+/// or one others could change is refused.
 pub fn authorized(file: &Path, key: &PublicKey) -> io::Result<bool> {
-    let meta = match std::fs::metadata(file) {
-        Ok(meta) => meta,
+    let mut opened = match open_no_symlink(file) {
+        Ok(opened) => opened,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    // SAFETY: geteuid has no preconditions.
-    if meta.mode() & 0o022 != 0 || meta.uid() != unsafe { libc::geteuid() } {
+    let meta = opened.metadata()?;
+    if !meta.is_file() || meta.mode() & 0o022 != 0 || meta.uid() != euid() {
         return Err(io::Error::other(format!(
-            "{} is writable by others",
+            "{} is not a file only this user can change",
             file.display()
         )));
     }
-    let keys = std::fs::read_to_string(file)?;
+    let mut keys = String::new();
+    io::Read::read_to_string(&mut opened, &mut keys)?;
     Ok(AuthorizedKeys::new(&keys).flatten().any(|entry| {
         let known = entry.public_key();
         entry.config_opts().is_empty()
@@ -174,11 +249,59 @@ pub fn authorized(file: &Path, key: &PublicKey) -> io::Result<bool> {
     }))
 }
 
-/// russh's settings: keys only, a few tries, no idle limit but keepalives.
+/// The algorithms offered, and nothing else: elliptic-curve key exchange
+/// only (finite-field Diffie-Hellman is slow work an unauthenticated peer
+/// could ask for, on the Kindle's one core), AEAD ciphers only (so no MAC is
+/// ever negotiated), no compression. The host key is ed25519 (the only one
+/// there is); user keys sign with ed25519 or RSA with SHA-2.
+pub fn preferred() -> Preferred {
+    use russh::keys::HashAlg;
+    Preferred {
+        kex: Cow::Borrowed(&[
+            russh::kex::MLKEM768X25519_SHA256,
+            russh::kex::CURVE25519,
+            russh::kex::CURVE25519_PRE_RFC_8731,
+            // Not algorithms: RFC 8308 extensions and OpenSSH's strict key
+            // exchange (Terrapin).
+            russh::kex::EXTENSION_SUPPORT_AS_SERVER,
+            russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER,
+        ]),
+        key: Cow::Borrowed(&[
+            Algorithm::Ed25519,
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512),
+            },
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha256),
+            },
+        ]),
+        host_key_certificates: Cow::Borrowed(&[]),
+        cipher: Cow::Borrowed(&[
+            russh::cipher::CHACHA20_POLY1305,
+            russh::cipher::AES_256_GCM,
+            russh::cipher::AES_128_GCM,
+        ]),
+        mac: Cow::Borrowed(&[]),
+        compression: Cow::Borrowed(&[russh::compression::NONE]),
+    }
+}
+
+/// Whether a user key may sign with `algorithm`: not RSA with SHA-1.
+fn signs_well(algorithm: &Algorithm) -> bool {
+    matches!(
+        algorithm,
+        Algorithm::Ed25519 | Algorithm::Rsa { hash: Some(_) }
+    )
+}
+
+/// russh's settings: keys only, a few tries, no idle limit but keepalives,
+/// fresh keys every 128 MiB or hour each way.
 pub fn config(key: PrivateKey, settings: &Settings) -> russh::server::Config {
     let mut methods = MethodSet::empty();
     methods.push(MethodKind::PublicKey);
     russh::server::Config {
+        preferred: preferred(),
+        limits: russh::Limits::new(128 << 20, 128 << 20, Duration::from_secs(3600)),
         server_id: SshId::Standard("SSH-2.0-kindil".into()),
         methods,
         auth_rejection_time: Duration::from_secs(1),
@@ -194,10 +317,10 @@ pub fn config(key: PrivateKey, settings: &Settings) -> russh::server::Config {
 }
 
 /// Serves `listener` until it fails: each connection in a task, at most
-/// `max_connections` at a time (more are closed at once), each given
-/// [`LOGIN_TIME`] to log in.
+/// `max_connections` at a time and `admissions_per_second` new ones (more
+/// are closed at once), each cut at its login deadline unless logged in.
 pub async fn serve(listener: TcpListener, settings: Settings) -> io::Result<()> {
-    std::fs::create_dir_all(&settings.dir)?;
+    own_dir(&settings.dir)?;
     let key = host_key(&settings.host_key())?;
     log(format_args!(
         "listening on {}, host key {}",
@@ -207,57 +330,139 @@ pub async fn serve(listener: TcpListener, settings: Settings) -> io::Result<()> 
     let config = Arc::new(config(key, &settings));
     let settings = Arc::new(settings);
     let live = Arc::new(AtomicUsize::new(0));
+    let mut bucket = Bucket::new(settings.admissions_per_second, settings.admission_burst);
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(error) => {
                 // Out of descriptors, say: the server carries on.
-                log(format_args!("accept: {error}"));
+                noise(format_args!("accept: {error}"));
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             }
         };
         if live.load(Ordering::SeqCst) >= settings.max_connections {
-            log(format_args!("{peer}: too many connections"));
+            noise(format_args!("{peer}: too many connections"));
+            continue;
+        }
+        if !bucket.admit(std::time::Instant::now()) {
+            noise(format_args!("{peer}: too many new connections"));
             continue;
         }
         let guard = Live::new(&live);
         let (config, settings) = (config.clone(), settings.clone());
         tokio::spawn(async move {
             let _guard = guard;
-            let (logged_in_tx, logged_in) = oneshot::channel();
-            let handler = Connection {
-                settings,
-                peer,
-                logged_in: Some(logged_in_tx),
-                channels: HashMap::new(),
-            };
-            let session = match tokio::time::timeout(
-                LOGIN_TIME,
-                russh::server::run_stream(config, socket, handler),
-            )
-            .await
-            {
-                Ok(Ok(session)) => session,
-                Ok(Err(error)) => return log(format_args!("{peer}: {error}")),
-                Err(_) => return log(format_args!("{peer}: no handshake")),
-            };
-            let handle = session.handle();
-            tokio::spawn(async move {
-                if tokio::time::timeout(LOGIN_TIME, logged_in).await.is_err() {
-                    let _ = handle
-                        .disconnect(
-                            russh::Disconnect::ByApplication,
-                            "login timed out".into(),
-                            "".into(),
-                        )
-                        .await;
-                }
-            });
-            if let Err(error) = session.await {
-                log(format_args!("{peer}: {error}"));
-            }
+            connection(config, settings, socket, peer).await;
         });
+    }
+}
+
+/// One connection, from accept to its end. Until it logs in it has one
+/// deadline, `login_time` from now: then its socket is shut down under
+/// russh (which may be busy, or waiting on a peer that sends nothing), and
+/// its slot is given back within [`WIND_DOWN`] whatever russh does.
+async fn connection(
+    config: Arc<russh::server::Config>,
+    settings: Arc<Settings>,
+    socket: tokio::net::TcpStream,
+    peer: SocketAddr,
+) {
+    let deadline = tokio::time::Instant::now() + settings.login_time;
+    // A second descriptor for the same socket, to shut it down from here.
+    let (socket, cutter) = match socket
+        .into_std()
+        .and_then(|socket| Ok((socket.try_clone()?, socket)))
+        .and_then(|(cutter, socket)| Ok((tokio::net::TcpStream::from_std(socket)?, cutter)))
+    {
+        Ok(pair) => pair,
+        Err(error) => return noise(format_args!("{peer}: {error}")),
+    };
+    let cut = || {
+        let _ = cutter.shutdown(std::net::Shutdown::Both);
+    };
+    let (logged_in_tx, logged_in) = oneshot::channel();
+    let handler = Connection {
+        settings,
+        peer,
+        logged_in: Some(logged_in_tx),
+        channels: HashMap::new(),
+    };
+    let started =
+        tokio::time::timeout_at(deadline, russh::server::run_stream(config, socket, handler));
+    let mut session = match started.await {
+        Ok(Ok(session)) => session,
+        Ok(Err(error)) => return noise(format_args!("{peer}: {error}")),
+        Err(_) => {
+            cut();
+            return noise(format_args!("{peer}: no handshake in time"));
+        }
+    };
+    let in_time = tokio::select! {
+        ended = &mut session => {
+            if let Err(error) = ended {
+                noise(format_args!("{peer}: {error}"));
+            }
+            return;
+        }
+        logged_in = logged_in => {
+            if logged_in.is_err() {
+                // Its handler is gone without a login: the session is ending
+                // (a failed negotiation, say). Its error, not a timeout.
+                cut();
+                match tokio::time::timeout(WIND_DOWN, session).await {
+                    Ok(Err(error)) => noise(format_args!("{peer}: {error}")),
+                    Ok(Ok(())) => {}
+                    Err(_) => noise(format_args!("{peer}: ended without a login")),
+                }
+                return;
+            }
+            true
+        }
+        () = tokio::time::sleep_until(deadline) => false,
+    };
+    if !in_time {
+        cut();
+        noise(format_args!("{peer}: no login in time"));
+        let _ = tokio::time::timeout(WIND_DOWN, session).await;
+        return;
+    }
+    if let Err(error) = session.await {
+        noise(format_args!("{peer}: {error}"));
+    }
+}
+
+/// Admission: a token bucket.
+pub struct Bucket {
+    rate: f64,
+    burst: f64,
+    tokens: f64,
+    last: Option<std::time::Instant>,
+}
+
+impl Bucket {
+    pub fn new(rate: f64, burst: f64) -> Self {
+        Self {
+            rate,
+            burst,
+            tokens: burst,
+            last: None,
+        }
+    }
+
+    /// Whether one more may come in now.
+    pub fn admit(&mut self, now: std::time::Instant) -> bool {
+        if let Some(last) = self.last {
+            let refill = now.saturating_duration_since(last).as_secs_f64() * self.rate;
+            self.tokens = (self.tokens + refill).min(self.burst);
+        }
+        self.last = Some(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -281,7 +486,7 @@ impl Drop for Live {
 struct Connection {
     settings: Arc<Settings>,
     peer: SocketAddr,
-    /// Fired (dropped) once it has logged in, or once it ends.
+    /// Fired once it has logged in (dropped unfired if it ends before).
     logged_in: Option<oneshot::Sender<()>>,
     channels: HashMap<ChannelId, Chan>,
 }
@@ -293,31 +498,72 @@ struct Chan {
     master: Option<Arc<pty::Master>>,
     input: Option<Input>,
     started: bool,
-    /// Dropped with the channel (closed, or the connection gone): the tasks
-    /// serving it stop.
-    _open: Option<oneshot::Sender<()>>,
+    /// Dropped with the channel (closed, or the connection gone), or when
+    /// its program stops taking input: every task serving it stops, and a
+    /// program still running is ended, with its process group.
+    _open: Option<watch::Sender<()>>,
 }
 
-/// The way into a program's stdin (or its terminal), with room for at most
-/// [`INPUT_BACKLOG`] bytes it hasn't read yet.
+impl Chan {
+    /// Ends what the channel runs, as if the client had closed it.
+    fn cancel(&mut self) {
+        self._open = None;
+        self.input = None;
+        self.master = None;
+    }
+}
+
+/// Resolves once `open`'s sender is gone.
+async fn cancelled(mut open: watch::Receiver<()>) {
+    while open.changed().await.is_ok() {}
+}
+
+/// Queued input waiting for a program: at most [`INPUT_BACKLOG`] bytes in
+/// at most [`INPUT_MESSAGES`] messages.
+type Queued = (Bytes, OwnedSemaphorePermit);
+
+/// The way into a program's stdin (or its terminal).
 #[derive(Clone)]
 struct Input {
-    queue: mpsc::UnboundedSender<(Bytes, OwnedSemaphorePermit)>,
+    queue: mpsc::Sender<Queued>,
     room: Arc<Semaphore>,
+    wait: Duration,
 }
 
 impl Input {
-    fn new() -> (Self, mpsc::UnboundedReceiver<(Bytes, OwnedSemaphorePermit)>) {
-        let (queue, receiver) = mpsc::unbounded_channel();
+    fn new(wait: Duration) -> (Self, mpsc::Receiver<Queued>, Arc<Semaphore>) {
+        let (queue, receiver) = mpsc::channel(INPUT_MESSAGES);
         let room = Arc::new(Semaphore::new(INPUT_BACKLOG));
-        (Self { queue, room }, receiver)
+        (
+            Self {
+                queue,
+                room: room.clone(),
+                wait,
+            },
+            receiver,
+            room,
+        )
     }
 
-    async fn send(&self, data: &[u8]) {
-        let n = data.len().min(INPUT_BACKLOG) as u32;
-        if let Ok(permit) = self.room.clone().acquire_many_owned(n).await {
-            let _ = self.queue.send((Bytes::copy_from_slice(data), permit));
+    /// Queues `data`, waiting for room. Once the program no longer reads
+    /// its input, the rest is dropped, as other servers do; false only if
+    /// it took none for its wait.
+    async fn send(&self, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return true;
         }
+        let n = data.len().min(INPUT_BACKLOG) as u32;
+        let queued = async {
+            // Closed: the program stopped taking input.
+            let Ok(permit) = self.room.clone().acquire_many_owned(n).await else {
+                return;
+            };
+            let _ = self
+                .queue
+                .send((Bytes::copy_from_slice(data), permit))
+                .await;
+        };
+        tokio::time::timeout(self.wait, queued).await.is_ok()
     }
 }
 
@@ -327,13 +573,14 @@ impl Connection {
             return false;
         }
         authorized(&self.settings.authorized_keys(), key).unwrap_or_else(|error| {
-            log(format_args!("{}: {error}", self.peer));
+            noise(format_args!("{}: {error}", self.peer));
             false
         })
     }
 
     /// Starts the channel's program: `command` by the shell, or the shell
-    /// itself (a login shell), on its terminal if it asked for one.
+    /// itself (a login shell), on its terminal if it asked for one. Either
+    /// way it leads a session (and process group) of its own.
     fn start(&mut self, id: ChannelId, command: Option<&[u8]>, handle: Handle) -> io::Result<()> {
         let settings = self.settings.clone();
         let chan = self.channels.entry(id).or_default();
@@ -362,24 +609,35 @@ impl Connection {
             .env("LOGNAME", USER)
             .env("SHELL", &settings.shell)
             .current_dir(home);
-        let (open, closed) = oneshot::channel();
-        let (input, received) = Input::new();
+        let (open, closed) = watch::channel(());
+        let (input, received, room) = Input::new(settings.input_wait);
         if let Some((term, size)) = chan.pty.clone() {
             let (master, slave) = pty::open(size)?;
             cmd.env("TERM", term);
             pty::attach(&mut cmd, slave)?;
             let child = tokio::process::Command::from(cmd).spawn()?;
             let master = Arc::new(master);
-            tokio::spawn(type_into(master.clone(), received));
+            let typing = type_into(master.clone(), received, room);
+            tokio::spawn(until(cancelled(closed.clone()), typing));
             tokio::spawn(run_on_terminal(handle, id, child, master.clone(), closed));
             chan.master = Some(master);
         } else {
             cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            // SAFETY: only setsid(2), async-signal-safe, between fork and exec.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
             let mut child = tokio::process::Command::from(cmd).spawn()?;
             if let Some(stdin) = child.stdin.take() {
-                tokio::spawn(pipe_into(stdin, received));
+                let piping = pipe_into(stdin, received, room);
+                tokio::spawn(until(cancelled(closed.clone()), piping));
             }
             tokio::spawn(run_on_pipes(handle, id, child, closed));
         }
@@ -390,29 +648,44 @@ impl Connection {
     }
 }
 
+/// Runs `work` until `stop` resolves.
+async fn until(
+    stop: impl std::future::Future<Output = ()>,
+    work: impl std::future::Future<Output = ()>,
+) {
+    tokio::select! {
+        () = stop => {}
+        () = work => {}
+    }
+}
+
 /// Feeds what the client sends into a program's stdin, closed (EOF) once
-/// the client says it is done.
+/// the client says it is done. Once it can't, no more is queued.
 async fn pipe_into(
     mut stdin: tokio::process::ChildStdin,
-    mut received: mpsc::UnboundedReceiver<(Bytes, OwnedSemaphorePermit)>,
+    mut received: mpsc::Receiver<Queued>,
+    room: Arc<Semaphore>,
 ) {
     while let Some((data, _room)) = received.recv().await {
         if stdin.write_all(&data).await.is_err() {
-            return;
+            break;
         }
     }
+    room.close();
 }
 
 /// Types what the client sends into a terminal.
 async fn type_into(
     master: Arc<pty::Master>,
-    mut received: mpsc::UnboundedReceiver<(Bytes, OwnedSemaphorePermit)>,
+    mut received: mpsc::Receiver<Queued>,
+    room: Arc<Semaphore>,
 ) {
     while let Some((data, _room)) = received.recv().await {
         if master.write_all(&data).await.is_err() {
-            return;
+            break;
         }
     }
+    room.close();
 }
 
 /// Sends what `reader` gives as the channel's data (`ext` 1: its stderr)
@@ -441,27 +714,50 @@ async fn pump(
     }
 }
 
+/// Ends a channel's program and everything in its process group: SIGHUP
+/// and SIGTERM, then SIGKILL for whatever is left after [`GRACE`]; reaped.
+async fn end_group(child: &mut tokio::process::Child, group: i32) {
+    let signal = |signal| {
+        // SAFETY: kill(2) on the process group this channel started; its
+        // leader's pid can't be reused while the group has members.
+        unsafe { libc::kill(-group, signal) };
+    };
+    signal(libc::SIGHUP);
+    signal(libc::SIGTERM);
+    let _ = tokio::time::timeout(GRACE, child.wait()).await;
+    signal(libc::SIGKILL);
+    let _ = child.wait().await;
+}
+
 async fn run_on_pipes(
     handle: Handle,
     id: ChannelId,
     mut child: tokio::process::Child,
-    closed: oneshot::Receiver<()>,
+    closed: watch::Receiver<()>,
 ) {
+    let Some(group) = child.id().map(|pid| pid as i32) else {
+        return;
+    };
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-    let work = async {
-        let (_, _, status) = tokio::join!(
-            pump(stdout, &handle, id, None),
-            pump(stderr, &handle, id, Some(1)),
-            child.wait()
-        );
-        status
+    let status = {
+        let work = async {
+            let (_, _, status) = tokio::join!(
+                pump(stdout, &handle, id, None),
+                pump(stderr, &handle, id, Some(1)),
+                child.wait()
+            );
+            status
+        };
+        tokio::select! {
+            status = work => Some(status),
+            // The channel or the connection is gone first.
+            () = cancelled(closed) => None,
+        }
     };
-    let status = tokio::select! {
-        status = work => status,
-        // The channel or the connection is gone: its pipes close.
-        _ = closed => return,
-    };
-    finish(&handle, id, status).await;
+    match status {
+        Some(status) => finish(&handle, id, status).await,
+        None => end_group(&mut child, group).await,
+    }
 }
 
 async fn run_on_terminal(
@@ -469,19 +765,23 @@ async fn run_on_terminal(
     id: ChannelId,
     mut child: tokio::process::Child,
     master: Arc<pty::Master>,
-    mut closed: oneshot::Receiver<()>,
+    closed: watch::Receiver<()>,
 ) {
+    let Some(group) = child.id().map(|pid| pid as i32) else {
+        return;
+    };
     let mut buf = vec![0; CHUNK];
+    let mut gone = std::pin::pin!(cancelled(closed));
     let status = loop {
         tokio::select! {
             read = master.read(&mut buf) => match read {
                 Ok(n) if n > 0 => {
                     if handle.data(id, Bytes::copy_from_slice(&buf[..n])).await.is_err() {
-                        return;
+                        break None;
                     }
                 }
                 // Every slave side closed: the shell is ending.
-                _ => break child.wait().await,
+                _ => break Some(child.wait().await),
             },
             status = child.wait() => {
                 // What it wrote last may still be on its way through the
@@ -495,14 +795,19 @@ async fn run_on_terminal(
                         _ => break,
                     }
                 }
-                break status;
+                break Some(status);
             }
-            // Gone: the terminal closes (the last master with the channel's),
-            // which hangs up on the shell.
-            _ = &mut closed => return,
+            () = &mut gone => break None,
         }
     };
-    finish(&handle, id, status).await;
+    match status {
+        Some(status) => finish(&handle, id, status).await,
+        None => {
+            // The terminal goes too (the last master), hanging up on it.
+            drop(master);
+            end_group(&mut child, group).await;
+        }
+    }
 }
 
 /// The program's exit status (128 + the signal that killed it), then EOF
@@ -527,11 +832,13 @@ impl russh::server::Handler for Connection {
         user: &str,
         offer: russh::server::PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
-        Ok(if self.allowed(user, offer.public_key) {
-            Auth::Accept
-        } else {
-            Auth::reject()
-        })
+        Ok(
+            if signs_well(offer.algorithm) && self.allowed(user, offer.public_key) {
+                Auth::Accept
+            } else {
+                Auth::reject()
+            },
+        )
     }
 
     async fn auth_publickey(
@@ -539,8 +846,8 @@ impl russh::server::Handler for Connection {
         user: &str,
         key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        if !self.allowed(user, key.public_key) {
-            log(format_args!("{}: refused {user}", self.peer));
+        if !signs_well(key.algorithm) || !self.allowed(user, key.public_key) {
+            noise(format_args!("{}: refused {user}", self.peer));
             return Ok(Auth::reject());
         }
         log(format_args!(
@@ -549,7 +856,9 @@ impl russh::server::Handler for Connection {
             key.public_key.algorithm(),
             key.public_key.fingerprint(HashAlg::Sha256)
         ));
-        self.logged_in.take();
+        if let Some(logged_in) = self.logged_in.take() {
+            let _ = logged_in.send(());
+        }
         Ok(Auth::Accept)
     }
 
@@ -560,9 +869,11 @@ impl russh::server::Handler for Connection {
         _: &mut Session,
     ) -> Result<(), Self::Error> {
         // Its messages come through this handler; the channel object, unread,
-        // goes.
-        self.channels.insert(channel.id(), Chan::default());
-        reply.accept().await;
+        // goes. Past CHANNELS, the reply, dropped, refuses it.
+        if self.channels.len() < CHANNELS {
+            self.channels.insert(channel.id(), Chan::default());
+            reply.accept().await;
+        }
         Ok(())
     }
 
@@ -590,11 +901,23 @@ impl russh::server::Handler for Connection {
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        _: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
         let input = self.channels.get(&channel).and_then(|c| c.input.clone());
         if let Some(input) = input {
-            input.send(data).await;
+            if !input.send(data).await {
+                // It hasn't read for a minute while the client keeps
+                // sending: rather than hold up the connection (its other
+                // channels, its close), the program goes.
+                if let Some(chan) = self.channels.get_mut(&channel) {
+                    noise(format_args!(
+                        "{}: a program took no input; ended",
+                        self.peer
+                    ));
+                    chan.cancel();
+                    session.close(channel)?;
+                }
+            }
         }
         Ok(())
     }
@@ -735,6 +1058,12 @@ mod tests {
         assert_eq!(parsed.port, 2222);
         assert_eq!(parsed.dir, Path::new("/var/local/kindil/ssh"));
         assert_eq!(parsed.listen, IpAddr::from(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(parsed.log, None);
+        let parsed = args(&["--log", "/var/local/kindil/sshd.log"]).unwrap();
+        assert_eq!(
+            parsed.log.as_deref(),
+            Some(Path::new("/var/local/kindil/sshd.log"))
+        );
         let parsed = args(&["--listen", "127.0.0.1"]).unwrap();
         assert_eq!(
             (parsed.port, parsed.listen),
@@ -743,6 +1072,21 @@ mod tests {
         assert!(args(&["--port"]).is_err());
         assert!(args(&["--port", "x"]).is_err());
         assert!(args(&["--password"]).is_err());
+    }
+
+    #[test]
+    fn admits_bursts_then_a_steady_rate() {
+        let mut bucket = Bucket::new(2.0, 3.0);
+        let start = std::time::Instant::now();
+        assert!((0..3).all(|_| bucket.admit(start)));
+        assert!(!bucket.admit(start));
+        assert!(!bucket.admit(start + Duration::from_millis(400)));
+        assert!(bucket.admit(start + Duration::from_millis(600)));
+        assert!(!bucket.admit(start + Duration::from_millis(700)));
+        // A long quiet refills to the burst, no more.
+        let later = start + Duration::from_secs(60);
+        assert!((0..3).all(|_| bucket.admit(later)));
+        assert!(!bucket.admit(later));
     }
 
     #[test]
@@ -761,6 +1105,43 @@ mod tests {
     }
 
     #[test]
+    fn refuses_symlinked_key_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = PrivateKey::from(Ed25519Keypair::from_seed(&[1; 32]));
+        let real = dir.path().join("real");
+        std::fs::write(
+            &real,
+            format!("{}\n", key.public_key().to_openssh().unwrap()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("authorized_keys");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(authorized(&real, key.public_key()).unwrap());
+        assert!(authorized(&link, key.public_key()).is_err());
+        let host = dir.path().join("host_ed25519");
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), &host).unwrap();
+        assert!(host_key(&host).is_err());
+        assert!(!dir.path().join("elsewhere").exists());
+    }
+
+    #[test]
+    fn keeps_its_directory_to_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("ssh");
+        own_dir(&own).unwrap();
+        let mode = || std::fs::metadata(&own).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(), 0o700);
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o775)).unwrap();
+        own_dir(&own).unwrap();
+        assert_eq!(mode(), 0o700);
+        // A symlink to a directory isn't one.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&own, &link).unwrap();
+        assert!(own_dir(&link).is_err());
+    }
+
+    #[test]
     fn no_authorized_keys_lets_nobody_in() {
         let dir = tempfile::tempdir().unwrap();
         let key = PrivateKey::from(Ed25519Keypair::from_seed(&[1; 32]));
@@ -770,6 +1151,7 @@ mod tests {
         assert!(!authorized(&file, key.public_key()).unwrap());
         let line = key.public_key().to_openssh().unwrap();
         std::fs::write(&file, format!("garbage\n{line} me@there\n")).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(authorized(&file, key.public_key()).unwrap());
     }
 }

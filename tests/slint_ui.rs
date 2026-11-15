@@ -618,6 +618,15 @@ impl Host for Recording {
     fn set_ssh_at_boot(&self, power: kindil::host::Power) -> anyhow::Result<()> {
         self.device.set_ssh_at_boot(power)
     }
+    fn own_ssh(&self) -> kindil::host::OwnSsh {
+        self.device.own_ssh()
+    }
+    fn trust_ssh_keys(&self, fingerprints: &[String]) -> anyhow::Result<()> {
+        self.device.trust_ssh_keys(fingerprints)
+    }
+    fn ignore_ssh_keys(&self, fingerprints: &[String]) -> anyhow::Result<()> {
+        self.device.ignore_ssh_keys(fingerprints)
+    }
     fn boot_start(&self) -> kindil::host::BootStart {
         self.device.boot_start()
     }
@@ -892,4 +901,33 @@ fn an_update_that_cannot_install_says_why_and_kindil_keeps_running() {
     f.k().invoke_update();
     assert!(f.k().get_update_status().contains("cannot update"));
     assert_eq!(f.app.exit(), kindil::ui::Exit::Quit);
+}
+
+#[test]
+fn new_ssh_keys_on_the_usb_storage_wait_to_be_trusted() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    f.k().invoke_go(Page::Remote);
+    assert_eq!(f.k().get_ssh_new().row_count(), 1);
+    assert_eq!(f.k().get_ssh_trusted().row_count(), 1);
+    let new = f.k().get_ssh_new().row_data(0).unwrap();
+    assert_eq!(new.title, "RSA · 3072");
+    assert!(new.fingerprint.starts_with("SHA256:"));
+    assert!(f.k().get_own_ssh_detail().contains("2222"));
+    f.k().invoke_trust_ssh_keys();
+    assert_eq!(f.k().get_ssh_new().row_count(), 0);
+    assert_eq!(f.k().get_ssh_trusted().row_count(), 2);
+    assert_eq!(host.own_ssh().trusted.len(), 2);
+    assert!(f.k().get_notice().contains("Trusted 1 SSH key"));
+}
+
+#[test]
+fn ignored_ssh_keys_are_not_offered_again() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    f.k().invoke_go(Page::Remote);
+    f.k().invoke_ignore_ssh_keys();
+    assert_eq!(f.k().get_ssh_new().row_count(), 0);
+    assert_eq!(f.k().get_ssh_trusted().row_count(), 1);
+    assert!(host.own_ssh().new_on_usb.is_empty());
 }

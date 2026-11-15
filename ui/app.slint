@@ -45,6 +45,15 @@ export struct Fact {
     value: string,
 }
 
+/// An SSH key, as someone checks it before trusting it.
+export struct SshKeyItem {
+    /// Its type and size: "ED25519 · 256".
+    title: string,
+    /// "SHA256:…", as `ssh-keygen -lf` prints it.
+    fingerprint: string,
+    comment: string,
+}
+
 global Theme {
     out property <color> ink: #000000;
     out property <color> ink-2: #333333;
@@ -111,6 +120,11 @@ export global Kindil {
     in property <BootChoice> boot: BootChoice.unavailable;
     in property <string> boot-start-detail;
     in property <string> ssh-detail;
+    /// kindil's own SSH server: its port and whether it runs.
+    in property <string> own-ssh-detail;
+    in property <[SshKeyItem]> ssh-trusted;
+    /// Keys on the USB storage that aren't trusted (or ignored) yet.
+    in property <[SshKeyItem]> ssh-new;
     in property <Switch> sync: Switch.unavailable;
     in property <string> sync-detail;
     in property <[Fact]> facts;
@@ -129,6 +143,9 @@ export global Kindil {
     in-out property <string> notice;
     in-out property <bool> notice-undo: false;
 
+    /// Trusts, or stops offering, the keys `ssh-new` shows.
+    callback trust-ssh-keys();
+    callback ignore-ssh-keys();
     callback navigated(Page);
     callback choose-dashboard(DashboardKind);
     callback open-book(int);
@@ -1555,6 +1572,80 @@ component WifiSettings inherits SectionPage {
     }
 }
 
+/// A key's type, fingerprint and comment.
+component KeyLines inherits VerticalLayout {
+    in property <SshKeyItem> key;
+    spacing: 2px;
+    Text { text: root.key.title; font-size: 19px; font-weight: 600; color: Theme.ink; }
+    Text { text: root.key.fingerprint; font-size: 16px; color: Theme.ink-2; wrap: char-wrap; }
+    if root.key.comment != "": Text {
+        text: root.key.comment;
+        font-size: 17px;
+        color: Theme.ink-3;
+        overflow: elide;
+    }
+}
+
+/// Keys found on the USB storage: trusted only once someone here says so.
+component NewKeys inherits VerticalLayout {
+    padding-top: 12px;
+    padding-bottom: 12px;
+    spacing: 12px;
+    Text { text: "New SSH keys on the USB storage"; font-size: 23px; font-weight: 600; color: Theme.ink; }
+    Text {
+        text: "Trust them only if they are yours: anyone with this Kindle on a USB cable can add keys there.";
+        font-size: 17px;
+        color: Theme.ink-3;
+        wrap: word-wrap;
+    }
+    for key in Kindil.ssh-new: KeyLines { key: key; }
+    HorizontalLayout {
+        spacing: 12px;
+        Button {
+            horizontal-stretch: 1;
+            text: "Ignore";
+            clicked => { Kindil.ignore-ssh-keys(); }
+        }
+        Button {
+            horizontal-stretch: 1;
+            text: "Trust";
+            kind: ButtonKind.primary;
+            clicked => { Kindil.trust-ssh-keys(); }
+        }
+    }
+}
+
+/// The trusted keys' fingerprints, shown on a tap.
+component TrustedKeys inherits VerticalLayout {
+    property <bool> open: false;
+    Rectangle {
+        min-height: 76px;
+        HorizontalLayout {
+            spacing: 16px;
+            Text {
+                text: "Trusted keys";
+                font-size: 23px;
+                font-weight: 600;
+                color: Theme.ink;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: Kindil.ssh-trusted.length + (root.open ? " · Hide" : " · Show");
+                font-size: 19px;
+                color: Theme.ink-2;
+                vertical-alignment: center;
+            }
+        }
+        TouchArea { clicked => { root.open = !root.open; } }
+    }
+    if root.open: VerticalLayout {
+        spacing: 14px;
+        padding-bottom: 12px;
+        for key in Kindil.ssh-trusted: KeyLines { key: key; }
+    }
+}
+
 component RemoteSettings inherits SectionPage {
     title: "Remote access";
     Group {
@@ -1577,6 +1668,20 @@ component RemoteSettings inherits SectionPage {
             state: Kindil.sync;
             toggled => { Kindil.toggle-sync(); }
         }
+    }
+    Group {
+        title: "KINDIL SSH";
+        VerticalLayout {
+            min-height: 76px;
+            alignment: center;
+            spacing: 2px;
+            Text { text: "SSH server"; font-size: 23px; font-weight: 600; color: Theme.ink; }
+            Text { text: Kindil.own-ssh-detail; font-size: 18px; color: Theme.ink-2; wrap: word-wrap; }
+        }
+        if Kindil.ssh-new.length > 0: Divider { }
+        if Kindil.ssh-new.length > 0: NewKeys { }
+        Divider { }
+        TrustedKeys { }
     }
 }
 
