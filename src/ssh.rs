@@ -107,6 +107,14 @@ impl Layout {
     /// Everything the server needs: the binary (written only when it
     /// changed), its directory and, the first time, its trusted keys. It
     /// makes its host key itself.
+    ///
+    /// Every start also closes again what Amazon's framework opened: each
+    /// time the Kindle UI starts (whenever kindil hands the screen back),
+    /// /etc/upstart/framework.conf runs `chgrp -R javausers /var/local;
+    /// chmod -R g=u /var/local` and setgids every directory there, so a
+    /// 0600 file comes back 0660 and the 0700 directory 02770. kindil-sshd
+    /// rightly refuses a group-writable `authorized_keys`, and only fixes
+    /// its host key itself.
     pub fn prepare(&self, binary: &[u8], usbnet_keys: &Path) -> anyhow::Result<()> {
         anyhow::ensure!(
             !binary.is_empty(),
@@ -118,7 +126,22 @@ impl Layout {
                 self.binary.display()
             ));
         }
-        own_dir(&self.dir)?;
+        if let Some(was) = own_dir(&self.dir)? {
+            say(format_args!(
+                "{} was {was:o}: made 0700 again",
+                self.dir.display()
+            ));
+        }
+        for file in [&self.authorized_keys(), &self.ignored_keys(), &self.log] {
+            match own_file(file) {
+                Ok(Some(was)) => say(format_args!(
+                    "{} was {was:o}: made 0600 again",
+                    file.display()
+                )),
+                Ok(None) => {}
+                Err(error) => say(format_args!("{}: {error}", file.display())),
+            }
+        }
         // The first start only; /mnt/us may be gone (USB drive mode).
         match crate::ssh_keys::bootstrap(usbnet_keys, &self.authorized_keys()) {
             Ok(true) => say(format_args!("SSH keys taken from USBNetwork's, once")),
@@ -296,8 +319,9 @@ pub fn firewall_rule(action: &str, port: u16) -> Vec<String> {
 }
 
 /// The server's directory: made 0700 if missing; a real directory of
-/// kindil's user (root's), put back to 0700 if it was opened up.
-pub fn own_dir(dir: &Path) -> anyhow::Result<()> {
+/// kindil's user (root's), put back to 0700 (setgid off too) if it was
+/// opened up. Its mode before, if it was.
+pub fn own_dir(dir: &Path) -> anyhow::Result<Option<u32>> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -311,22 +335,53 @@ pub fn own_dir(dir: &Path) -> anyhow::Result<()> {
         "{} is not a directory of kindil's",
         dir.display()
     );
-    if meta.mode() & 0o777 != 0o700 {
-        set_mode(dir, 0o700)?;
+    let was = meta.mode() & 0o7777;
+    if was == 0o700 {
+        return Ok(None);
     }
-    Ok(())
+    set_mode(dir, 0o700)?;
+    Ok(Some(was))
 }
 
-/// The file at `path`, not through a symlink.
-fn read_no_symlink(path: &Path) -> std::io::Result<Vec<u8>> {
+/// A file of kindil's in its directory, if there is one, put back to 0600
+/// if group or others got any access; never through a symlink, and only a
+/// regular file of kindil's user. Its mode before, if it was opened up.
+pub fn own_file(path: &Path) -> std::io::Result<Option<u32>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    // O_NONBLOCK: a FIFO in its place doesn't hang the open.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let meta = file.metadata()?;
+    // SAFETY: geteuid has no preconditions.
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::other("not a file of kindil's"));
+    }
+    let was = meta.mode() & 0o7777;
+    if was & 0o7077 == 0 {
+        return Ok(None);
+    }
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(Some(was))
+}
+
+/// The file at `path`, not through a symlink, open, and what it holds.
+fn open_no_symlink(path: &Path) -> std::io::Result<(std::fs::File, Vec<u8>)> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes)?;
-    Ok(bytes)
+    Ok((file, bytes))
 }
 
 /// Writes `path` whole or not at all: a new `.part` beside it (O_EXCL,
@@ -347,11 +402,22 @@ pub fn write_new(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     std::fs::rename(&part, path)
 }
 
-/// Writes `binary` to `path` unless it is already there; whether it wrote
-/// it.
+/// Writes `binary` to `path` unless it is already there (then only made
+/// 0755 again if others could change it); whether it wrote it.
 pub fn install(binary: &[u8], path: &Path) -> anyhow::Result<bool> {
-    if read_no_symlink(path).ok().as_deref() == Some(binary) {
-        return Ok(false);
+    if let Ok((file, bytes)) = open_no_symlink(path) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = file.metadata()?;
+        // SAFETY: geteuid has no preconditions.
+        let ours = meta.is_file() && meta.uid() == unsafe { libc::geteuid() };
+        if ours && bytes == binary {
+            // Through the open file: the directory may be the javausers
+            // group's to change for now (see Layout::prepare).
+            if meta.mode() & 0o7022 != 0 {
+                file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+            }
+            return Ok(false);
+        }
     }
     write_new(path, binary, 0o755)?;
     Ok(true)
@@ -366,6 +432,10 @@ fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn read_no_symlink(path: &Path) -> std::io::Result<Vec<u8>> {
+        open_no_symlink(path).map(|(_, bytes)| bytes)
+    }
 
     fn mode(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -569,6 +639,71 @@ mod tests {
             std::fs::read_to_string(layout.authorized_keys()).unwrap(),
             "ssh-ed25519 AAAA k\n"
         );
+    }
+
+    /// What the Kindle's /etc/upstart/framework.conf does to all of
+    /// /var/local each time the UI starts: `chmod -R g=u`, then `chmod g+s`
+    /// on every directory.
+    fn framework_starts(dir: &Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            let user = meta.permissions().mode() & 0o700;
+            let mut widened = (meta.permissions().mode() & 0o7707) | (user >> 3);
+            if meta.is_dir() {
+                set_mode(&path, widened).unwrap();
+                framework_starts(&path);
+                widened |= 0o2000;
+                // A non-root user outside the directory's group may not
+                // set it (macOS); g=u is the harm anyway.
+                let _ = set_mode(&path, widened);
+            } else if meta.is_file() {
+                set_mode(&path, widened).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn closes_again_what_the_kindle_ui_opened_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout(dir.path());
+        let usbnet = dir.path().join("authorized_keys");
+        std::fs::write(&usbnet, "ssh-ed25519 AAAA k\n").unwrap();
+        layout.prepare(b"sshd", &usbnet).unwrap();
+        crate::ssh_keys::ignore(&layout.ignored_keys(), &["SHA256:x".into()]).unwrap();
+        std::fs::write(&layout.log, "a line\n").unwrap();
+        set_mode(&layout.log, 0o600).unwrap();
+        framework_starts(dir.path());
+        assert_eq!(mode(&layout.authorized_keys()), 0o660);
+        assert_eq!(mode(&layout.dir), 0o770);
+        assert_eq!(mode(&layout.binary), 0o775);
+        layout.prepare(b"sshd", &usbnet).unwrap();
+        let full = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(full(&layout.dir), 0o700);
+        assert_eq!(full(&layout.binary), 0o755);
+        for file in [layout.authorized_keys(), layout.ignored_keys(), layout.log] {
+            assert_eq!(full(&file), 0o600, "{}", file.display());
+        }
+    }
+
+    #[test]
+    fn repairs_only_its_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(own_file(&dir.path().join("none")).unwrap(), None);
+        let file = dir.path().join("keys");
+        std::fs::write(&file, "").unwrap();
+        set_mode(&file, 0o600).unwrap();
+        assert_eq!(own_file(&file).unwrap(), None);
+        set_mode(&file, 0o664).unwrap();
+        assert_eq!(own_file(&file).unwrap(), Some(0o664));
+        assert_eq!(mode(&file), 0o600);
+        // Not through a symlink, and not a directory.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        set_mode(&file, 0o666).unwrap();
+        assert!(own_file(&link).is_err());
+        assert_eq!(mode(&file), 0o666);
+        assert!(own_file(dir.path()).is_err());
     }
 
     #[test]
