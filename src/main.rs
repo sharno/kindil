@@ -149,6 +149,13 @@ fn uevents() -> anyhow::Result<()> {
 }
 
 fn main() -> std::process::ExitCode {
+    // Run as udhcpc's hook (a link named kindil-dhcp): no command line.
+    let mut args = std::env::args();
+    let name = args.next().unwrap_or_default();
+    if std::path::Path::new(&name).file_name() == Some(std::ffi::OsStr::new(kindil::dhcp::NAME)) {
+        kindil::dhcp::hook(&args.next().unwrap_or_default());
+        return std::process::ExitCode::SUCCESS;
+    }
     let cli = Cli::parse();
     let result = match &cli.mode {
         Mode::Preview { dir } => preview(&cli, dir).map(|()| Exit::Quit),

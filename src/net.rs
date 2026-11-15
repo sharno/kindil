@@ -28,11 +28,11 @@ const WPA_BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wpa_supplica
 const WPA_CONF: &str = "/var/local/kindil/wpa_supplicant.conf";
 const WPA_CONF_TEXT: &str = "ctrl_interface=/var/run/wpa_supplicant\nap_scan=1\n";
 const WPA_PID: &str = "/var/run/kindil-wpa.pid";
-/// udhcpc's hook, on the system storage: /mnt/us goes away in USB drive
-/// mode, and a renewal then would find no script.
-const DHCP_SCRIPT: &str = "/var/local/kindil/dhcp.sh";
+/// udhcpc's hook: kindil itself, through a link named for the hook (see
+/// src/dhcp.rs), beside the binary on the system storage: /mnt/us goes away
+/// in USB drive mode.
+const DHCP_HOOK: &str = "/var/local/kindil/kindil-dhcp";
 const DHCP_PID: &str = "/var/run/kindil-udhcpc.pid";
-const SCRIPT: &str = include_str!("../kindle/extensions/kindil/bin/dhcp.sh");
 /// Present while Wi-Fi is switched off in kindil.
 const OFF_FLAG: &str = "/var/local/kindil/wifi-off";
 /// The PW1's (yoshime3) calibration data for the AR6003, as Amazon's
@@ -221,8 +221,7 @@ impl Net {
         load_driver()?;
         install_supplicant()?;
         std::fs::write(WPA_CONF, WPA_CONF_TEXT)?;
-        std::fs::write(DHCP_SCRIPT, SCRIPT)?;
-        set_executable(DHCP_SCRIPT)?;
+        link_hook()?;
         let generation = self.generation.load(Ordering::SeqCst);
         self.supervise("wpa_supplicant", generation, |net| {
             let mut child = spawn_supplicant()?;
@@ -417,6 +416,17 @@ fn terminate(file: &str) {
     let _ = std::fs::remove_file(file);
 }
 
+/// Points the hook's link at the running binary.
+fn link_hook() -> anyhow::Result<()> {
+    let binary = std::env::current_exe()?;
+    if std::fs::read_link(DHCP_HOOK).ok().as_deref() == Some(binary.as_path()) {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(DHCP_HOOK);
+    std::os::unix::fs::symlink(&binary, DHCP_HOOK)?;
+    Ok(())
+}
+
 /// Writes kindil's wpa_supplicant out when it differs from the one there.
 fn install_supplicant() -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -463,17 +473,7 @@ fn spawn_supplicant() -> anyhow::Result<Child> {
 fn spawn_dhcp() -> anyhow::Result<Child> {
     Ok(Command::new("/sbin/udhcpc")
         .args([
-            "-f",
-            "-i",
-            INTERFACE,
-            "-s",
-            DHCP_SCRIPT,
-            "-p",
-            DHCP_PID,
-            "-t",
-            "5",
-            "-T",
-            "2",
+            "-f", "-i", INTERFACE, "-s", DHCP_HOOK, "-p", DHCP_PID, "-t", "5", "-T", "2",
         ])
         .stdout(std::process::Stdio::null())
         .spawn()?)
