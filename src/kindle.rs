@@ -20,14 +20,7 @@ use std::time::Duration;
 
 const INTERFACE: &str = "wlan0";
 /// How long kindil keeps retrying its Wi-Fi at start (a slow driver).
-const WIFI_TAKEOVER: Duration = Duration::from_secs(180);
-/// udhcpc's lease for [`INTERFACE`] (`/usr/share/udhcpc/default.script`).
-const DHCP_LEASE: &str = "/tmp/wlan0";
-/// The name servers udhcpc got, and where the resolver reads them
-/// (`/etc/resolv.conf` links there).
-const DHCP_RESOLV: &str = "/tmp/resolv.conf";
-const RESOLV: &str = "/var/run/resolv.conf";
-const ROUTES: &str = "/proc/net/route";
+const WIFI_START: Duration = Duration::from_secs(180);
 /// The PW1's fuel gauge; it stalls while suspended and catches up on resume.
 const GAUGE_CHARGE: &str = "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_mAH";
 /// The gauge's state of charge, as `71%`; powerd's `battLevel` is this.
@@ -111,9 +104,8 @@ impl Host for KindleHost {
 
     fn wifi(&self) -> Wifi {
         match self.net.power() {
-            Err(e) => Wifi::Unavailable(e.to_string()),
-            Ok(Power::Off) => Wifi::Off,
-            Ok(Power::On) => match wifi::open(INTERFACE).and_then(|wpa| Ok((wpa.link()?, wpa))) {
+            Power::Off => Wifi::Off,
+            Power::On => match wifi::open(INTERFACE).and_then(|wpa| Ok((wpa.link()?, wpa))) {
                 Err(e) => Wifi::Unavailable(e.to_string()),
                 Ok((Link::NotAssociated, _)) => Wifi::Searching,
                 Ok((Link::Associated { ssid, ip }, wpa)) => Wifi::Connected {
@@ -273,15 +265,10 @@ impl Host for KindleHost {
                 eprintln!("kindil: USB drive mode: {error}");
             }
         });
-        std::thread::spawn(|| {
-            if let Err(error) = wifid() {
-                eprintln!("kindil: Wi-Fi: {error}");
-            }
-        });
         let net = self.net.clone();
         let networks = self.networks.clone();
         std::thread::spawn(move || {
-            take_over_wifi(&net, &networks);
+            start_wifi(&net, &networks);
         });
     }
 
@@ -373,97 +360,33 @@ fn volumd(deliver: impl Fn(Event)) -> anyhow::Result<()> {
     )
 }
 
-/// Each time Wi-Fi connects, does what Amazon's connection manager (`cmd`)
-/// would: a standalone boot stops it (bin/boot.sh), and udhcpc leaves the
-/// default route and the name servers to it. While `cmd` runs, both are
-/// already in place and this changes nothing.
-fn wifid() -> anyhow::Result<()> {
-    let route = || {
-        if let Err(error) = route_wifi() {
-            eprintln!("kindil: Wi-Fi route: {error}");
-        }
-    };
-    route();
-    lipc_events("com.lab126.wifid", "cmConnected", |_| route())
-}
-
-/// With networks of its own, kindil runs Wi-Fi from the start; with none
-/// (first run), Amazon's wifid does until one is joined.
-fn take_over_wifi(net: &Arc<Net>, networks: &Mutex<Networks>) {
-    let saved = lock(networks).list().to_vec();
-    if saved.is_empty() {
-        eprintln!("kindil: no saved networks yet; wifid runs Wi-Fi until one is joined");
+/// Starts kindil's Wi-Fi if it was left on, with the saved networks (none
+/// on a first run: then it scans, and a network joined in Settings is
+/// saved). A failed start is retried for a while; after that the switch
+/// in Settings tries again.
+fn start_wifi(net: &Arc<Net>, networks: &Mutex<Networks>) {
+    if Net::wanted() == Power::Off {
+        eprintln!("kindil: Wi-Fi is switched off");
         return;
     }
+    let saved = lock(networks).list().to_vec();
     let since = std::time::Instant::now();
     loop {
-        match net.load(&saved) {
+        match net.set(Power::On, &saved) {
             Ok(()) => {
-                eprintln!("kindil: running Wi-Fi with {} saved networks", saved.len());
+                eprintln!("kindil: Wi-Fi up with {} saved networks", saved.len());
                 return;
             }
-            Err(error) if since.elapsed() < WIFI_TAKEOVER => {
+            Err(error) if since.elapsed() < WIFI_START => {
                 eprintln!("kindil: Wi-Fi start: {error}; trying again");
                 std::thread::sleep(Duration::from_secs(5));
             }
             Err(error) => {
-                eprintln!("kindil: Wi-Fi start: {error}; switch Wi-Fi off and on to try again");
+                eprintln!("kindil: Wi-Fi start: {error}; switch Wi-Fi on to try again");
                 return;
             }
         }
     }
-}
-
-fn route_wifi() -> anyhow::Result<()> {
-    let lease = match std::fs::read_to_string(DHCP_LEASE) {
-        // Not connected since boot: cmConnected comes once it is.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        lease => lease?,
-    };
-    let Some(gateway) = lease_gateway(&lease) else {
-        return Ok(());
-    };
-    let routes = std::fs::read_to_string(ROUTES)?;
-    // No address on Wi-Fi (an old lease, Wi-Fi down): the router is out of reach.
-    if !routes_through(&routes, INTERFACE) {
-        return Ok(());
-    }
-    if !has_default_route(&routes) {
-        let gateway = gateway.to_string();
-        run(Command::new("/sbin/route").args(["add", "default", "gw", &gateway, "dev", INTERFACE]))?;
-    }
-    let servers = std::fs::read_to_string(DHCP_RESOLV)?;
-    if std::fs::read_to_string(RESOLV).ok().as_ref() != Some(&servers) {
-        std::fs::write(RESOLV, servers)?;
-    }
-    Ok(())
-}
-
-/// The router in udhcpc's lease (`gw=192.168.1.1`), if it named one.
-pub fn lease_gateway(lease: &str) -> Option<std::net::Ipv4Addr> {
-    lease
-        .lines()
-        .find_map(|line| line.strip_prefix("gw="))?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
-}
-
-/// True if `/proc/net/route` has any route through `interface`: it has an address.
-pub fn routes_through(table: &str, interface: &str) -> bool {
-    table
-        .lines()
-        .skip(1)
-        .any(|line| line.split_whitespace().next() == Some(interface))
-}
-
-/// True if `/proc/net/route` has a default route, on any interface.
-pub fn has_default_route(table: &str) -> bool {
-    table.lines().skip(1).any(|line| {
-        let columns: Vec<&str> = line.split_whitespace().collect();
-        columns.get(1) == Some(&"00000000") && columns.get(7) == Some(&"00000000")
-    })
 }
 
 /// Hands each of `events` from lipc service `publisher` to `each`, through
@@ -577,30 +500,6 @@ mod tests {
         assert!(listens_on(table, 22));
         assert!(!listens_on(table, 8092), "established, not listening");
         assert!(!listens_on("header\n", 22));
-    }
-
-    #[test]
-    fn reads_the_router_from_the_dhcp_lease() {
-        let lease =
-            "ip=192.168.1.130\nbroadcast=192.168.1.255\nsubnet=255.255.255.0\ngw=192.168.1.1\n";
-        assert_eq!(
-            lease_gateway(lease),
-            Some(std::net::Ipv4Addr::new(192, 168, 1, 1))
-        );
-        assert_eq!(lease_gateway("ip=192.168.1.130\ngw=\n"), None);
-        assert_eq!(lease_gateway(""), None);
-    }
-
-    #[test]
-    fn finds_a_default_route() {
-        let header =
-            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n";
-        let local = "wlan0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
-        let default = "wlan0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n";
-        assert!(!has_default_route(&format!("{header}{local}")));
-        assert!(routes_through(&format!("{header}{local}"), "wlan0"));
-        assert!(!routes_through(header, "wlan0"), "no address, no route");
-        assert!(has_default_route(&format!("{header}{local}{default}")));
     }
 
     #[test]

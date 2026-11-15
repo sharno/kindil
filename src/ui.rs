@@ -939,7 +939,7 @@ impl Ctx {
         self.switch_service(ui.global::<Kindil>().get_wifi(), "Wi-Fi", |host, power| {
             host.set_wifi(power)
         });
-        // wifid takes a few seconds to associate after switching on.
+        // Loading the driver and joining take a few seconds after switching on.
         self.refresh_after(Duration::from_secs(8));
     }
 

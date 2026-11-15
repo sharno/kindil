@@ -1,7 +1,7 @@
 //! Everything the UI asks of the device, behind one trait.
 //!
-//! [`crate::kindle::KindleHost`] drives Amazon's own services (wifid via lipc,
-//! USBNetwork's dropbear, the frontlight driver). [`Simulated`] returns fixtures
+//! [`crate::kindle::KindleHost`] drives the device: its own Wi-Fi stack, the
+//! battery and front light drivers, USBNetwork's dropbear. [`Simulated`] returns fixtures
 //! and never opens a device, so previews and tests cannot touch hardware.
 use crate::battery::Battery;
 use crate::update::{Check, Commit, Release};
@@ -145,10 +145,8 @@ pub trait Host: Send + Sync {
     fn set_brightness(&self, level: Brightness) -> anyhow::Result<()>;
     fn wifi(&self) -> Wifi;
     fn set_wifi(&self, power: Power) -> anyhow::Result<()>;
-    /// Wi-Fi stays down after kindil suspends the device itself: wifid never
-    /// hears of the suspend. Switching it off and on rejoins Amazon's saved
-    /// networks; a network joined for the session only is lost. Blocks for a
-    /// few seconds: call from a worker thread.
+    /// After kindil suspends the device: joins again and renews the address.
+    /// Blocks for a few seconds: call from a worker thread.
     fn reconnect_wifi(&self) -> anyhow::Result<()>;
     /// Blocks for a few seconds: call from a worker thread.
     fn scan(&self) -> anyhow::Result<Vec<Network>>;

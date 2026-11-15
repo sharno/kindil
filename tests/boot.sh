@@ -30,7 +30,6 @@ sed -e "s#^FLAG=.*#FLAG=$T/BOOT#" \
   -e "s#^BOOT_ID=.*#BOOT_ID=$T/boot_id#" \
   -e "s#^PIDFILE=.*#PIDFILE=$T/pid#" \
   -e "s#^SKIP=.*#SKIP=$T/SKIP#" \
-  -e "s#^NETWORKS=.*#NETWORKS=$T/networks.toml#" \
   -e "s#^export PATH=.*#export PATH=$T/stub:/usr/bin:/bin#" \
   "$BOOT" >"$T/run/boot.sh"
 chmod +x "$T/run/boot.sh"
@@ -47,7 +46,7 @@ tries() { cat "$T/state/boot-tries" 2>/dev/null || echo 0; }
 # A boot as the job finds it: Amazon's services up, X starting, Amazon's UI
 # still to come.
 reset() {
-  rm -rf "$T/state" "$T/starts" "$T/pid" "$T/BOOT" "$T/SKIP" "$T/upstart" "$T/networks.toml"
+  rm -rf "$T/state" "$T/starts" "$T/pid" "$T/BOOT" "$T/SKIP" "$T/upstart"
   echo 1 >"$T/up"
   { echo "$SERVICES" | tr ' ' '\n'; printf 'wifid\nx\n'; } >"$T/jobs"
 }
@@ -101,7 +100,7 @@ reset
 echo standalone >"$T/BOOT"
 touch "$T/SKIP"
 boot a
-expect "standalone: X and Amazon's UI never start, nor does the spinner stay" "$(starts) $(upstart)" "1 stop x,stop early_progress,$(all stop)"
+expect "standalone: X and Amazon's UI never start, nor does the spinner stay" "$(starts) $(upstart)" "1 stop x,stop early_progress,stop wifid,$(all stop)"
 
 reset
 : >"$T/BOOT"
@@ -113,9 +112,9 @@ echo standalone >"$T/BOOT"
 touch "$T/SKIP"
 echo 0 >"$T/up"
 boot a
-expect "a standalone boot kindil doesn't stay up in gets Amazon's full UI" "$(skip) $(upstart)" "framework stop x,stop early_progress,$(all stop)$(all start)start x,"
+expect "a standalone boot kindil doesn't stay up in gets Amazon's full UI" "$(skip) $(upstart)" "framework stop x,stop early_progress,stop wifid,$(all stop)start wifid,$(all start)start x,"
 boot a
-expect "which starts nothing more in that boot" "$(starts) $(upstart)" "1 stop x,stop early_progress,$(all stop)$(all start)start x,"
+expect "which starts nothing more in that boot" "$(starts) $(upstart)" "1 stop x,stop early_progress,stop wifid,$(all stop)start wifid,$(all start)start x,"
 
 reset
 echo standalone >"$T/BOOT"
@@ -131,10 +130,3 @@ expect "past the failed-boot limit Amazon's UI comes with its framework" "$(star
 touch "$T/SKIP"
 boot d
 expect "a job from before 0.6.2 restarts Amazon's UI, which is already up" "$(skip) $(upstart)" "framework stop lab126_gui,start lab126_gui,"
-
-reset
-echo standalone >"$T/BOOT"
-touch "$T/SKIP"
-printf '[[network]]\nssid = "Home"\n' >"$T/networks.toml"
-boot a
-expect "standalone with networks of kindil's own: wifid never runs" "$(starts) $(upstart)" "1 stop x,stop early_progress,stop wifid,$(all stop)"

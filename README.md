@@ -56,10 +56,11 @@ and a reboot always returns the Kindle to stock.
   - **Wi-Fi of its own**: kindil runs Wi-Fi itself with the networks joined
     in it, saved in `/var/local/kindil/networks.toml` (plain text, readable
     by root only; a network is saved once it has joined). It loads the
-    driver, runs wpa_supplicant and DHCP as its own children, starting one
-    again if it exits, and Off unloads the driver. Back online about a
-    second after a nap. Amazon's wifid runs Wi-Fi only until the first
-    network is joined in kindil, and again after leaving kindil.
+    driver, runs its own wpa_supplicant (upstream 2.12, built by the flake)
+    and DHCP as its children, starting one again if it exits, and Off
+    unloads the driver; it remembers Off. Back online about a second after
+    a nap. None of Amazon's Wi-Fi services run while kindil does; on a
+    first run it starts with no networks, ready to join one.
   - **USB drive mode**: plugging into a computer shows a USB screen while the
     computer has `/mnt/us`; unplugging reloads the library and resumes
     Syncthing. A cable that keeps dropping doesn't flash the screen: kindil
@@ -149,8 +150,8 @@ faster.
   `/mnt/us/DONT_START_FRAMEWORK` flag. The next boots then skip X, Amazon's
   UI and its Java framework, since kindil draws to the screen itself, and
   stop Amazon's boot spinner and the services kindil doesn't use (connections,
-  apps, archive, updates, sync and the like). With networks of its own,
-  kindil runs Wi-Fi itself and wifid doesn't start either. Of Amazon's
+  apps, archive, updates, sync and the like), wifid too: kindil runs
+  Wi-Fi itself. Of Amazon's
   system powerd and volumd stay, for now. kindil comes up about 20 s after
   the kernel, with more memory free. Every way back to Amazon's UI removes the flag first and
   starts those services and X if they aren't running:

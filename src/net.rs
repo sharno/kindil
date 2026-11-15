@@ -1,18 +1,15 @@
-//! Wi-Fi, run by kindil itself.
+//! Wi-Fi, run by kindil itself, always.
 //!
-//! With networks of its own (src/networks.rs), kindil owns the whole stack:
-//! it loads the ar6003 driver, runs its own wpa_supplicant from its own
-//! config, loads its networks into it and does DHCP with its own hook. None
-//! of Amazon's Wi-Fi pieces (wifid, and the wifim and wifis jobs it drives)
-//! run. Off unloads the driver, which powers the chip down. wpa_supplicant
-//! and udhcpc run as kindil's children: one that exits without being told is
-//! started again (wpa_supplicant with the networks loaded again), with a
-//! growing pause if it keeps dying. After its own suspends kindil rejoins.
-//!
-//! Amazon's wifid runs Wi-Fi in one case only: a Kindle where kindil has no
-//! network yet (first run). Leaving kindil starts it again (bin/session.sh).
+//! While kindil runs, none of Amazon's Wi-Fi pieces do (wifid, and the wifim
+//! and wifis jobs it drives): kindil loads the ar6003 driver, runs its own
+//! wpa_supplicant (src/wifi.rs, built by the flake) and udhcpc with its own
+//! hook as its children, and loads its saved networks (src/networks.rs),
+//! none on a first run until one is joined. A child that exits without being
+//! told is started again, wpa_supplicant with the networks loaded again,
+//! with a growing pause if it keeps dying. Off unloads the driver, which
+//! powers the chip down, and is remembered. Amazon's wifid only runs outside
+//! kindil: bin/session.sh starts it for Amazon's UI.
 use crate::host::Power;
-use crate::lipc;
 use crate::wifi::{self, Credentials, Link};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +33,8 @@ const WPA_PID: &str = "/var/run/kindil-wpa.pid";
 const DHCP_SCRIPT: &str = "/var/local/kindil/dhcp.sh";
 const DHCP_PID: &str = "/var/run/kindil-udhcpc.pid";
 const SCRIPT: &str = include_str!("../kindle/extensions/kindil/bin/dhcp.sh");
+/// Present while Wi-Fi is switched off in kindil.
+const OFF_FLAG: &str = "/var/local/kindil/wifi-off";
 /// The PW1's (yoshime3) calibration data for the AR6003, as Amazon's
 /// wifim job finds it from the board id.
 const BOARD_DATA: &str = "/opt/ar6k/target/AR6003/hw2.1.1/bin";
@@ -53,18 +52,10 @@ const TRY_WAIT: Duration = Duration::from_secs(30);
 const HEALTHY: Duration = Duration::from_secs(60);
 const PAUSE_MIN: Duration = Duration::from_secs(1);
 const PAUSE_MAX: Duration = Duration::from_secs(60);
-/// wifid's switch settles asynchronously.
-const WIFID_SETTLE: Duration = Duration::from_secs(2);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Owner {
-    /// First run: no network of kindil's own yet.
-    Amazon,
-    Kindil(Power),
-}
 
 pub struct Net {
-    owner: Mutex<Owner>,
+    /// Whether kindil's Wi-Fi is up: On only once a start has succeeded.
+    power: Mutex<Power>,
     /// The networks wpa_supplicant was last given: a restarted one gets them.
     saved: Mutex<Vec<Credentials>>,
     /// Bumped whenever kindil stops its stack: children of an older one
@@ -75,7 +66,7 @@ pub struct Net {
 impl Default for Net {
     fn default() -> Self {
         Self {
-            owner: Mutex::new(Owner::Amazon),
+            power: Mutex::new(Power::Off),
             saved: Mutex::default(),
             generation: AtomicU64::new(0),
         }
@@ -83,49 +74,47 @@ impl Default for Net {
 }
 
 impl Net {
-    fn owner(&self) -> Owner {
-        *self.owner.lock().unwrap_or_else(|e| e.into_inner())
+    pub fn power(&self) -> Power {
+        *lock(&self.power)
     }
 
-    fn set_owner(&self, owner: Owner) {
-        *self.owner.lock().unwrap_or_else(|e| e.into_inner()) = owner;
+    /// Whether Wi-Fi was left on: kindil starts it then.
+    pub fn wanted() -> Power {
+        if std::path::Path::new(OFF_FLAG).exists() {
+            Power::Off
+        } else {
+            Power::On
+        }
     }
 
-    /// Runs Wi-Fi with `saved`, kindil's networks: takes it from Amazon the
-    /// first time, reloads the list after. With none, Wi-Fi is Amazon's.
-    pub fn load(self: &Arc<Self>, saved: &[Credentials]) -> anyhow::Result<()> {
-        match self.owner() {
-            Owner::Amazon if saved.is_empty() => Ok(()),
-            Owner::Amazon => {
-                // Amazon's Wi-Fi on means kindil's on; with no wifid, on.
-                let power = wifid_power().unwrap_or(Power::On);
-                stop_amazon();
-                self.set_owner(Owner::Kindil(Power::Off));
-                let started = match power {
-                    Power::On => self.start(saved),
-                    Power::Off => Ok(()),
-                };
-                if started.is_err() {
-                    // Not taken over: a retry starts again from the top, it
-                    // doesn't find an Off that looks like success.
-                    self.stop();
-                    self.set_owner(Owner::Amazon);
-                }
-                started
+    /// Switches kindil's Wi-Fi, with `saved` loaded, and remembers it.
+    pub fn set(self: &Arc<Self>, power: Power, saved: &[Credentials]) -> anyhow::Result<()> {
+        match power {
+            Power::On => {
+                let _ = std::fs::remove_file(OFF_FLAG);
+                self.start(saved)
             }
-            Owner::Kindil(_) if saved.is_empty() => self.hand_back(),
-            Owner::Kindil(Power::Off) => Ok(()),
-            Owner::Kindil(Power::On) => {
-                *lock(&self.saved) = saved.to_vec();
-                let wpa = wifi::open(INTERFACE)?;
-                wpa.load(saved)?;
-                wpa.command("REASSOCIATE").map(drop)
+            Power::Off => {
+                std::fs::write(OFF_FLAG, b"")?;
+                self.stop();
+                Ok(())
             }
         }
     }
 
+    /// Gives wpa_supplicant `saved`, kindil's networks, when Wi-Fi is on.
+    pub fn load(self: &Arc<Self>, saved: &[Credentials]) -> anyhow::Result<()> {
+        *lock(&self.saved) = saved.to_vec();
+        if self.power() == Power::Off {
+            return Ok(());
+        }
+        let wpa = wifi::open(INTERFACE)?;
+        wpa.load(saved)?;
+        wpa.command("REASSOCIATE").map(drop)
+    }
+
     /// Tries `candidate` as a new first network: Ok once it has joined it,
-    /// otherwise back to `saved` and an error.
+    /// otherwise back to `saved` and an error. Switches Wi-Fi on if off.
     pub fn try_join(
         self: &Arc<Self>,
         candidate: &[Credentials],
@@ -135,10 +124,9 @@ impl Net {
             .first()
             .map(|c| c.ssid().as_str().to_owned())
             .ok_or_else(|| anyhow::anyhow!("no network to join"))?;
-        if self.owner() == Owner::Kindil(Power::Off) {
-            self.set(Power::On, candidate)?;
-        } else {
-            self.load(candidate)?;
+        match self.power() {
+            Power::Off => self.set(Power::On, candidate)?,
+            Power::On => self.load(candidate)?,
         }
         let since = Instant::now();
         let wpa = wifi::open(INTERFACE)?;
@@ -163,61 +151,41 @@ impl Net {
         anyhow::bail!("couldn't join {ssid}: check the password and that it is in range")
     }
 
-    pub fn power(&self) -> anyhow::Result<Power> {
-        match self.owner() {
-            Owner::Amazon => wifid_power(),
-            Owner::Kindil(power) => Ok(power),
-        }
-    }
-
-    pub fn set(self: &Arc<Self>, power: Power, saved: &[Credentials]) -> anyhow::Result<()> {
-        match self.owner() {
-            Owner::Amazon => lipc::set("com.lab126.wifid", "enable", wifid_value(power)),
-            Owner::Kindil(_) => match power {
-                Power::On => self.start(saved),
-                Power::Off => {
-                    self.stop();
-                    Ok(())
-                }
-            },
-        }
-    }
-
     /// After a suspend: join again, then renew the address (usually kept).
-    pub fn reconnect(&self) -> anyhow::Result<()> {
-        match self.owner() {
-            Owner::Amazon => match wifid_power()? {
-                Power::Off => Ok(()),
-                Power::On => {
-                    lipc::set("com.lab126.wifid", "enable", "0")?;
-                    // An immediate switch back can land before it went down.
-                    std::thread::sleep(WIFID_SETTLE);
-                    lipc::set("com.lab126.wifid", "enable", "1")
-                }
-            },
-            Owner::Kindil(Power::Off) => Ok(()),
-            Owner::Kindil(Power::On) => {
-                let wpa = wifi::open(INTERFACE)?;
-                wpa.command("REASSOCIATE")?;
-                let since = Instant::now();
-                while !matches!(wpa.link(), Ok(Link::Associated { .. })) {
-                    anyhow::ensure!(since.elapsed() < JOIN_WAIT, "no access point joined");
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                renew_dhcp()
-            }
+    /// A supplicant that doesn't answer gets the whole stack started again.
+    pub fn reconnect(self: &Arc<Self>) -> anyhow::Result<()> {
+        if self.power() == Power::Off {
+            return Ok(());
         }
+        let Ok(wpa) = wifi::open(INTERFACE) else {
+            let saved = lock(&self.saved).clone();
+            return self.start(&saved);
+        };
+        wpa.command("REASSOCIATE")?;
+        let since = Instant::now();
+        while !matches!(wpa.link(), Ok(Link::Associated { .. })) {
+            anyhow::ensure!(since.elapsed() < JOIN_WAIT, "no access point joined");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        renew_dhcp()
     }
 
-    /// kindil's whole stack up, with `saved` loaded.
+    /// kindil's whole stack up, with `saved` loaded; On only if it all came up.
     fn start(self: &Arc<Self>, saved: &[Credentials]) -> anyhow::Result<()> {
-        // Off even if this fails part way, so On tries it all again.
         self.stop();
-        // From a clean slate whoever left what behind: a wifid started behind
-        // kindil's back, or a stray supplicant holding the control socket,
-        // would fight kindil's own.
-        stop_amazon();
+        // From a clean slate, whoever left what behind: a wifid, Amazon's
+        // supplicant or a stray one holding the control socket would fight
+        // kindil's own.
+        clear_slate();
         *lock(&self.saved) = saved.to_vec();
+        let result = self.bring_up();
+        if result.is_err() {
+            self.stop();
+        }
+        result
+    }
+
+    fn bring_up(self: &Arc<Self>) -> anyhow::Result<()> {
         load_driver()?;
         install_supplicant()?;
         std::fs::write(WPA_CONF, WPA_CONF_TEXT)?;
@@ -239,7 +207,7 @@ impl Net {
             Ok(child)
         })?;
         self.supervise("udhcpc", generation, |_| spawn_dhcp())?;
-        self.set_owner(Owner::Kindil(Power::On));
+        *lock(&self.power) = Power::On;
         Ok(())
     }
 
@@ -295,6 +263,7 @@ impl Net {
     fn stop(&self) {
         // Its children now exit for good.
         self.generation.fetch_add(1, Ordering::SeqCst);
+        *lock(&self.power) = Power::Off;
         terminate(DHCP_PID);
         terminate(WPA_PID);
         // Nothing to take down the first time (no driver yet): quietly.
@@ -306,29 +275,22 @@ impl Net {
         };
         quiet(Command::new("/sbin/ifconfig").args([INTERFACE, "down"]));
         quiet(Command::new("/sbin/rmmod").arg("ar6003"));
-        self.set_owner(Owner::Kindil(Power::Off));
-    }
-
-    /// No network of kindil's own left: Wi-Fi goes back to wifid and
-    /// Amazon's networks, as on a first run.
-    fn hand_back(&self) -> anyhow::Result<()> {
-        self.stop();
-        self.set_owner(Owner::Amazon);
-        run(Command::new("/sbin/start").arg("wifid"))
     }
 }
 
-/// wifid and the supplicant it drives, and any wpa_supplicant or udhcpc
-/// that isn't kindil's (kindil's own are stopped before this runs). The
-/// driver stays: kindil's start loads it anyway, and reloading costs seconds.
-fn stop_amazon() {
+/// Amazon's Wi-Fi jobs, if anything started them, and any wpa_supplicant or
+/// udhcpc that isn't kindil's (kindil's own are stopped before this runs).
+fn clear_slate() {
     for job in ["wifid", "wifis"] {
         if running(job) {
             let _ = run(Command::new("/sbin/stop").arg(job));
         }
     }
     for stray in ["wpa_supplicant", "udhcpc"] {
-        let _ = Command::new("killall").arg(stray).status();
+        let _ = Command::new("killall")
+            .arg(stray)
+            .stderr(std::process::Stdio::null())
+            .status();
     }
     // A dead supplicant's socket: the new one would think it in use.
     let _ = std::fs::remove_file(format!("/var/run/wpa_supplicant/{INTERFACE}"));
@@ -488,21 +450,6 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn wifid_power() -> anyhow::Result<Power> {
-    match lipc::get("com.lab126.wifid", "enable")?.as_str() {
-        "1" => Ok(Power::On),
-        "0" => Ok(Power::Off),
-        other => anyhow::bail!("unexpected wifid enable value {other:?}"),
-    }
-}
-
-fn wifid_value(power: Power) -> &'static str {
-    match power {
-        Power::On => "1",
-        Power::Off => "0",
-    }
-}
-
 /// The id of the network named `ssid` in a `LIST_NETWORKS` reply.
 pub fn network_id(reply: &str, ssid: &str) -> Option<u32> {
     reply.lines().skip(1).find_map(|line| {
@@ -544,17 +491,12 @@ mod tests {
             network_id("network id / ssid / bssid / flags\n", "Home"),
             None
         );
+        let bracketed = "network id / ssid / bssid / flags\n13\t[Tomato]\tany\t[CURRENT]\n";
+        assert_eq!(network_id(bracketed, "Tomato"), Some(13));
     }
 
     #[test]
-    fn starts_out_with_amazon_until_kindil_has_a_network() {
-        let net = Arc::new(Net::default());
-        assert_eq!(net.owner(), Owner::Amazon);
-        net.load(&[]).unwrap();
-        assert_eq!(
-            net.owner(),
-            Owner::Amazon,
-            "no networks: nothing to take over"
-        );
+    fn starts_off_until_its_stack_is_up() {
+        assert_eq!(Net::default().power(), Power::Off);
     }
 }

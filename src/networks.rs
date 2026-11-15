@@ -1,7 +1,7 @@
 //! The Wi-Fi networks kindil joins by itself, saved as plain TOML.
 //!
-//! Amazon's wifid keeps its own list encrypted, readable by wifid alone; this
-//! one lets kindil run Wi-Fi with no wifid at all. Most recently joined first,
+//! Amazon's wifid keeps its own list encrypted, readable by wifid alone;
+//! kindil keeps this one. Most recently joined first,
 //! which is also the order wpa_supplicant prefers them in.
 use crate::wifi::{Credentials, Ssid};
 use serde::{Deserialize, Serialize};

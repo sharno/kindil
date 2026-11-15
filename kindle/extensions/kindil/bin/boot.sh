@@ -15,8 +15,6 @@ STATE=/var/local/kindil
 BOOT_ID=/proc/sys/kernel/random/boot_id
 START="$(dirname "$0")/start.sh"
 PIDFILE=/var/tmp/kindil.pid
-# The Wi-Fi networks kindil saved (src/networks.rs).
-NETWORKS=/var/local/kindil/networks.toml
 # The boot kindil last started in: the job running again later in that boot
 # (Amazon's UI coming back, with jobs from before 0.6.2) must not start
 # kindil again.
@@ -105,14 +103,8 @@ if [ -f "$SKIP" ]; then
   # running, it keeps drawing over kindil.
   stop early_progress
   await answers com.lab126.powerd state || log "powerd isn't answering"
-  if [ -s "$NETWORKS" ]; then
-    # kindil runs Wi-Fi with its own networks and starts what it needs.
-    log "skipping wifid: kindil has networks of its own"
-    stop wifid
-  else
-    # wifid hands wpa_supplicant Amazon's networks; kindil takes over then.
-    await answers com.lab126.wifid enable || log "wifid isn't answering"
-  fi
+  # kindil runs Wi-Fi itself.
+  stop wifid
   # What X's language picker does at boot to set up the front light.
   lipc-set-prop com.lab126.powerd flStartup 1
 else

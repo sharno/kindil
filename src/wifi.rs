@@ -1,9 +1,8 @@
 //! Talking to `wpa_supplicant` over its control socket.
 //!
-//! Amazon's `wifid` starts `wpa_supplicant` and feeds it the networks it keeps;
-//! once kindil runs Wi-Fi itself (src/net.rs), it feeds it its own
-//! (src/networks.rs). It never saves the supplicant config, so Amazon's stored
-//! Wi-Fi profiles are left untouched.
+//! kindil runs its own `wpa_supplicant` (src/net.rs) and feeds it its saved
+//! networks (src/networks.rs) over this socket. It never saves the supplicant
+//! config, and Amazon's stored Wi-Fi profiles are left untouched.
 //!
 //! Replies are plain text: either `key=value` lines (`STATUS`), or tab-separated
 //! tables with a `/`-separated header (`SCAN_RESULTS`).
@@ -192,7 +191,7 @@ impl Wpa {
 
     /// Replaces every network wpa_supplicant holds with `networks`, the
     /// first preferred most, and lets it pick among them from its own scans
-    /// (Amazon's wifid runs it with ap_scan 2 and picks itself).
+    /// (ap_scan 1).
     pub fn load(&self, networks: &[Credentials]) -> anyhow::Result<()> {
         self.command("AP_SCAN 1")?;
         self.command("REMOVE_NETWORK all")?;
