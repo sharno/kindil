@@ -5,7 +5,7 @@ default-members = ["."]
 
 [package]
 name = "kindil"
-version = "0.9.2"
+version = "0.9.3"
 edition = "2021"
 rust-version = "1.92"
 description = "A single-process Rust shell for the first-generation Amazon Kindle Paperwhite"
@@ -26,6 +26,10 @@ serde_json = "1.0"
 # Over-the-air updates: GitHub's API over rustls, and CI's release signature.
 ureq = "3"
 minisign-verify = "0.2"
+# kindil install: the bundle's checksum, unpacking it and backing up.
+sha2 = "0.10"
+tar = "0.4"
+flate2 = "1.1"
 toml = "1.2"
 textwrap = { version = "0.16", default-features = false }
 rbook = { version = "0.7.12", default-features = false }

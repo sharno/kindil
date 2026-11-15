@@ -2,7 +2,8 @@
 //!
 //! The release's binary is checked against the key kindil's own updater
 //! trusts (`src/update.rs`) and bundled with the launcher files from the
-//! release's tag. On the Kindle, `scripts/device/install.sh` installs it and
+//! release's tag. On the Kindle the release installs itself: its binary,
+//! uploaded beside the bundle, runs `kindil install` (src/install.rs), which
 //! rolls back unless kindil comes back up with its Wi-Fi.
 use crate::device::Device;
 use anyhow::{bail, ensure, Context};
@@ -89,8 +90,8 @@ fn launcher_files(root: &Path, version: &str) -> anyhow::Result<Vec<u8>> {
     Ok(archive.stdout)
 }
 
-/// The bundle install.sh unpacks: `extensions/kindil/...` with `binary` as
-/// `bin/kindil`, gzipped; with its SHA-256, which install.sh checks.
+/// The bundle `kindil install` unpacks: `extensions/kindil/...` with
+/// `binary` as `bin/kindil`, gzipped; with its SHA-256, which it checks.
 pub fn bundle(launcher: &[u8], binary: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
     let mut out = tar::Builder::new(flate2::write::GzEncoder::new(
         Vec::new(),
@@ -131,7 +132,8 @@ pub fn bundle(launcher: &[u8], binary: &[u8]) -> anyhow::Result<(Vec<u8>, String
     Ok((bundle, sum))
 }
 
-/// What install.sh logged for run `id`: done, rolled back or failed, if yet.
+/// What `kindil install` logged for run `id`: done, rolled back or failed,
+/// if yet.
 pub fn outcome(log: &str, id: &str) -> Option<Result<String, String>> {
     let prefix = format!("install {id}: ");
     let lines: Vec<&str> = log.lines().filter(|line| line.contains(&prefix)).collect();
@@ -161,7 +163,7 @@ pub fn install(
     let mut files = vec![
         write(&work, "bundle.tgz", &bundle)?,
         write(&work, "bundle.sha256", format!("{sum}\n").as_bytes())?,
-        root.join("scripts/device/install.sh"),
+        write(&work, "kindil.install", &new.bytes)?,
     ];
     if let Some(rollback) = rollback {
         files.push(write(
@@ -185,7 +187,8 @@ pub fn install(
     let paths: Vec<&Path> = files.iter().map(|p| p.as_path()).collect();
     device.put(&paths, DEPLOY)?;
     device.run(&format!(
-        "setsid sh {DEPLOY}/install.sh {id} </dev/null >/dev/null 2>&1 &"
+        "chmod 755 {DEPLOY}/kindil.install && \
+         setsid {DEPLOY}/kindil.install install {id} </dev/null >>/var/local/kindil/deploy.log 2>&1 &"
     ))?;
     println!("installing v{} (run {id})", new.version);
     // The Kindle drops off the network while kindil restarts: keep asking.

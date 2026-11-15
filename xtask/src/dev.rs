@@ -6,7 +6,7 @@ use std::process::Command;
 
 const TARGET: &str = "armv7-unknown-linux-musleabihf";
 /// The shell tests of the device scripts.
-const SHELL_TESTS: [&str; 3] = ["tests/launcher.sh", "tests/boot.sh", "tests/install.sh"];
+const SHELL_TESTS: [&str; 2] = ["tests/launcher.sh", "tests/boot.sh"];
 
 fn run(command: &mut Command) -> anyhow::Result<()> {
     let status = command
@@ -224,8 +224,9 @@ fn walk(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Starts `script` on the Kindle with `args`, and a lifeline beside it that
-/// brings kindil and Wi-Fi back when it ends or at `deadline` seconds.
+/// Starts `script` on the Kindle with `args`, and kindil's lifeline beside it
+/// (src/lifeline.rs), which brings kindil and Wi-Fi back when it ends or at
+/// `deadline` seconds.
 pub fn run_on_device(script: &Path, deadline: u64, args: &[String]) -> anyhow::Result<()> {
     ensure!(script.is_file(), "no script {}", script.display());
     let device = Device::from_env()?;
@@ -234,16 +235,13 @@ pub fn run_on_device(script: &Path, deadline: u64, args: &[String]) -> anyhow::R
         .context("a script file")?
         .to_string_lossy()
         .into_owned();
-    device.put(
-        &[script, Path::new("scripts/device/lifeline.sh")],
-        "/var/local/kindil",
-    )?;
+    device.put(&[script], "/var/local/kindil")?;
     let quoted: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
     print!(
         "{}",
         device.run(&format!(
             "cd /var/local/kindil && sh {name} {} </dev/null >/dev/null 2>&1 & pid=$!; \
-             setsid sh lifeline.sh {deadline} $pid </dev/null >/dev/null 2>&1 & \
+             setsid /var/local/kindil/kindil lifeline {deadline} $pid </dev/null >>lifeline.log 2>&1 & \
              echo \"started {name} as $pid, lifeline at {deadline} s\"",
             quoted.join(" ")
         ))?

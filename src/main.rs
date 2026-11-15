@@ -42,6 +42,12 @@ enum Mode {
     Kindle,
     /// Print kernel uevents (power button, USB cable) as they arrive
     Uevents,
+    /// Install the uploaded release bundle, rolling back unless it comes up
+    /// (run on the Kindle by `cargo xtask release`)
+    Install { id: String },
+    /// Bring the Kindle back online after experiment PID ends, or at
+    /// DEADLINE seconds (run on the Kindle by `cargo xtask run`)
+    Lifeline { deadline: u64, pid: i32 },
 }
 
 impl Cli {
@@ -164,6 +170,17 @@ fn main() -> std::process::ExitCode {
         #[cfg(feature = "kindle")]
         Mode::Kindle => kindle(&cli),
         Mode::Uevents => uevents().map(|()| Exit::Quit),
+        Mode::Install { id } => kindil::install::install(
+            id,
+            &kindil::install::Paths::default(),
+            &kindil::install::Timing::default(),
+            &kindil::install::Device,
+        )
+        .map(|()| Exit::Quit),
+        Mode::Lifeline { deadline, pid } => {
+            kindil::lifeline::lifeline(std::time::Duration::from_secs(*deadline), *pid);
+            Ok(Exit::Quit)
+        }
     };
     match result {
         Ok(Exit::Quit) => std::process::ExitCode::SUCCESS,
