@@ -246,6 +246,9 @@ impl Host for KindleHost {
             self.boot_start() != BootStart::NotInstalled,
             "the boot job is not installed"
         );
+        if let Some(dir) = Path::new(BOOT_FLAG).parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         match boot {
             Boot::Off => {
                 remove_if_present(BOOT_FLAG)?;

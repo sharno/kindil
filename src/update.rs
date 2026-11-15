@@ -29,7 +29,7 @@ const SIGNATURE: &str = "kindil.minisig";
 /// The KUAL extension this binary was built with, relative to its folder,
 /// with each file's mode. A settled update installs them, so launcher fixes
 /// arrive over the air too; they take effect at the next start from KUAL.
-const LAUNCHER: [(&str, &[u8], u32); 10] = [
+const LAUNCHER: [(&str, &[u8], u32); 7] = [
     (
         "bin/session.sh",
         include_bytes!("../kindle/extensions/kindil/bin/session.sh"),
@@ -43,21 +43,6 @@ const LAUNCHER: [(&str, &[u8], u32); 10] = [
     (
         "bin/boot.sh",
         include_bytes!("../kindle/extensions/kindil/bin/boot.sh"),
-        0o755,
-    ),
-    (
-        "bin/boot-on.sh",
-        include_bytes!("../kindle/extensions/kindil/bin/boot-on.sh"),
-        0o755,
-    ),
-    (
-        "bin/boot-off.sh",
-        include_bytes!("../kindle/extensions/kindil/bin/boot-off.sh"),
-        0o755,
-    ),
-    (
-        "bin/boot-standalone.sh",
-        include_bytes!("../kindle/extensions/kindil/bin/boot-standalone.sh"),
         0o755,
     ),
     // Only the install script copies these into the system.

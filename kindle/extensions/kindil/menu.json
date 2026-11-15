@@ -5,9 +5,9 @@
       "priority": 0,
       "items": [
         { "name": "Start kindil", "priority": 1, "action": "bin/start.sh" },
-        { "name": "Start at boot: on", "priority": 2, "action": "bin/boot-on.sh" },
-        { "name": "Start at boot: standalone", "priority": 3, "action": "bin/boot-standalone.sh" },
-        { "name": "Start at boot: off", "priority": 4, "action": "bin/boot-off.sh" }
+        { "name": "Start at boot: on", "priority": 2, "action": "bin/kindil", "params": "boot-mode on" },
+        { "name": "Start at boot: standalone", "priority": 3, "action": "bin/kindil", "params": "boot-mode standalone" },
+        { "name": "Start at boot: off", "priority": 4, "action": "bin/kindil", "params": "boot-mode off" }
       ]
     }
   ]

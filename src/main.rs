@@ -48,6 +48,23 @@ enum Mode {
     /// Bring the Kindle back online after experiment PID ends, or at
     /// DEADLINE seconds (run on the Kindle by `cargo xtask run`)
     Lifeline { deadline: u64, pid: i32 },
+    /// Whether kindil starts at boot (KUAL's menu runs this; Settings →
+    /// Power has the same choice), with a fresh count of failed boots
+    #[cfg(feature = "kindle")]
+    #[command(name = "boot-mode")]
+    StartAtBoot { mode: StartAtBoot },
+}
+
+/// `kindil boot-mode`'s choices.
+#[cfg(feature = "kindle")]
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum StartAtBoot {
+    /// Boot to Amazon's UI
+    Off,
+    /// Start kindil once Amazon's UI is up
+    On,
+    /// Start kindil without Amazon's UI
+    Standalone,
 }
 
 impl Cli {
@@ -177,6 +194,21 @@ fn main() -> std::process::ExitCode {
             &kindil::install::Device,
         )
         .map(|()| Exit::Quit),
+        #[cfg(feature = "kindle")]
+        Mode::StartAtBoot { mode } => {
+            use kindil::host::{Boot, Host};
+            let boot = match mode {
+                StartAtBoot::Off => Boot::Off,
+                StartAtBoot::On => Boot::AfterAmazon,
+                StartAtBoot::Standalone => Boot::Standalone,
+            };
+            kindil::kindle::KindleHost::open()
+                .set_boot_start(boot)
+                .map(|()| {
+                    println!("start at boot: {boot:?}");
+                    Exit::Quit
+                })
+        }
         Mode::Lifeline { deadline, pid } => {
             kindil::lifeline::lifeline(std::time::Duration::from_secs(*deadline), *pid);
             Ok(Exit::Quit)
