@@ -113,6 +113,9 @@
               # the native executable too. Select only the prebuilt ARM target.
               buildPhase = ''
                 runHook preBuild
+                # kindil carries its launcher (launcher/, src/launcher.rs).
+                cargo build --locked --offline --release --target ${target} --package launcher --jobs "$NIX_BUILD_CORES"
+                export KINDIL_LAUNCHER="$PWD/target/${target}/release/launcher"
                 cargo build --locked --offline --release --target ${target} --features kindle --jobs "$NIX_BUILD_CORES"
                 runHook postBuild
               '';
@@ -154,6 +157,7 @@
               pkgs.qemu
               pkgs.binutils
               pkgs.pkg-config
+              pkgs.shellcheck
             ];
             CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER = "${linker}/bin/armv7l-unknown-linux-gnueabihf-gcc";
             CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUNNER = "${pkgs.qemu}/bin/qemu-arm";

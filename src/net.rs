@@ -8,7 +8,7 @@
 //! told is started again, wpa_supplicant with the networks loaded again,
 //! with a growing pause if it keeps dying. Off stops them and takes the
 //! interface down, and is remembered; the driver is never unloaded. Amazon's wifid only runs outside
-//! kindil: bin/session.sh starts it for Amazon's UI.
+//! kindil: the launcher starts it for Amazon's UI.
 use crate::host::Power;
 use crate::wifi::{self, Credentials, Link};
 use std::process::{Child, Command};
@@ -451,7 +451,7 @@ fn spawn_supplicant() -> anyhow::Result<Child> {
         .stdout(std::process::Stdio::null())
         .spawn()?;
     // wpa_supplicant writes a pid file only when it daemonizes; kindil's
-    // own stop and bin/session.sh find it by this one.
+    // own stop and the launcher find it by this one.
     std::fs::write(WPA_PID, child.id().to_string())?;
     let since = Instant::now();
     while wifi::open(INTERFACE).is_err() {

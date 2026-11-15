@@ -1,0 +1,15 @@
+[package]
+name = "launcher"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "kindil's launcher on the Kindle: the session around kindil, and the boot guard"
+license = "MIT"
+
+# Small and simple on purpose: it is the Kindle's way back to Amazon's UI
+# when kindil isn't well, so it shares no code with the app.
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.27"

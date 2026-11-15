@@ -5,8 +5,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const TARGET: &str = "armv7-unknown-linux-musleabihf";
-/// The shell tests of the device scripts.
-const SHELL_TESTS: [&str; 2] = ["tests/launcher.sh", "tests/boot.sh"];
 
 fn run(command: &mut Command) -> anyhow::Result<()> {
     let status = command
@@ -30,9 +28,12 @@ fn cargo() -> Command {
 
 pub fn test() -> anyhow::Result<()> {
     run(cargo().args(["test", "--workspace", "--locked"]))?;
-    SHELL_TESTS
-        .iter()
-        .try_for_each(|test| run(Command::new("sh").arg(test)))
+    // The shims that hand over to the launcher.
+    run(Command::new("shellcheck").args([
+        "kindle/extensions/kindil/bin/start.sh",
+        "kindle/extensions/kindil/bin/boot.sh",
+        "kindle/extensions/kindil/boot/install.sh",
+    ]))
 }
 
 pub fn check() -> anyhow::Result<()> {
@@ -82,9 +83,20 @@ fn arm_cargo(cc: &str) -> Command {
     command
 }
 
-/// dist/kindil, static ARMv7, with kindil's own wpa_supplicant inside.
+/// dist/kindil, static ARMv7, with kindil's own wpa_supplicant and its
+/// launcher inside.
 pub fn device() -> anyhow::Result<PathBuf> {
     let cc = arm_linker()?;
+    run(arm_cargo(&cc).args([
+        "build",
+        "--locked",
+        "--release",
+        "--package",
+        "launcher",
+        "--target",
+        TARGET,
+    ]))?;
+    let launcher = std::fs::canonicalize(format!("target/{TARGET}/release/launcher"))?;
     let wpa = output(Command::new("nix").args([
         "build",
         "--no-link",
@@ -93,6 +105,7 @@ pub fn device() -> anyhow::Result<PathBuf> {
     ]))?;
     run(arm_cargo(&cc)
         .env("KINDIL_WPA_SUPPLICANT", format!("{wpa}/bin/wpa_supplicant"))
+        .env("KINDIL_LAUNCHER", &launcher)
         .args([
             "build",
             "--locked",

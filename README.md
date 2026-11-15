@@ -129,7 +129,10 @@ downloads it. Nothing installs without a tap.
 - **Rollback:** if it exits or crashes before then, or the Kindle reboots
   mid-trial, the launcher runs the previous binary again.
 - **Launcher:** once kept, the new version also installs the KUAL launcher
-  files it was built with; they take effect at the next start.
+  files it was built with, and writes out the launcher it carries
+  (`/var/local/kindil/launcher`, from `launcher/`), which runs kindil's
+  session and the boot guard; they take effect at the next start. A version
+  that doesn't stay up for two minutes never replaces the launcher.
 - **Scope:** only kindil's own files change; the bootloader, kernel and system
   partition are never touched.
 
@@ -151,7 +154,8 @@ sh /mnt/us/extensions/kindil/boot/install.sh install
 Then pick a mode in **Settings → Power → Start at boot**, or in KUAL →
 **kindil → Start at boot: on / standalone / off**. The job runs once per boot,
 as soon as powerd, wifid and volumd start, and hands over to `bin/boot.sh` on
-the user storage, which starts kindil while `/mnt/us/kindil/BOOT` exists.
+the user storage, whose launcher (`launcher boot`) starts kindil while
+`/mnt/us/kindil/BOOT` exists.
 With **on**, it waits for Amazon's UI to come up first, and Amazon's UI is
 there whenever kindil exits (Exit to Kindle, or crashes it can't recover
 from); it doesn't start kindil again until the next boot. A job installed
@@ -183,7 +187,7 @@ faster.
 | Path | What |
 |---|---|
 | `/mnt/us/extensions/kindil/` | KUAL launcher and the `kindil` binary; during an update also `kindil.next`, `kindil.trying`, and afterwards `kindil.previous` |
-| `/var/local/kindil/` | The running copy and the log; off `/mnt/us`, which a computer takes in USB drive mode |
+| `/var/local/kindil/` | The running copy, the launcher and the log; off `/mnt/us`, which a computer takes in USB drive mode |
 | `/var/local/kindil/networks.toml` | The Wi-Fi networks joined in kindil, with their passwords (root only) |
 | `/mnt/us/kindil/kindil.toml` | Optional settings (every key has a default) |
 | `/mnt/us/kindil/miqat.toml` | Miqat's own settings: location, prayer method |
@@ -266,7 +270,9 @@ someone nearby to press the power button, or must end on their own first.
 | `system.rs` | Sleep, wake and USB drive mode as a state machine |
 | `reader.rs`, `files.rs`, `prefs.rs` | Books, Trash, persisted choices |
 | `ghosting.rs` | When to flash the panel |
+| `launcher.rs` | Writes out the launcher kindil carries, once it has run two minutes |
 | `vendor/slint-backend-kindle` | Display/touch backend, patched for full refresh |
+| `launcher/` | The launcher, its own small crate: the session around kindil (Amazon's UI and services aside, crash restart, update trial, restore) and the boot guard |
 
 The build pins Slint 1.18.1 with its software renderer and full font shaping
 (Arabic joins correctly). IBM Plex Sans Arabic, from Miqat, is the only font.

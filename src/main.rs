@@ -50,6 +50,10 @@ enum Mode {
     Lifeline { deadline: u64, pid: i32 },
     /// Whether kindil starts at boot (KUAL's menu runs this; Settings →
     /// Power has the same choice), with a fresh count of failed boots
+    /// Write the launcher this kindil carries to /var/local/kindil/launcher
+    /// (start.sh and boot.sh run this when no launcher runs there)
+    #[cfg(feature = "kindle")]
+    Launcher,
     #[cfg(feature = "kindle")]
     #[command(name = "boot-mode")]
     StartAtBoot { mode: StartAtBoot },
@@ -194,6 +198,15 @@ fn main() -> std::process::ExitCode {
             &kindil::install::Device,
         )
         .map(|()| Exit::Quit),
+        #[cfg(feature = "kindle")]
+        Mode::Launcher => kindil::launcher::install(std::path::Path::new(kindil::launcher::PATH))
+            .map(|wrote| {
+                println!(
+                    "launcher {}",
+                    if wrote { "written" } else { "already there" }
+                );
+                Exit::Quit
+            }),
         #[cfg(feature = "kindle")]
         Mode::StartAtBoot { mode } => {
             use kindil::host::{Boot, Host};

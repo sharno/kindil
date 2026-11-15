@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "xtask"]
+members = [".", "launcher", "xtask"]
 # `cargo build` and the Nix build at the root build the app alone.
 default-members = ["."]
 

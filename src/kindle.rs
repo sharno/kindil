@@ -43,16 +43,16 @@ const USER_STORAGE: &str = "/mnt/us";
 const BOOT_JOB: &str = "/etc/upstart/kindil.conf";
 /// Present: the boot job starts kindil (`bin/boot.sh`).
 const BOOT_FLAG: &str = "/mnt/us/kindil/BOOT";
-/// The start-at-boot flag's content for a standalone boot (bin/boot.sh).
+/// The start-at-boot flag's content for a standalone boot (launcher/src/boot.rs).
 const BOOT_STANDALONE: &str = "standalone";
 /// Amazon's framework job skips its Java framework while this exists.
-/// session.sh and boot.sh remove it on every way back to Amazon's UI.
+/// The launcher removes it on every way back to Amazon's UI.
 const SKIP_FRAMEWORK: &str = "/mnt/us/DONT_START_FRAMEWORK";
 /// Boots in a row where kindil didn't stay up; turning start at boot on
 /// gives it a fresh start.
 const BOOT_TRIES: &str = "/var/local/kindil/boot-tries";
 /// The KUAL extension's binaries: the current one, a staged update, the one
-/// on trial and the previous one (see `bin/session.sh`).
+/// on trial and the previous one (see launcher/src/session.rs).
 const EXTENSION_BIN: &str = "/mnt/us/extensions/kindil/bin";
 /// The launcher's marker while a new version is on trial.
 const UPDATE_TRIAL: &str = "/var/local/kindil/trying";
@@ -370,7 +370,15 @@ impl Host for KindleHost {
     }
 
     fn commit_update(&self) -> anyhow::Result<Commit> {
-        Slots::new(EXTENSION_BIN, UPDATE_TRIAL).commit()
+        let commit = Slots::new(EXTENSION_BIN, UPDATE_TRIAL).commit()?;
+        // Up for two minutes: this version's launcher is the one that starts
+        // kindil from now on (src/launcher.rs).
+        match crate::launcher::install(Path::new(crate::launcher::PATH)) {
+            Ok(true) => eprintln!("kindil: launcher updated"),
+            Ok(false) => {}
+            Err(error) => eprintln!("kindil: writing the launcher: {error:#}"),
+        }
+        Ok(commit)
     }
 }
 

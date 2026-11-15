@@ -11,6 +11,7 @@ pub mod ghosting;
 pub mod host;
 pub mod install;
 pub mod kindle;
+pub mod launcher;
 pub mod lifeline;
 pub mod net;
 pub mod networks;
