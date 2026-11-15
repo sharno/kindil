@@ -61,6 +61,13 @@ and a reboot always returns the Kindle to stock.
     them, and is remembered. Back online about a second after
     a nap. None of Amazon's Wi-Fi services run while kindil does; on a
     first run it starts with no networks, ready to join one.
+  - **SSH of its own**: kindil carries kindil-sshd (`sshd/`, Rust, on
+    russh with pure-Rust crypto) and runs it as its child on port 2222 for
+    now, beside USBNetwork's on 22: keys only (ed25519, RSA), commands and
+    shells. It uses USBNetwork's `usbnet/etc/authorized_keys`, copied to
+    `/var/local/kindil/ssh/` whenever it is there, and a host key of its own;
+    nothing of it is on `/mnt/us`. It ends with kindil, and its sessions with
+    it.
   - **USB drive mode**: plugging into a computer shows a USB screen while the
     computer has `/mnt/us`; unplugging reloads the library and resumes
     Syncthing. A cable that keeps dropping doesn't flash the screen: kindil
@@ -194,6 +201,7 @@ faster.
 | `/mnt/us/extensions/kindil/` | KUAL launcher and the `kindil` binary; during an update also `kindil.next`, `kindil.trying`, and afterwards `kindil.previous` |
 | `/var/local/kindil/` | The running copy, the launcher and the log; off `/mnt/us`, which a computer takes in USB drive mode |
 | `/var/local/kindil/networks.toml` | The Wi-Fi networks joined in kindil, with their passwords (root only) |
+| `/var/local/kindil/kindil-sshd`, `/var/local/kindil/ssh/` | kindil's SSH server, its host key and authorized keys (root only) |
 | `/var/local/kindil/usb-drive` | `kindil` inside: kindil runs USB drive mode instead of volumd (off by default; [docs/USB-DRIVE-TEST.md](docs/USB-DRIVE-TEST.md)) |
 | `/var/local/kindil/usb-exported` | Present while a computer may have the storage: the next start checks it |
 | `/mnt/us/kindil/kindil.toml` | Optional settings (every key has a default) |
@@ -242,7 +250,8 @@ weather and make no requests.
 ### On the Kindle
 
 `cargo xtask` (the `xtask/` crate) reaches the Kindle over SSH
-(`KINDIL_DEVICE`, optionally `KINDIL_SSH_KEY`):
+(`KINDIL_DEVICE`, optionally `KINDIL_SSH_KEY` and `KINDIL_SSH_PORT`), and
+copies files with plain `ssh` (no scp or sftp needed on the Kindle):
 
 ```sh
 cargo xtask release 0.9.1 [--rollback 0.9.0]   # install a release
@@ -272,6 +281,7 @@ someone nearby to press the power button, or must end on their own first.
 | `wifi.rs` | wpa_supplicant control socket, typed SSID/passphrase |
 | `net.rs` | Wi-Fi run by kindil: driver, supervised wpa_supplicant and udhcpc |
 | `networks.rs` | The saved Wi-Fi networks |
+| `ssh.rs` | SSH run by kindil: its kindil-sshd, keys, firewall port, supervised |
 | `sync.rs` | Syncthing as a typed state machine |
 | `update.rs` | Over-the-air updates: GitHub releases, signature check, trial and commit |
 | `system.rs` | Sleep, wake and USB drive mode as a state machine |
@@ -280,6 +290,8 @@ someone nearby to press the power button, or must end on their own first.
 | `ghosting.rs` | When to flash the panel |
 | `launcher.rs` | Writes out the launcher kindil carries, once it has run two minutes |
 | `vendor/slint-backend-kindle` | Display/touch backend, patched for full refresh |
+| `vendor/russh` | russh 0.65.1 with a pure-Rust AEAD backend (see its `KINDIL.md`) |
+| `sshd/` | kindil-sshd, its own small crate: keys-only SSH server (exec, shells on a pty) |
 | `launcher/` | The launcher, its own small crate: the session around kindil (Amazon's UI and services aside, crash restart, update trial, restore) and the boot guard |
 
 The build pins Slint 1.18.1 with its software renderer and full font shaping

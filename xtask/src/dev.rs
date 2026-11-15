@@ -83,10 +83,27 @@ fn arm_cargo(cc: &str) -> Command {
     command
 }
 
-/// dist/kindil, static ARMv7, with kindil's own wpa_supplicant and its
-/// launcher inside.
+/// dist/kindil, static ARMv7, with kindil's own wpa_supplicant, its SSH
+/// server and its launcher inside.
 pub fn device() -> anyhow::Result<PathBuf> {
     let cc = arm_linker()?;
+    // Built for size (Cargo.toml's sshd profile).
+    run(arm_cargo(&cc).args([
+        "build",
+        "--locked",
+        "--profile",
+        "sshd",
+        "--package",
+        "sshd",
+        "--target",
+        TARGET,
+    ]))?;
+    let sshd = std::fs::canonicalize(format!("target/{TARGET}/sshd/kindil-sshd"))?;
+    println!(
+        "SSH server: {} ({} bytes)",
+        sshd.display(),
+        std::fs::metadata(&sshd)?.len()
+    );
     run(arm_cargo(&cc).args([
         "build",
         "--locked",
@@ -105,6 +122,7 @@ pub fn device() -> anyhow::Result<PathBuf> {
     ]))?;
     run(arm_cargo(&cc)
         .env("KINDIL_WPA_SUPPLICANT", format!("{wpa}/bin/wpa_supplicant"))
+        .env("KINDIL_SSHD", &sshd)
         .env("KINDIL_LAUNCHER", &launcher)
         .args([
             "build",

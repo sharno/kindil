@@ -13,6 +13,7 @@ a replacement for the full transitive license inventory when distributing builds
 | clap | https://github.com/clap-rs/clap — MIT OR Apache-2.0 | Command line |
 | rbook | https://github.com/DevinSterling/rbook — Apache-2.0 | EPUB parsing/reading order |
 | html2text | https://github.com/jugglerchris/rust-html2text — MIT | XHTML-to-text conversion |
+| russh 0.65.1 | https://github.com/warp-tech/russh — Apache-2.0 | kindil-sshd's SSH protocol; vendored in `vendor/russh` with a pure-Rust (RustCrypto) AEAD backend, see its `KINDIL.md` |
 | IBM Plex Sans Arabic | see `crates/miqat/assets/fonts/OFL.txt` — SIL OFL 1.1 | All typography: Miqat, the shell and the reader |
 
 kindil runs on Amazon's stock OS and uses its services (wifid, powerd, the
