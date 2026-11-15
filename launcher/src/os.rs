@@ -31,6 +31,10 @@ pub trait Os: Sync {
     /// Starts `launcher session` detached, its output appended to `log`;
     /// its pid.
     fn spawn_session(&self, log: &Path) -> Option<i32>;
+    /// Whether /proc/modules lists `module`.
+    fn module_loaded(&self, module: &str) -> bool;
+    /// `modprobe -r MODULE`.
+    fn unload_module(&self, module: &str);
 }
 
 /// The PW1 itself.
@@ -206,6 +210,17 @@ impl Os for Device {
         let child = command.spawn().ok()?;
         i32::try_from(child.id()).ok()
     }
+
+    fn module_loaded(&self, module: &str) -> bool {
+        std::fs::read_to_string("/proc/modules").is_ok_and(|text| {
+            text.lines()
+                .any(|line| line.split_whitespace().next() == Some(module))
+        })
+    }
+
+    fn unload_module(&self, module: &str) {
+        quiet("modprobe", &["-r", module]);
+    }
 }
 
 pub fn version(binary: &Path) -> Option<String> {
@@ -305,6 +320,7 @@ pub mod fake {
         /// At boot: Amazon's UI comes up while the launcher waits, if X
         /// runs to bring it.
         pub gui_coming: Mutex<bool>,
+        pub modules: Mutex<BTreeSet<String>>,
     }
 
     impl Fake {
@@ -346,15 +362,25 @@ pub mod fake {
             self.upstart.lock().unwrap().push(format!("start {job}"));
             let mut jobs = self.jobs.lock().unwrap();
             jobs.insert(job.to_owned());
-            // Starting X brings Amazon's UI up with it, as upstart does.
+            // Starting X brings Amazon's UI up with it, as upstart does;
+            // volumd brings USBNetwork's job (`start on started volumd`).
             if job == "x" {
                 jobs.insert("lab126_gui".into());
+            }
+            if job == "volumd" {
+                jobs.insert("usbnet".into());
             }
         }
 
         fn stop(&self, job: &str) {
             self.upstart.lock().unwrap().push(format!("stop {job}"));
-            self.jobs.lock().unwrap().remove(job);
+            let mut jobs = self.jobs.lock().unwrap();
+            jobs.remove(job);
+            // `stop on stopping volumd`.
+            if job == "volumd" {
+                jobs.remove("usbnet");
+                jobs.remove("usbnet-autostart");
+            }
         }
 
         fn sleep(&self, _: Duration) {
@@ -405,6 +431,15 @@ pub mod fake {
         fn spawn_session(&self, _: &Path) -> Option<i32> {
             *self.sessions.lock().unwrap() += 1;
             Some(if *self.up.lock().unwrap() { UP } else { GONE })
+        }
+
+        fn module_loaded(&self, module: &str) -> bool {
+            self.modules.lock().unwrap().contains(module)
+        }
+
+        fn unload_module(&self, module: &str) {
+            self.upstart.lock().unwrap().push(format!("rmmod {module}"));
+            self.modules.lock().unwrap().remove(module);
         }
     }
 }

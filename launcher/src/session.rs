@@ -118,6 +118,52 @@ fn executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+/// USB drive mode run by kindil (src/drive.rs in the app): volumd stops
+/// while kindil runs. Stopping it stops USBNetwork's jobs too (`stop on
+/// stopping volumd`), so the way back starts those that ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UsbDrive {
+    usbnet: bool,
+    autostart: bool,
+}
+
+/// The switch, `/var/local/kindil/usb-drive`, holding `kindil`; otherwise
+/// volumd keeps USB drive mode, as without kindil.
+const USB_SWITCH: &str = "usb-drive";
+
+impl UsbDrive {
+    /// Read before anything is stopped.
+    fn read(paths: &Paths, os: &dyn Os) -> Option<Self> {
+        let switch = std::fs::read_to_string(paths.run.join(USB_SWITCH)).unwrap_or_default();
+        (switch.trim() == "kindil").then(|| Self {
+            usbnet: os.running("usbnet"),
+            autostart: os.running("usbnet-autostart"),
+        })
+    }
+
+    /// volumd, and USBNetwork's jobs that ran before.
+    fn restore(self, os: &dyn Os) {
+        if !os.running("volumd") {
+            // usbnet's start toggles USBNetwork: over a g_ether still loaded
+            // it would switch it off. Without it, it comes up as at boot.
+            if self.usbnet && os.module_loaded("g_ether") {
+                log("unloading g_ether for USBNetwork to start afresh");
+                os.unload_module("g_ether");
+            }
+            log("starting volumd");
+            os.start("volumd");
+        }
+        for (job, ran) in [
+            ("usbnet", self.usbnet),
+            ("usbnet-autostart", self.autostart),
+        ] {
+            if ran && !os.running(job) {
+                os.start(job);
+            }
+        }
+    }
+}
+
 pub fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
     crate::os::ignore(libc::SIGHUP);
     let files = Files::new(paths);
@@ -136,6 +182,7 @@ pub fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
         log(&format!("missing {}", files.bin.display()));
         return ExitCode::FAILURE;
     }
+    let usb = UsbDrive::read(paths, os);
     // Stopping the GUI job signals its whole tree, which can include us.
     crate::os::ignore(libc::SIGTERM);
     // A standalone boot never started it.
@@ -164,7 +211,7 @@ pub fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
         // The rest in the background, so kindil starts at once. Ended before
         // anything is brought back, so the two never race.
         let (done, rounds) = mpsc::channel::<()>();
-        let stopper = scope.spawn(move || stop_services(os, &rounds));
+        let stopper = scope.spawn(move || stop_services(os, &rounds, usb.is_some()));
         // Amazon's screen modules would draw over kindil in USB drive mode
         // and after it; kindil draws its own screens. Only Amazon's UI loads
         // them.
@@ -176,13 +223,20 @@ pub fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
         run(paths, os, &files, slot);
         drop(done);
         let _ = stopper.join();
-        restore(paths, os, gui);
+        restore(paths, os, gui, usb);
     });
     ExitCode::SUCCESS
 }
 
-fn stop_services(os: &dyn Os, done: &mpsc::Receiver<()>) {
+fn stop_services(os: &dyn Os, done: &mpsc::Receiver<()>, usb_drive: bool) {
     for _ in 0..STOP_ROUNDS {
+        // kindil runs USB drive mode, and waits for volumd to go. It started
+        // at boot, as kindil's boot job needs; USBNetwork's jobs go with it,
+        // their post-stop taking a few seconds.
+        if usb_drive && os.running("volumd") {
+            log("stopping volumd: kindil runs USB drive mode");
+            os.stop("volumd");
+        }
         for job in SERVICES {
             if os.running(job) {
                 os.stop(job);
@@ -250,7 +304,7 @@ fn run(paths: &Paths, os: &dyn Os, files: &Files, mut slot: PathBuf) {
 }
 
 /// Amazon's UI back, with everything it needs.
-fn restore(paths: &Paths, os: &dyn Os, gui: bool) {
+fn restore(paths: &Paths, os: &dyn Os, gui: bool, usb: Option<UsbDrive>) {
     // A standalone boot skipped Amazon's framework: without it, Amazon's UI
     // is an empty screen. `launcher boot` sets the flag again after a boot
     // kindil stays up.
@@ -260,6 +314,11 @@ fn restore(paths: &Paths, os: &dyn Os, gui: bool) {
     let _ = std::fs::write(&paths.charger, "1");
     if !os.running("powerd") {
         os.start("powerd");
+    }
+    // Before Amazon's UI, which expects the storage volumd's. Its start runs
+    // kindil's boot job again, which does nothing twice in a boot.
+    if let Some(usb) = usb {
+        usb.restore(os);
     }
     if gui {
         os.lipc_set("com.lab126.blanket", "load", "usb");
@@ -644,6 +703,75 @@ mod tests {
         env.fake(&env.ext("kindil"), "1.0.0", &body);
         env.session(&Fake::default());
         assert_eq!(env.runs(), "ran ran");
+    }
+
+    /// From KUAL, with volumd and USBNetwork's jobs up as on the PW1.
+    fn kual_with_volumd() -> Fake {
+        let os = kual();
+        for job in ["volumd", "usbnet", "usbnet-autostart"] {
+            os.jobs.lock().unwrap().insert(job.into());
+        }
+        os
+    }
+
+    #[test]
+    fn volumd_stays_unless_kindil_runs_usb_drive_mode() {
+        let env = Env::new();
+        let os = kual_with_volumd();
+        env.fake(&env.ext("kindil"), "1.0.0", "exit 0");
+        std::fs::write(env.paths.run.join(USB_SWITCH), "amazon\n").unwrap();
+        env.session(&os);
+        let during = os.during.lock().unwrap().clone().unwrap();
+        assert!(during.contains("volumd") && during.contains("usbnet"));
+        assert!(!os.upstart().contains("volumd"), "{}", os.upstart());
+    }
+
+    #[test]
+    fn kindils_usb_drive_mode_stops_volumd_and_brings_it_back_with_usbnetwork() {
+        let env = Env::new();
+        let os = kual_with_volumd();
+        let before = os.jobs();
+        env.fake(&env.ext("kindil"), "1.0.0", "exit 0");
+        std::fs::write(env.paths.run.join(USB_SWITCH), "kindil\n").unwrap();
+        env.session(&os);
+        let during = os.during.lock().unwrap().clone().unwrap();
+        for job in ["volumd", "usbnet", "usbnet-autostart"] {
+            assert!(!during.contains(job), "{job} stopped while kindil runs");
+        }
+        assert_eq!(os.jobs(), before, "every one of them back");
+        let upstart = os.upstart.lock().unwrap().clone();
+        let at = |line: &str| upstart.iter().position(|l| l == line).unwrap();
+        assert!(at("start volumd") < at("start usbnet-autostart"));
+        assert!(at("start volumd") < at("start x"), "before Amazon's UI");
+        assert!(!upstart.contains(&"rmmod g_ether".to_owned()));
+    }
+
+    #[test]
+    fn usbnetwork_starts_afresh_without_a_leftover_g_ether() {
+        let env = Env::new();
+        let os = kual_with_volumd();
+        os.modules.lock().unwrap().insert("g_ether".into());
+        env.fake(&env.ext("kindil"), "1.0.0", "exit 0");
+        std::fs::write(env.paths.run.join(USB_SWITCH), "kindil").unwrap();
+        env.session(&os);
+        let upstart = os.upstart.lock().unwrap().clone();
+        let at = |line: &str| upstart.iter().position(|l| l == line).unwrap();
+        assert!(at("rmmod g_ether") < at("start volumd"));
+    }
+
+    #[test]
+    fn usbnetwork_that_didnt_run_isnt_started() {
+        let env = Env::new();
+        let os = kual();
+        os.jobs.lock().unwrap().insert("volumd".into());
+        os.modules.lock().unwrap().insert("g_ether".into());
+        env.fake(&env.ext("kindil"), "1.0.0", "exit 0");
+        std::fs::write(env.paths.run.join(USB_SWITCH), "kindil").unwrap();
+        env.session(&os);
+        assert!(os.running("volumd"));
+        // upstart itself starts usbnet with volumd; the launcher adds nothing.
+        assert!(!os.upstart().contains("start usbnet-autostart"));
+        assert!(!os.upstart().contains("rmmod"));
     }
 
     #[test]
