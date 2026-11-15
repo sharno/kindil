@@ -1,11 +1,11 @@
 //! Domain state → what the screen shows. Pure, so wording and units are tested
 //! without a window.
 use crate::battery::{Battery, Charge};
-use crate::host::{Boot, BootStart, DeviceInfo, Power, Ssh, Wifi};
+use crate::host::{Boot, BootStart, DeviceInfo, OwnSsh, Power, Ssh, SshKey, Wifi};
 use crate::prefs::Progress;
 use crate::reader::Book;
 use crate::sync::Service;
-use crate::ui::{BookItem, BootChoice, Fact, NetworkItem, Switch};
+use crate::ui::{BookItem, BootChoice, Fact, NetworkItem, SshKeyItem, Switch};
 use crate::update::{Updates, Version};
 use crate::wifi::{Network, Security};
 use chrono::{DateTime, TimeZone};
@@ -92,6 +92,23 @@ pub fn ssh(ssh: Ssh, ip: Option<Ipv4Addr>) -> (Switch, Switch, String) {
                 (Power::Off, _) => "Off".into(),
             },
         ),
+    }
+}
+
+/// kindil's own SSH server's line: where to reach it, or that it isn't up.
+pub fn own_ssh(ssh: &OwnSsh, ip: Option<Ipv4Addr>) -> String {
+    match (ssh.running, ip) {
+        (false, _) => format!("Not running · port {}", ssh.port),
+        (true, Some(ip)) => format!("ssh -p {} root@{ip} · keys only", ssh.port),
+        (true, None) => format!("Listening on port {} · keys only", ssh.port),
+    }
+}
+
+pub fn ssh_key(key: &SshKey) -> SshKeyItem {
+    SshKeyItem {
+        title: format!("{} · {}", key.kind, key.bits).into(),
+        fingerprint: key.fingerprint.clone().into(),
+        comment: key.comment.clone().into(),
     }
 }
 

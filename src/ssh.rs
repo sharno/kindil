@@ -7,9 +7,10 @@
 //! storage a computer takes in USB drive mode; USBNetwork's dropbear runs
 //! from there.
 //!
-//! Keys only, no passwords. The keys are USBNetwork's: its
-//! `authorized_keys` is copied into kindil's own whenever it is there, and
-//! kindil's copy stays for when it isn't. The host key is the server's own,
+//! Keys only, no passwords. The trusted keys are kindil's own list, which
+//! USBNetwork's seeds on the first start only (src/ssh_keys.rs); keys added
+//! on the USB storage later wait to be trusted in Settings. The host key is
+//! the server's own,
 //! made on its first start. The server ends with kindil ([`stop`]), and
 //! the launcher stops it by its pid file on the way out and before each run
 //! (launcher/src/main.rs), and shuts its port; sessions open end with it.
@@ -31,7 +32,7 @@ pub const LOG: &str = "/var/local/kindil/sshd.log";
 /// Its process name, as /proc/PID/stat gives it.
 const NAME: &str = "kindil-sshd";
 /// USBNetwork's authorized keys, read by its patched dropbear.
-const USBNET_AUTHORIZED_KEYS: &str = "/mnt/us/usbnet/etc/authorized_keys";
+pub const USBNET_AUTHORIZED_KEYS: &str = "/mnt/us/usbnet/etc/authorized_keys";
 const BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kindil-sshd"));
 const INTERFACE: &str = "wlan0";
 const IPTABLES: &str = "/usr/sbin/iptables";
@@ -84,6 +85,11 @@ impl Layout {
         self.dir.join("authorized_keys")
     }
 
+    /// Fingerprints of USB keys someone chose not to trust.
+    pub fn ignored_keys(&self) -> PathBuf {
+        self.dir.join("ignored_keys")
+    }
+
     /// kindil-sshd's arguments.
     pub fn args(&self, port: u16) -> Vec<String> {
         [
@@ -99,7 +105,8 @@ impl Layout {
     }
 
     /// Everything the server needs: the binary (written only when it
-    /// changed), its directory and the keys. It makes its host key itself.
+    /// changed), its directory and, the first time, its trusted keys. It
+    /// makes its host key itself.
     pub fn prepare(&self, binary: &[u8], usbnet_keys: &Path) -> anyhow::Result<()> {
         anyhow::ensure!(
             !binary.is_empty(),
@@ -112,9 +119,11 @@ impl Layout {
             ));
         }
         own_dir(&self.dir)?;
-        // /mnt/us may be gone (USB drive mode): the last copy serves.
-        if let Err(error) = copy_keys(usbnet_keys, &self.authorized_keys()) {
-            say(format_args!("SSH keys from USBNetwork: {error}"));
+        // The first start only; /mnt/us may be gone (USB drive mode).
+        match crate::ssh_keys::bootstrap(usbnet_keys, &self.authorized_keys()) {
+            Ok(true) => say(format_args!("SSH keys taken from USBNetwork's, once")),
+            Ok(false) => {}
+            Err(error) => say(format_args!("SSH keys from USBNetwork: {error}")),
         }
         Ok(())
     }
@@ -348,22 +357,6 @@ pub fn install(binary: &[u8], path: &Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Copies the authorized keys at `from` to `to`, root's only, when `from`
-/// is there and differs; whether it copied. With no `from`, `to` stays.
-pub fn copy_keys(from: &Path, to: &Path) -> anyhow::Result<bool> {
-    let keys = match std::fs::read(from) {
-        Ok(keys) => keys,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    if read_no_symlink(to).ok().as_deref() == Some(keys.as_slice()) {
-        set_mode(to, 0o600)?;
-        return Ok(false);
-    }
-    write_new(to, &keys, 0o600)?;
-    Ok(true)
-}
-
 fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
@@ -558,33 +551,6 @@ mod tests {
     }
 
     #[test]
-    fn copies_usbnetworks_keys_root_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let (from, to) = (dir.path().join("usbnet"), dir.path().join("keys"));
-        // No USBNetwork keys: nothing to copy, nothing made.
-        assert!(!copy_keys(&from, &to).unwrap());
-        assert!(!to.exists());
-        std::fs::write(&from, "ssh-ed25519 AAAA one\n").unwrap();
-        set_mode(&from, 0o777).unwrap();
-        assert!(copy_keys(&from, &to).unwrap());
-        assert_eq!(
-            std::fs::read_to_string(&to).unwrap(),
-            "ssh-ed25519 AAAA one\n"
-        );
-        assert_eq!(mode(&to), 0o600);
-        assert!(!copy_keys(&from, &to).unwrap());
-        std::fs::write(&from, "ssh-ed25519 AAAA two\n").unwrap();
-        assert!(copy_keys(&from, &to).unwrap());
-        // USBNetwork's gone (USB drive mode): the last copy stays.
-        std::fs::remove_file(&from).unwrap();
-        assert!(!copy_keys(&from, &to).unwrap());
-        assert_eq!(
-            std::fs::read_to_string(&to).unwrap(),
-            "ssh-ed25519 AAAA two\n"
-        );
-    }
-
-    #[test]
     fn prepares_binary_directory_and_keys() {
         let dir = tempfile::tempdir().unwrap();
         let layout = layout(dir.path());
@@ -594,10 +560,16 @@ mod tests {
         assert_eq!(std::fs::read(&layout.binary).unwrap(), b"sshd");
         assert_eq!(mode(&layout.dir), 0o700);
         assert_eq!(mode(&layout.authorized_keys()), 0o600);
-        // Again, with the directory opened up: closed again.
+        // Again, with the directory opened up: closed again. A key added on
+        // the USB storage since isn't taken.
         set_mode(&layout.dir, 0o775).unwrap();
+        std::fs::write(&usbnet, "ssh-ed25519 AAAA k\nssh-ed25519 BBBB new\n").unwrap();
         layout.prepare(b"sshd", &usbnet).unwrap();
         assert_eq!(mode(&layout.dir), 0o700);
+        assert_eq!(
+            std::fs::read_to_string(layout.authorized_keys()).unwrap(),
+            "ssh-ed25519 AAAA k\n"
+        );
     }
 
     #[test]

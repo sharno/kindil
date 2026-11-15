@@ -6,7 +6,7 @@ use crate::config::{Config, Dashboard};
 use crate::drain::{Drain, Gauge};
 use crate::files::{FileName, Files, Trashed};
 use crate::ghosting::{Ghosting, Refresh, Update};
-use crate::host::{BootStart, Brightness, DeviceInfo, Host, Power, Ssh, Wifi};
+use crate::host::{BootStart, Brightness, DeviceInfo, Host, OwnSsh, Power, Ssh, SshKey, Wifi};
 use crate::prefs::Store;
 use crate::reader::{self, Book, Layout, Reader};
 use crate::sync::Service;
@@ -326,6 +326,7 @@ struct Snapshot {
     wifi: Wifi,
     saved_networks: Vec<String>,
     ssh: Ssh,
+    own_ssh: OwnSsh,
     boot_start: BootStart,
     info: DeviceInfo,
     brightness: Option<Brightness>,
@@ -337,6 +338,7 @@ impl Snapshot {
             wifi: host.wifi(),
             saved_networks: host.saved_networks(),
             ssh: host.ssh(),
+            own_ssh: host.own_ssh(),
             boot_start: host.boot_start(),
             info: host.info(),
             brightness: host.brightness().ok(),
@@ -363,6 +365,10 @@ impl Snapshot {
         k.set_ssh(server);
         k.set_ssh_at_boot(at_boot);
         k.set_ssh_detail(detail.into());
+        k.set_own_ssh_detail(view::own_ssh(&self.own_ssh, view::ip(&self.wifi)).into());
+        let keys = |keys: &[SshKey]| model(keys.iter().map(view::ssh_key).collect());
+        k.set_ssh_trusted(keys(&self.own_ssh.trusted));
+        k.set_ssh_new(keys(&self.own_ssh.new_on_usb));
         let (boot, detail) = view::boot_start(self.boot_start);
         k.set_boot(boot);
         k.set_boot_start_detail(detail.into());
@@ -575,6 +581,8 @@ fn wire(window: &AppWindow, ctx: &Ctx) {
     on!(on_forget_network => forget_network(ssid));
     on!(on_toggle_ssh => toggle_ssh());
     on!(on_toggle_ssh_at_boot => toggle_ssh_at_boot());
+    on!(on_trust_ssh_keys => trust_ssh_keys());
+    on!(on_ignore_ssh_keys => ignore_ssh_keys());
     on!(on_choose_boot => choose_boot(choice));
     on!(on_toggle_sync => toggle_sync());
     on!(on_exit_app => exit_app());
@@ -990,6 +998,51 @@ impl Ctx {
             ui.global::<Kindil>().get_ssh_at_boot(),
             "SSH at boot",
             |host, power| host.set_ssh_at_boot(power),
+        );
+    }
+
+    /// The fingerprints of the new keys on screen: only those are trusted
+    /// or ignored, whatever the USB storage holds by the time of the tap.
+    fn shown_new_keys(&self) -> Vec<String> {
+        let Some(ui) = self.ui() else {
+            return Vec::new();
+        };
+        slint::Model::iter(&ui.global::<Kindil>().get_ssh_new())
+            .map(|key| key.fingerprint.to_string())
+            .collect()
+    }
+
+    fn trust_ssh_keys(&self) {
+        let shown = self.shown_new_keys();
+        self.background(
+            move |host| {
+                host.trust_ssh_keys(&shown)
+                    .map(|()| (shown.len(), Snapshot::read(host)))
+            },
+            |ui, result| match result {
+                Ok((count, snapshot)) => {
+                    snapshot.apply(ui);
+                    notify(
+                        ui,
+                        &match count {
+                            1 => "Trusted 1 SSH key".to_string(),
+                            n => format!("Trusted {n} SSH keys"),
+                        },
+                    );
+                }
+                Err(error) => notify(ui, &format!("SSH keys: {error}")),
+            },
+        );
+    }
+
+    fn ignore_ssh_keys(&self) {
+        let shown = self.shown_new_keys();
+        self.background(
+            move |host| host.ignore_ssh_keys(&shown).map(|()| Snapshot::read(host)),
+            |ui, result| match result {
+                Ok(snapshot) => snapshot.apply(ui),
+                Err(error) => notify(ui, &format!("SSH keys: {error}")),
+            },
         );
     }
 

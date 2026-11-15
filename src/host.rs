@@ -94,6 +94,39 @@ pub enum Ssh {
     },
 }
 
+/// A key kindil's SSH server trusts, or could: what someone checks before
+/// trusting it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshKey {
+    /// `ED25519`, `RSA`...
+    pub kind: String,
+    pub bits: u32,
+    /// `SHA256:...`, as `ssh-keygen -lf` prints it.
+    pub fingerprint: String,
+    pub comment: String,
+}
+
+impl From<&crate::ssh_keys::Key> for SshKey {
+    fn from(key: &crate::ssh_keys::Key) -> Self {
+        Self {
+            kind: key.kind.clone(),
+            bits: key.bits,
+            fingerprint: key.fingerprint.clone(),
+            comment: key.comment.clone(),
+        }
+    }
+}
+
+/// kindil's own SSH server (src/ssh.rs) and its keys.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnSsh {
+    pub port: u16,
+    pub running: bool,
+    pub trusted: Vec<SshKey>,
+    /// Keys on the USB storage that are neither trusted nor ignored yet.
+    pub new_on_usb: Vec<SshKey>,
+}
+
 /// Whether kindil starts at boot instead of Amazon's UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootStart {
@@ -159,6 +192,12 @@ pub trait Host: Send + Sync {
     fn ssh(&self) -> Ssh;
     fn set_ssh(&self, power: Power) -> anyhow::Result<()>;
     fn set_ssh_at_boot(&self, power: Power) -> anyhow::Result<()>;
+    /// kindil's own SSH server and its keys.
+    fn own_ssh(&self) -> OwnSsh;
+    /// Trusts the new USB keys with these fingerprints (those shown).
+    fn trust_ssh_keys(&self, fingerprints: &[String]) -> anyhow::Result<()>;
+    /// Stops offering the new USB keys with these fingerprints.
+    fn ignore_ssh_keys(&self, fingerprints: &[String]) -> anyhow::Result<()>;
     fn boot_start(&self) -> BootStart;
     /// Fails while the boot job isn't installed.
     fn set_boot_start(&self, boot: Boot) -> anyhow::Result<()>;
@@ -196,7 +235,34 @@ struct SimulatedState {
     saved: Vec<String>,
     ssh: Power,
     ssh_at_boot: Power,
+    own_ssh: OwnSsh,
     boot_start: BootStart,
+}
+
+/// The Simulated device's keys: one trusted, one new on the USB storage.
+fn simulated_ssh() -> OwnSsh {
+    let key = |kind: &str, bits, fingerprint: &str, comment: &str| SshKey {
+        kind: kind.into(),
+        bits,
+        fingerprint: fingerprint.into(),
+        comment: comment.into(),
+    };
+    OwnSsh {
+        port: 2222,
+        running: true,
+        trusted: vec![key(
+            "ED25519",
+            256,
+            "SHA256:Tmj8P5/f8150RFsVfCD8guzdZW/Exkcf9MVSDzekGsg",
+            "me@laptop",
+        )],
+        new_on_usb: vec![key(
+            "RSA",
+            3072,
+            "SHA256:kASt+czojb6SDSr4yElIlLfOJ/VLtLLNJiTGIu8Qql4",
+            "me@desktop",
+        )],
+    }
 }
 
 impl Default for Simulated {
@@ -215,6 +281,7 @@ impl Default for Simulated {
                 saved: Vec::new(),
                 ssh: Power::On,
                 ssh_at_boot: Power::On,
+                own_ssh: simulated_ssh(),
                 boot_start: BootStart::Installed(Boot::Off),
             }),
         }
@@ -306,6 +373,27 @@ impl Host for Simulated {
     }
     fn set_ssh_at_boot(&self, power: Power) -> anyhow::Result<()> {
         self.with(|s| s.ssh_at_boot = power);
+        Ok(())
+    }
+    fn own_ssh(&self) -> OwnSsh {
+        self.with(|s| s.own_ssh.clone())
+    }
+    fn trust_ssh_keys(&self, fingerprints: &[String]) -> anyhow::Result<()> {
+        self.with(|s| {
+            let (chosen, rest) = std::mem::take(&mut s.own_ssh.new_on_usb)
+                .into_iter()
+                .partition(|key| fingerprints.contains(&key.fingerprint));
+            s.own_ssh.new_on_usb = rest;
+            s.own_ssh.trusted.extend::<Vec<SshKey>>(chosen);
+        });
+        Ok(())
+    }
+    fn ignore_ssh_keys(&self, fingerprints: &[String]) -> anyhow::Result<()> {
+        self.with(|s| {
+            s.own_ssh
+                .new_on_usb
+                .retain(|key| !fingerprints.contains(&key.fingerprint))
+        });
         Ok(())
     }
     fn boot_start(&self) -> BootStart {
