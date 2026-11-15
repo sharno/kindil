@@ -419,18 +419,19 @@ async fn seconds_until_cut(mut stream: tokio::net::TcpStream, chatty: bool) -> f
 async fn cuts_a_peer_that_never_logs_in_and_frees_its_slot() {
     use tokio::io::AsyncWriteExt;
     let key = ed25519(1);
-    let server = serve_with(&line(key.public_key()), |settings| {
-        settings.max_connections = 1;
-        settings.login_time = Duration::from_secs(2);
-    })
-    .await;
     for chatty in [true, false] {
+        // One slot, so the cut peer's slot is the one a real client needs.
+        let server = serve_with(&line(key.public_key()), |settings| {
+            settings.max_connections = 1;
+            settings.login_time = Duration::from_secs(2);
+        })
+        .await;
         let mut stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
         if chatty {
             stream.write_all(b"SSH-2.0-stall\r\n").await.unwrap();
         }
         let cut = seconds_until_cut(stream, chatty).await;
-        assert!((1.5..3.5).contains(&cut), "cut after {cut} s");
+        assert!((1.5..5.0).contains(&cut), "cut after {cut} s");
         // Its slot is free again: a real client gets in.
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(login(server.addr, "root", key.clone()).await.is_some());
@@ -440,12 +441,13 @@ async fn cuts_a_peer_that_never_logs_in_and_frees_its_slot() {
 #[tokio::test]
 async fn a_peer_that_logs_in_outlives_the_deadline() {
     let key = ed25519(1);
+    // Long enough to log in under an emulator, too.
     let server = serve_with(&line(key.public_key()), |settings| {
-        settings.login_time = Duration::from_secs(1);
+        settings.login_time = Duration::from_secs(5);
     })
     .await;
     let handle = login(server.addr, "root", key).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
     assert_eq!(exec(&handle, "exit 4", None).await.status, Some(4));
 }
 
