@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "launcher", "xtask"]
+members = [".", "launcher", "sshd", "xtask"]
 # `cargo build` and the Nix build at the root build the app alone.
 default-members = ["."]
 
@@ -59,6 +59,8 @@ slint-build = "=1.18.1"
 # Vendored to add request_full_refresh() for ghosting control; upstream candidate.
 [patch.crates-io]
 slint-backend-kindle = { path = "vendor/slint-backend-kindle" }
+# Vendored to add a pure-Rust (RustCrypto) AEAD backend: no ring, no aws-lc-rs.
+russh = { path = "vendor/russh" }
 
 [profile.release]
 # Speed over size: the binary is a few MB either way, and page turns matter more.
@@ -67,3 +69,9 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# kindil-sshd (sshd/), which kindil carries and writes to the Kindle's small
+# /var/local: the release build, for size (about 1.7 MB rather than 2.4 MB).
+[profile.sshd]
+inherits = "release"
+opt-level = "s"
