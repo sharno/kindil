@@ -245,10 +245,17 @@ fn started(device: &Device, id: &str, pid: u32) -> anyhow::Result<()> {
     loop {
         // The log after the process check: a line written as it exits is
         // still seen.
-        let said = device.run(&format!(
+        let asked = device.run_once(&format!(
             "if kill -0 {pid} 2>/dev/null; then s=alive; else s=gone; fi; \
              grep 'install {id}: ' {LOG} || tail -n 5 {LOG} 2>/dev/null; echo $s"
-        ))?;
+        ));
+        // The install restarts kindil, and its Wi-Fi with it: the Kindle
+        // dropping off now is the install at work. Its outcome is waited
+        // for next, through such gaps.
+        let Ok(said) = asked else {
+            println!("the Kindle dropped off as the install got going; waiting for its outcome");
+            return Ok(());
+        };
         match launch(&said, id) {
             Ok(true) => return Ok(()),
             Err(said) => bail!("kindil install {id} exited at once; the log ends:\n{said}"),
