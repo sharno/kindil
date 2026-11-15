@@ -271,7 +271,7 @@ pub fn run_on_device(script: &Path, deadline: u64, args: &[String]) -> anyhow::R
     let quoted: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
     print!(
         "{}",
-        device.run(&format!(
+        device.run_once(&format!(
             "cd /var/local/kindil; sh /var/local/kindil/{name} {} </dev/null >/dev/null 2>&1 & pid=$!; \
              ln -sf kindil /var/local/kindil/kindil-lifeline; \
              setsid /var/local/kindil/kindil-lifeline {deadline} $pid </dev/null \

@@ -192,7 +192,7 @@ pub fn install(
     device.put(&paths, DEPLOY)?;
     // The log's directory first: on a Kindle kindil never ran on, the
     // redirect would fail and the install never start.
-    let launched = device.run(&format!(
+    let launched = device.run_once(&format!(
         "mkdir -p /var/local/kindil && chmod 755 {DEPLOY}/kindil.install && \
          {{ setsid {DEPLOY}/kindil.install install {id} </dev/null >>{LOG} 2>&1 & \
          echo \"launched $!\"; }}"

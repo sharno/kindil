@@ -70,8 +70,16 @@ impl Device {
     }
 
     /// Runs `command` in the Kindle's shell; its output without the banner.
-    /// Fails if SSH can't reach it.
+    /// Tries again while SSH can't reach it, for up to [`RETRY_FOR`]: a
+    /// dozing Kindle naps between redraws. Only for commands that may run
+    /// twice: SSH's 255 can also mean the connection dropped mid-command.
     pub fn run(&self, command: &str) -> anyhow::Result<String> {
+        retrying(|| self.run_once(command))
+    }
+
+    /// Runs `command` once: for commands that must not run twice, such as
+    /// starting an install. Fails if SSH can't reach the Kindle.
+    pub fn run_once(&self, command: &str) -> anyhow::Result<String> {
         let output = self
             .ssh(command)
             .stdin(Stdio::null())
@@ -86,6 +94,11 @@ impl Device {
     /// Copies `files` into `dir` on the Kindle, each with its mode, written
     /// beside its place and moved there once whole.
     pub fn put(&self, files: &[&Path], dir: &str) -> anyhow::Result<()> {
+        // Each copy is whole or not at all, so it may be tried again.
+        retrying(|| self.put_once(files, dir))
+    }
+
+    fn put_once(&self, files: &[&Path], dir: &str) -> anyhow::Result<()> {
         for file in files {
             let name = file
                 .file_name()
@@ -117,7 +130,7 @@ impl Device {
     }
 
     pub fn reachable(&self) -> bool {
-        self.run("true").is_ok()
+        self.run_once("true").is_ok()
     }
 
     /// Waits up to `hours` for the Kindle to answer: asleep, dozing or
@@ -136,6 +149,23 @@ impl Device {
 
 /// The Kindle's side of [`Device::put`]: stdin into `dir/name.part`, given
 /// the file's permissions, then moved over `dir/name`.
+/// How long [`Device::run`] and [`Device::put`] keep trying, and how often.
+const RETRY_FOR: Duration = Duration::from_secs(120);
+const RETRY_EVERY: Duration = Duration::from_secs(10);
+
+fn retrying<T>(mut attempt: impl FnMut() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    let since = Instant::now();
+    loop {
+        match attempt() {
+            Err(error) if since.elapsed() + RETRY_EVERY < RETRY_FOR => {
+                eprintln!("{error:#}; trying again in {} s", RETRY_EVERY.as_secs());
+                std::thread::sleep(RETRY_EVERY);
+            }
+            result => return result,
+        }
+    }
+}
+
 pub fn put_command(dir: &str, name: &str, mode: u32) -> String {
     let dir = dir.trim_end_matches('/');
     let part = shell_quote(&format!("{dir}/{name}.part"));
