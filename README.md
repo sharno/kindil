@@ -65,6 +65,11 @@ and a reboot always returns the Kindle to stock.
     computer has `/mnt/us`; unplugging reloads the library and resumes
     Syncthing. A cable that keeps dropping doesn't flash the screen: kindil
     returns only once the storage has stayed back for 3 s.
+    Amazon's volumd hands the storage over, unless `/var/local/kindil/usb-drive`
+    holds `kindil`: then kindil does it itself (unmount, a check with
+    `fsck.vfat` when it comes back, read-only if that fails) and the launcher
+    stops volumd while kindil runs. Off by default, still to be tried with a
+    cable: see [docs/USB-DRIVE-TEST.md](docs/USB-DRIVE-TEST.md).
   - **Low battery**: at 5% and not charging, kindil sleeps with a screen that
     asks for a charge. Suspended, the last few percent last for days; asleep
     on battery it wakes every 6 hours to check, and at 1% powers off, as
@@ -169,7 +174,7 @@ faster.
   its launcher stops powerd, whose work kindil does, and the services kindil
   has no use for (connections, apps, archive, updates, sync and the like);
   kindil runs Wi-Fi itself, so wifid doesn't run either. Of Amazon's system
-  only volumd stays, for now. kindil comes up about 20 s after
+  only volumd stays, unless kindil runs USB drive mode itself (off by default). kindil comes up about 20 s after
   the kernel, with more memory free. Every way back to Amazon's UI removes the flag first and
   starts those services and X if they aren't running:
   leaving kindil (Exit to Kindle, a crash it gives up on, a kill), and any
@@ -189,6 +194,8 @@ faster.
 | `/mnt/us/extensions/kindil/` | KUAL launcher and the `kindil` binary; during an update also `kindil.next`, `kindil.trying`, and afterwards `kindil.previous` |
 | `/var/local/kindil/` | The running copy, the launcher and the log; off `/mnt/us`, which a computer takes in USB drive mode |
 | `/var/local/kindil/networks.toml` | The Wi-Fi networks joined in kindil, with their passwords (root only) |
+| `/var/local/kindil/usb-drive` | `kindil` inside: kindil runs USB drive mode instead of volumd (off by default; [docs/USB-DRIVE-TEST.md](docs/USB-DRIVE-TEST.md)) |
+| `/var/local/kindil/usb-exported` | Present while a computer may have the storage: the next start checks it |
 | `/mnt/us/kindil/kindil.toml` | Optional settings (every key has a default) |
 | `/mnt/us/kindil/miqat.toml` | Miqat's own settings: location, prayer method |
 | `/mnt/us/kindil/prefs.toml` | Choices made on the device; safe to delete |
@@ -260,7 +267,7 @@ someone nearby to press the power button, or must end on their own first.
 | `ui.rs` | Wiring: callbacks, worker threads, timers, e-ink refresh policy |
 | `view.rs` | Pure domain → display text (units, wording) |
 | `host.rs` | The `Host` trait the UI uses, and the `Simulated` device |
-| `kindle.rs` | `Host` on the device: battery, charger and front light drivers, power button, volumd's events, USBNetwork |
+| `kindle.rs` | `Host` on the device: battery, charger and front light drivers, power button, volumd's events or kindil's USB drive mode, USBNetwork |
 | `power.rs` | powerd's rules kept by kindil: charging temperatures, critical battery |
 | `wifi.rs` | wpa_supplicant control socket, typed SSID/passphrase |
 | `net.rs` | Wi-Fi run by kindil: driver, supervised wpa_supplicant and udhcpc |
@@ -268,6 +275,7 @@ someone nearby to press the power button, or must end on their own first.
 | `sync.rs` | Syncthing as a typed state machine |
 | `update.rs` | Over-the-air updates: GitHub releases, signature check, trial and commit |
 | `system.rs` | Sleep, wake and USB drive mode as a state machine |
+| `drive.rs`, `usb.rs` | USB drive mode run by kindil: the state machine and sequences, and the device under them |
 | `reader.rs`, `files.rs`, `prefs.rs` | Books, Trash, persisted choices |
 | `ghosting.rs` | When to flash the panel |
 | `launcher.rs` | Writes out the launcher kindil carries, once it has run two minutes |
