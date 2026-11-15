@@ -297,8 +297,15 @@ impl Net {
         self.generation.fetch_add(1, Ordering::SeqCst);
         terminate(DHCP_PID);
         terminate(WPA_PID);
-        let _ = run(Command::new("/sbin/ifconfig").args([INTERFACE, "down"]));
-        let _ = run(Command::new("/sbin/rmmod").arg("ar6003"));
+        // Nothing to take down the first time (no driver yet): quietly.
+        let quiet = |command: &mut Command| {
+            let _ = command
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        };
+        quiet(Command::new("/sbin/ifconfig").args([INTERFACE, "down"]));
+        quiet(Command::new("/sbin/rmmod").arg("ar6003"));
         self.set_owner(Owner::Kindil(Power::Off));
     }
 
