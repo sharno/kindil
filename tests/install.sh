@@ -7,11 +7,11 @@ INSTALL="$(cd "$(dirname "$0")/.." && pwd)/scripts/device/install.sh"
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/stub" "$T/run"
-# Whether kindil is running, its Wi-Fi supplicant runs and the Kindle is
-# online: files in $T; the fake start.sh creates them when $T/comes-up says.
+# Whether kindil is running, its Wi-Fi supplicant runs and Wi-Fi is joined:
+# files in $T; the fake start.sh creates them when $T/comes-up says.
 printf '#!/bin/sh\n[ -f %s/kindil-up ] && echo 1234\n' "$T" >"$T/stub/pidof"
 printf '#!/bin/sh\n[ -f %s/wifi-up ] && echo "%s/run/wpa_supplicant -i wlan0"\nexit 0\n' "$T" "$T" >"$T/stub/ps"
-printf '#!/bin/sh\n[ -f %s/online ]\n' "$T" >"$T/stub/wget"
+printf '#!/bin/sh\n[ -f %s/online ] && printf "wpa_state=COMPLETED\\nip_address=10.0.0.2\\n"\nexit 0\n' "$T" >"$T/stub/wpa_cli"
 printf '#!/bin/sh\necho "killall $*" >>%s/calls\nrm -f %s/kindil-up %s/wifi-up %s/online\n' "$T" "$T" "$T" "$T" >"$T/stub/killall"
 printf '#!/bin/sh\nshasum -a 256 "$@"\n' >"$T/stub/sha256sum"
 chmod +x "$T"/stub/*
@@ -34,19 +34,25 @@ kindil() {
 installed() {
   rm -rf "$T/ext" && mkdir -p "$T/ext/bin"
   kindil "$T/ext/bin/kindil" 1.0.0
+  printf '# the old launcher\n' >"$T/ext/menu.json"
+  # The installed start.sh: what a rollback starts.
+  printf '#!/bin/sh\necho "start.sh $(%s/ext/bin/kindil)" >>%s/calls\n' "$T" "$T" >"$T/ext/bin/start.sh"
+  chmod +x "$T/ext/bin/start.sh"
 }
-# A bundle of 2.0.0, its start.sh bringing kindil up if $T/comes-up exists.
+# A bundle of 2.0.0. Its start.sh, like the launcher, copies the binary it
+# runs to $T/run/kindil (the previous version, if $T/falls-back says), and
+# brings kindil and its Wi-Fi up if $T/comes-up says.
 bundle() {
   rm -rf "$T/deploy" "$T/b" && mkdir -p "$T/deploy" "$T/b/extensions/kindil/bin"
   kindil "$T/b/extensions/kindil/bin/kindil" 2.0.0
-  printf '#!/bin/sh\necho "start.sh $(%s/ext/bin/kindil)" >>%s/calls\n[ -f %s/comes-up ] && touch %s/kindil-up %s/wifi-up %s/online\nexit 0\n' \
-    "$T" "$T" "$T" "$T" "$T" "$T" >"$T/b/extensions/kindil/bin/start.sh"
+  printf '#!/bin/sh\necho "start.sh $(%s/ext/bin/kindil)" >>%s/calls\nif [ -f %s/falls-back ]; then cp %s/ext/bin/kindil.previous %s/run/kindil; else cp %s/ext/bin/kindil %s/run/kindil; fi\n[ -f %s/comes-up ] && touch %s/kindil-up %s/wifi-up %s/online\nexit 0\n' \
+    "$T" "$T" "$T" "$T" "$T" "$T" "$T" "$T" "$T" "$T" "$T" >"$T/b/extensions/kindil/bin/start.sh"
   printf '# the launcher\n' >"$T/b/extensions/kindil/menu.json"
   tar -C "$T/b" -czf "$T/deploy/bundle.tgz" extensions
   shasum -a 256 "$T/deploy/bundle.tgz" | cut -d' ' -f1 >"$T/deploy/bundle.sha256"
 }
 reset() {
-  rm -rf "$T/run" "$T/calls" "$T/comes-up" "$T/kindil-up" "$T/wifi-up" "$T/online"
+  rm -rf "$T/run" "$T/calls" "$T/comes-up" "$T/falls-back" "$T/kindil-up" "$T/wifi-up" "$T/online"
   mkdir -p "$T/run"
   installed
   bundle
@@ -76,6 +82,7 @@ reset
 run
 expect "an install kindil doesn't come back up from is rolled back" \
   "$(version kindil) $(log | grep -c 'install test: rolled back')" "kindil 1.0.0 1"
+expect "with the launcher files it had" "$(cat "$T/ext/menu.json")" "# the old launcher"
 expect "and kindil started again" "$(tail -n 1 "$T/calls")" "start.sh kindil 1.0.0"
 
 reset
@@ -84,8 +91,14 @@ run
 expect "a rollback binary sent along is the one rolled back to" "$(version kindil)" "kindil 0.9.0"
 
 reset
+touch "$T/comes-up" "$T/falls-back"
+run
+expect "the launcher falling back to the previous version isn't taken for the new one" \
+  "$(version kindil) $(log | grep -c 'rolled back')" "kindil 1.0.0 1"
+
+reset
 touch "$T/run/wifi-off"
-printf '#!/bin/sh\necho "start.sh" >>%s/calls\ntouch %s/kindil-up\n' "$T" "$T" >"$T/b/extensions/kindil/bin/start.sh"
+printf '#!/bin/sh\necho "start.sh" >>%s/calls\ncp %s/ext/bin/kindil %s/run/kindil\ntouch %s/kindil-up\n' "$T" "$T" "$T" "$T" >"$T/b/extensions/kindil/bin/start.sh"
 tar -C "$T/b" -czf "$T/deploy/bundle.tgz" extensions
 shasum -a 256 "$T/deploy/bundle.tgz" | cut -d' ' -f1 >"$T/deploy/bundle.sha256"
 run
