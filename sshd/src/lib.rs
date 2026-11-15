@@ -139,12 +139,58 @@ impl Args {
     }
 }
 
+/// Opens `path` to read, refusing a symlink (the last component).
+fn open_no_symlink(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+fn euid() -> u32 {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+/// The server's directory: made if missing, and then a real directory,
+/// the server user's (root's), 0700.
+pub fn own_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.uid() != euid() {
+        return Err(io::Error::other(format!(
+            "{} is not a directory of this user's",
+            dir.display()
+        )));
+    }
+    if meta.mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// The host key at `path`, made (ed25519, root's only) if there is none. A
 /// file beside it is renamed over it, so a half-written key never stays.
+/// A symlink, or a key file of another user's, is refused.
 pub fn host_key(path: &Path) -> io::Result<PrivateKey> {
-    match std::fs::read_to_string(path) {
-        Ok(pem) => {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    match open_no_symlink(path) {
+        Ok(mut file) => {
+            let meta = file.metadata()?;
+            if !meta.is_file() || meta.uid() != euid() {
+                return Err(io::Error::other(format!(
+                    "{} is not a file of this user's",
+                    path.display()
+                )));
+            }
+            if meta.mode() & 0o077 != 0 {
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            let mut pem = String::new();
+            io::Read::read_to_string(&mut file, &mut pem)?;
             return PrivateKey::from_openssh(pem).map_err(io::Error::other);
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -156,6 +202,7 @@ pub fn host_key(path: &Path) -> io::Result<PrivateKey> {
     seed.fill(0);
     let pem = key.to_openssh(LineEnding::LF).map_err(io::Error::other)?;
     let part = path.with_extension("part");
+    // A stale one (even a symlink) goes; O_EXCL then makes a new file.
     let _ = std::fs::remove_file(&part);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -174,21 +221,23 @@ pub fn host_key(path: &Path) -> io::Result<PrivateKey> {
 
 /// Whether `key` is in the authorized keys at `file`. Only ed25519 and RSA
 /// keys count, and only those without options (`command=`, `from=`...),
-/// which this server doesn't enforce. A file others could change is refused.
+/// which this server doesn't enforce. A symlink, a file of another user's
+/// or one others could change is refused.
 pub fn authorized(file: &Path, key: &PublicKey) -> io::Result<bool> {
-    let meta = match std::fs::metadata(file) {
-        Ok(meta) => meta,
+    let mut opened = match open_no_symlink(file) {
+        Ok(opened) => opened,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    // SAFETY: geteuid has no preconditions.
-    if meta.mode() & 0o022 != 0 || meta.uid() != unsafe { libc::geteuid() } {
+    let meta = opened.metadata()?;
+    if !meta.is_file() || meta.mode() & 0o022 != 0 || meta.uid() != euid() {
         return Err(io::Error::other(format!(
-            "{} is writable by others",
+            "{} is not a file only this user can change",
             file.display()
         )));
     }
-    let keys = std::fs::read_to_string(file)?;
+    let mut keys = String::new();
+    io::Read::read_to_string(&mut opened, &mut keys)?;
     Ok(AuthorizedKeys::new(&keys).flatten().any(|entry| {
         let known = entry.public_key();
         entry.config_opts().is_empty()
@@ -271,7 +320,7 @@ pub fn config(key: PrivateKey, settings: &Settings) -> russh::server::Config {
 /// `max_connections` at a time and `admissions_per_second` new ones (more
 /// are closed at once), each cut at its login deadline unless logged in.
 pub async fn serve(listener: TcpListener, settings: Settings) -> io::Result<()> {
-    std::fs::create_dir_all(&settings.dir)?;
+    own_dir(&settings.dir)?;
     let key = host_key(&settings.host_key())?;
     log(format_args!(
         "listening on {}, host key {}",
@@ -848,7 +897,10 @@ impl russh::server::Handler for Connection {
                 // sending: rather than hold up the connection (its other
                 // channels, its close), the program goes.
                 if let Some(chan) = self.channels.get_mut(&channel) {
-                    noise(format_args!("{}: a program took no input; ended", self.peer));
+                    noise(format_args!(
+                        "{}: a program took no input; ended",
+                        self.peer
+                    ));
                     chan.cancel();
                     session.close(channel)?;
                 }
@@ -1040,6 +1092,43 @@ mod tests {
     }
 
     #[test]
+    fn refuses_symlinked_key_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = PrivateKey::from(Ed25519Keypair::from_seed(&[1; 32]));
+        let real = dir.path().join("real");
+        std::fs::write(
+            &real,
+            format!("{}\n", key.public_key().to_openssh().unwrap()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("authorized_keys");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(authorized(&real, key.public_key()).unwrap());
+        assert!(authorized(&link, key.public_key()).is_err());
+        let host = dir.path().join("host_ed25519");
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), &host).unwrap();
+        assert!(host_key(&host).is_err());
+        assert!(!dir.path().join("elsewhere").exists());
+    }
+
+    #[test]
+    fn keeps_its_directory_to_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("ssh");
+        own_dir(&own).unwrap();
+        let mode = || std::fs::metadata(&own).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(), 0o700);
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o775)).unwrap();
+        own_dir(&own).unwrap();
+        assert_eq!(mode(), 0o700);
+        // A symlink to a directory isn't one.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&own, &link).unwrap();
+        assert!(own_dir(&link).is_err());
+    }
+
+    #[test]
     fn no_authorized_keys_lets_nobody_in() {
         let dir = tempfile::tempdir().unwrap();
         let key = PrivateKey::from(Ed25519Keypair::from_seed(&[1; 32]));
@@ -1049,6 +1138,7 @@ mod tests {
         assert!(!authorized(&file, key.public_key()).unwrap());
         let line = key.public_key().to_openssh().unwrap();
         std::fs::write(&file, format!("garbage\n{line} me@there\n")).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(authorized(&file, key.public_key()).unwrap());
     }
 }
