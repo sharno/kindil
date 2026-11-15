@@ -45,8 +45,8 @@ and a reboot always returns the Kindle to stock.
   [Updates](#updates).
 - **Device duties** that Amazon's UI normally performs:
   - **Power button**: sleeps (a sleep screen, front light off, suspend to
-    RAM) and wakes, with the light restored. powerd ignores the button while
-    kindil runs, so kindil hears it through kernel uevents.
+    RAM) and wakes, with the light restored. kindil hears the button through
+    kernel uevents; Amazon's powerd doesn't run while kindil does.
   - **Sleep when idle**: Doze (the default), Never, or a full sleep after
     5, 15, 30 or 60 minutes without a touch. Doze is for an always-on wall
     dashboard: after 2 minutes without a touch the light goes off and the
@@ -66,7 +66,11 @@ and a reboot always returns the Kindle to stock.
     Syncthing. A cable that keeps dropping doesn't flash the screen: kindil
     returns only once the storage has stayed back for 3 s.
   - **Low battery**: at 5% and not charging, kindil sleeps with a screen that
-    asks for a charge. Suspended, the last few percent last for days.
+    asks for a charge. Suspended, the last few percent last for days; asleep
+    on battery it wakes every 6 hours to check, and at 1% powers off, as
+    Amazon's powerd would.
+  - **Charging**: the charger charges by itself; kindil pauses it outside
+    32-113 °F, powerd's range, and resumes 3 °F back inside.
   - **Crash restart**: the launcher restarts kindil after a crash. After 3
     crashes within 5 minutes it runs the previous version (kept by the last
     update), and after 3 more it returns to Amazon's UI.
@@ -157,10 +161,11 @@ faster.
 - **Standalone:** `BOOT` holding `standalone` also sets Amazon's own
   `/mnt/us/DONT_START_FRAMEWORK` flag. The next boots then skip X, Amazon's
   UI and its Java framework, since kindil draws to the screen itself, and
-  stop Amazon's boot spinner and the services kindil doesn't use (connections,
-  apps, archive, updates, sync and the like), wifid too: kindil runs
-  Wi-Fi itself. Of Amazon's
-  system powerd and volumd stay, for now. kindil comes up about 20 s after
+  stop Amazon's boot spinner. While kindil runs (from a boot or from KUAL),
+  its launcher stops powerd, whose work kindil does, and the services kindil
+  has no use for (connections, apps, archive, updates, sync and the like);
+  kindil runs Wi-Fi itself, so wifid doesn't run either. Of Amazon's system
+  only volumd stays, for now. kindil comes up about 20 s after
   the kernel, with more memory free. Every way back to Amazon's UI removes the flag first and
   starts those services and X if they aren't running:
   leaving kindil (Exit to Kindle, a crash it gives up on, a kill), and any
@@ -250,7 +255,8 @@ someone nearby to press the power button, or must end on their own first.
 | `ui.rs` | Wiring: callbacks, worker threads, timers, e-ink refresh policy |
 | `view.rs` | Pure domain → display text (units, wording) |
 | `host.rs` | The `Host` trait the UI uses, and the `Simulated` device |
-| `kindle.rs` | `Host` on the stock OS: lipc (wifid, powerd front light and battery), USBNetwork |
+| `kindle.rs` | `Host` on the device: battery, charger and front light drivers, power button, volumd's events, USBNetwork |
+| `power.rs` | powerd's rules kept by kindil: charging temperatures, critical battery |
 | `wifi.rs` | wpa_supplicant control socket, typed SSID/passphrase |
 | `net.rs` | Wi-Fi run by kindil: driver, supervised wpa_supplicant and udhcpc |
 | `networks.rs` | The saved Wi-Fi networks |

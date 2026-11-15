@@ -25,8 +25,16 @@ const WIFI_START: Duration = Duration::from_secs(180);
 const GAUGE_CHARGE: &str = "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_mAH";
 /// The gauge's state of charge, as `71%`; powerd's `battLevel` is this.
 const GAUGE_CAPACITY: &str = "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_capacity";
-/// `1` while the charger charges; powerd's `isCharging` is this.
+/// `1` while the charger may charge; writing `0` pauses it (src/power.rs).
 const CHARGER: &str = "/sys/devices/platform/aplite_charger.0/charging";
+/// `1` while a charger is plugged in.
+const CHARGER_CONNECTED: &str = "/sys/devices/platform/aplite_charger.0/connected";
+/// The cell's temperature, in °F.
+const GAUGE_TEMPERATURE: &str =
+    "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_temperature";
+/// Whether kindil paused charging for the temperature (src/power.rs); only
+/// a pause of kindil's own is ever lifted.
+static CHARGING_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// USBNetwork toggles dropbear when configured with USE_WIFI_SSHD_ONLY.
 const USBNET_TOGGLE: &str = "/mnt/us/usbnet/bin/usbnetwork";
 const USBNET_AT_BOOT: &str = "/mnt/us/usbnet/auto";
@@ -67,16 +75,40 @@ impl KindleHost {
 }
 
 /// The PW1's fuel gauge and charger, read where powerd reads them; the
-/// gauge has no `power_supply` class entry.
+/// gauge has no `power_supply` class entry. Plugged in counts as charging,
+/// even while full or paused for the temperature: not on its own power.
 fn gauge_battery() -> anyhow::Result<Battery> {
     let text = std::fs::read_to_string(GAUGE_CAPACITY)?;
     let percent =
         parse_capacity(&text).ok_or_else(|| anyhow::anyhow!("unexpected capacity {text:?}"))?;
-    let charge = match std::fs::read_to_string(CHARGER)?.trim() {
-        "1" => Charge::Charging,
-        _ => Charge::Discharging,
+    let charge = if plugged()? {
+        Charge::Charging
+    } else {
+        Charge::Discharging
     };
     Ok(Battery::Known { percent, charge })
+}
+
+fn plugged() -> anyhow::Result<bool> {
+    Ok(std::fs::read_to_string(CHARGER_CONNECTED)?.trim() == "1")
+}
+
+/// powerd's charging temperature range, kept by kindil: pauses the charger
+/// outside it, and lifts a pause of its own once well inside again.
+fn guard_charging() -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    let paused = CHARGING_PAUSED.load(Ordering::Relaxed);
+    let temperature: i32 = std::fs::read_to_string(GAUGE_TEMPERATURE)?.trim().parse()?;
+    let pause = plugged()? && crate::power::pause_charging(temperature, paused);
+    if pause != paused {
+        std::fs::write(CHARGER, if pause { "0" } else { "1" })?;
+        CHARGING_PAUSED.store(pause, Ordering::Relaxed);
+        eprintln!(
+            "kindil: charging {} at {temperature} °F",
+            if pause { "paused" } else { "resumed" }
+        );
+    }
+    Ok(())
 }
 
 /// The gauge reports `71%`.
@@ -232,6 +264,10 @@ impl Host for KindleHost {
     }
 
     fn info(&self) -> DeviceInfo {
+        // Read each minute and each doze wake: the charging guard rides along.
+        if let Err(error) = guard_charging() {
+            eprintln!("kindil: charging guard: {error}");
+        }
         DeviceInfo {
             battery: gauge_battery().unwrap_or_else(|_| crate::battery::read(Path::new("/sys"))),
             charge: std::fs::read_to_string(GAUGE_CHARGE)
@@ -273,14 +309,30 @@ impl Host for KindleHost {
     }
 
     fn suspend(&self) -> anyhow::Result<()> {
-        // A nap's alarm must not wake a sleep the user asked for.
-        if let Ok(alarm) = wakealarm() {
-            let _ = std::fs::write(alarm, "0");
+        let alarm = wakealarm().ok();
+        loop {
+            // A nap's alarm must not wake a sleep the user asked for; on
+            // battery, a check of its own every few hours does (src/power.rs).
+            let check = match &alarm {
+                Some(alarm) => arm_check(alarm)?,
+                None => None,
+            };
+            std::fs::write("/sys/power/state", b"mem")?;
+            if let Some(alarm) = &alarm {
+                let _ = std::fs::write(alarm, "0");
+            }
+            let now = epoch_seconds();
+            let checking = check.is_some_and(|due| crate::power::alarm_woke(due, now));
+            if !checking {
+                // The power button: the app wakes.
+                return Ok(());
+            }
+            let battery = gauge_battery()?;
+            if crate::power::critical(battery) {
+                eprintln!("kindil: battery critical ({battery:?}); powering off");
+                return self.power_off();
+            }
         }
-        // powerd suspends the same way; it ignores the button while kindil
-        // runs, so nothing else will.
-        std::fs::write("/sys/power/state", b"mem")?;
-        Ok(())
     }
 
     fn nap(&self, wake_after: Duration) -> anyhow::Result<()> {
@@ -316,6 +368,24 @@ impl Host for KindleHost {
     fn commit_update(&self) -> anyhow::Result<Commit> {
         Slots::new(EXTENSION_BIN, UPDATE_TRIAL).commit()
     }
+}
+
+/// Arms `alarm` for the next battery check when on battery; returns when
+/// it is due, in seconds since the epoch. Plugged in, no alarm.
+fn arm_check(alarm: &Path) -> anyhow::Result<Option<i64>> {
+    std::fs::write(alarm, "0")?;
+    if plugged().unwrap_or(false) {
+        return Ok(None);
+    }
+    let after = crate::power::CHECK_ASLEEP.as_secs();
+    std::fs::write(alarm, format!("+{after}"))?;
+    Ok(Some(epoch_seconds() + after as i64))
+}
+
+fn epoch_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// The RTC that can wake the device: on the PW1 the PMIC's (`rtc1`); the

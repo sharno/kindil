@@ -25,11 +25,11 @@ LIMIT=2
 SETTLE=120
 # How long a boot may take to bring up what kindil waits for.
 PATIENCE=120
-# Amazon's services that kindil doesn't use, which a standalone boot stops:
-# connections (cmd, with tmd and phd), apps, archive, power management
-# helpers, dynamic config, updates, crash dumps and sync. kindil keeps
-# powerd, wifid and volumd. Amazon's UI needs them all back; session.sh
-# keeps the same list (tests/launcher.sh checks).
+# Amazon's services kindil has no use for: connections (cmd, with tmd and
+# phd), apps, archive, power management helpers, dynamic config, updates,
+# crash dumps and sync. session.sh stops them while kindil runs and brings
+# them back after; this brings them back after a boot kindil never got far
+# in. session.sh keeps the same list (tests/launcher.sh checks).
 SERVICES="cmd appmgrd archive dpmd dynconfig otaupd otav3 rcm stackdumpd todo deviced"
 
 log() { echo "$(date '+%F %T') boot: $*"; }
@@ -49,9 +49,6 @@ await() {
   done
 }
 
-# Whether the lipc service $1 answers for its property $2.
-answers() { lipc-get-prop "$1" "$2" >/dev/null 2>&1; }
-
 # Runs upstart's $1 (start or stop) on each of SERVICES that isn't so already.
 services() {
   for job in $SERVICES; do
@@ -68,8 +65,8 @@ amazon_ui() {
   [ -f "$SKIP" ] || return 0
   rm -f "$SKIP"
   log "starting Amazon's UI with its framework"
-  # kindil stops wifid while it runs Wi-Fi itself; session.sh starts it
-  # again, unless kindil never got that far.
+  # session.sh brings back what kindil stopped, unless kindil never got far.
+  running powerd || start powerd
   running wifid || start wifid
   services start
   if ! running x; then
@@ -102,11 +99,9 @@ if [ -f "$SKIP" ]; then
   # Amazon's boot spinner stops only when X's language picker starts: left
   # running, it keeps drawing over kindil.
   stop early_progress
-  # session.sh tells powerd not to sleep on its own while kindil runs,
-  # which needs it answering. (kindil sets the front light itself.)
-  await answers com.lab126.powerd state || log "powerd isn't answering"
-  # kindil runs Wi-Fi itself.
-  stop wifid
+  # session.sh stops powerd, whose work kindil does: once its job is up, or
+  # it would start behind kindil's back.
+  await running powerd || log "powerd didn't start"
 else
   # Let Amazon's UI get going; start.sh stops it again.
   await running lab126_gui || log "Amazon's UI didn't start"
@@ -117,12 +112,6 @@ fi
 rm -f "$PIDFILE"
 log "starting kindil"
 "$START"
-if [ -f "$SKIP" ]; then
-  # After kindil starts, which these 8 s would otherwise hold up, and after
-  # powerd answers: deviced starts once powerd has.
-  log "stopping Amazon's services kindil doesn't use"
-  services stop
-fi
 sleep "$SETTLE"
 if kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
   rm -f "$TRIES"

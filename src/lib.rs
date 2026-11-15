@@ -11,6 +11,7 @@ pub mod host;
 pub mod kindle;
 pub mod net;
 pub mod networks;
+pub mod power;
 pub mod prefs;
 pub mod preview;
 pub mod reader;

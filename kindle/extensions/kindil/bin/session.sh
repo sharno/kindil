@@ -10,8 +10,9 @@ BIN="$RUN/kindil"
 EXT=/mnt/us/extensions/kindil/bin
 CONFIG=/mnt/us/kindil/kindil.toml
 SKIP=/mnt/us/DONT_START_FRAMEWORK
-# Amazon's services that a standalone boot stops (bin/boot.sh, which keeps
-# the same list).
+CHARGER=/sys/devices/platform/aplite_charger.0/charging
+# Amazon's services kindil has no use for, stopped while it runs (boot.sh
+# keeps the same list, to bring them back after a boot kindil fails in).
 SERVICES="cmd appmgrd archive dpmd dynconfig otaupd otav3 rcm stackdumpd todo deviced"
 # Present while a new version is on trial; kindil removes it once it has run
 # for two minutes (src/update.rs). Still present after it exits: roll back.
@@ -34,14 +35,22 @@ restore() {
   # A standalone boot skipped Amazon's framework: without it, Amazon's UI is
   # an empty screen. boot.sh sets the flag again after a boot kindil stays up.
   rm -f "$SKIP"
-  lipc-set-prop com.lab126.powerd preventScreenSaver 0
+  # Nothing may stop a service once this starts bringing them back.
+  if [ -n "$STOPPER" ]; then
+    kill "$STOPPER" 2>/dev/null
+    wait "$STOPPER" 2>/dev/null
+  fi
+  # kindil may have paused charging for the temperature (src/power.rs);
+  # powerd, back now, keeps its own range.
+  echo 1 >"$CHARGER" 2>/dev/null
+  running powerd || start powerd
   if [ -n "$GUI" ]; then
     lipc-set-prop com.lab126.blanket load usb
     lipc-set-prop com.lab126.blanket load splash
   fi
   log "starting the Kindle UI"
   wifi_back
-  # A standalone boot stopped these and X: Amazon's UI needs them all.
+  # Amazon's UI needs them all, and X.
   for job in $SERVICES; do running "$job" || start "$job"; done
   if running x; then start lab126_gui; else start x; fi
   rm -f /var/tmp/kindil.pid
@@ -120,9 +129,6 @@ if [ ! -x "$BIN" ]; then
   log "missing $BIN"
   exit 1
 fi
-# powerd then ignores the power button and never sleeps on its own: kindil
-# hears the button through kernel uevents and runs sleep itself.
-lipc-set-prop com.lab126.powerd preventScreenSaver 1
 # Stopping the GUI job signals its whole tree, which can include us.
 trap '' TERM
 # A standalone boot never started it.
@@ -135,6 +141,24 @@ if running lab126_gui; then
   stop lab126_gui
   sleep 2
 fi
+# kindil does powerd's work itself: battery, front light, charging limits,
+# sleep and the power button. Stopped first, and before kindil starts:
+# stopping powerd switches the front light off, which kindil then sets.
+if running powerd; then
+  log "stopping powerd"
+  stop powerd
+fi
+# The rest in the background, so kindil starts at once; for a minute, since
+# at boot some may still be on their way up. restore() stops this first.
+(
+  n=0
+  while [ "$n" -lt 12 ]; do
+    for job in $SERVICES; do ! running "$job" || stop "$job"; done
+    n=$((n + 1))
+    sleep 5
+  done
+) >/dev/null 2>&1 &
+STOPPER=$!
 trap restore EXIT
 # Amazon's screen modules would draw over kindil in USB drive mode and after
 # it; kindil draws its own screens. Only Amazon's UI loads them.

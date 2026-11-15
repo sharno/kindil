@@ -9,11 +9,11 @@ mkdir -p "$T/stub" "$T/ext" "$T/run"
 for c in lipc-set-prop eips sleep; do
   printf '#!/bin/sh\nexit 0\n' >"$T/stub/$c"
 done
-# Upstart's stop and start, recorded in order; the jobs running are the lines
-# of $T/jobs.
-for c in stop start; do
-  printf '#!/bin/sh\necho "%s $1" >>%s/upstart\n' "$c" "$T" >"$T/stub/$c"
-done
+# Upstart's stop and start, recorded in order, and the jobs running, one per
+# line in $T/jobs.
+printf '#!/bin/sh\necho "stop $1" >>%s/upstart\ngrep -vx "$1" %s/jobs >%s/jobs.new; mv %s/jobs.new %s/jobs\n' \
+  "$T" "$T" "$T" "$T" "$T" >"$T/stub/stop"
+printf '#!/bin/sh\necho "start $1" >>%s/upstart\necho "$1" >>%s/jobs\n' "$T" "$T" >"$T/stub/start"
 printf '#!/bin/sh\nif grep -qx "$1" %s/jobs; then echo "$1 start/running"; else echo "$1 stop/waiting"; fi\n' \
   "$T" >"$T/stub/status"
 chmod +x "$T"/stub/*
@@ -21,11 +21,17 @@ chmod +x "$T"/stub/*
 SERVICES="$(sed -n 's/^SERVICES="\(.*\)"$/\1/p' "$SESSION")"
 BOOT_SERVICES="$(sed -n 's/^SERVICES="\(.*\)"$/\1/p' "$(dirname "$SESSION")/boot.sh")"
 # Started from KUAL: Amazon's services, X and Amazon's UI are up.
-kual() { { echo "$SERVICES" | tr ' ' '\n'; printf 'wifid\nx\nlab126_gui\n'; } >"$T/jobs"; }
+kual() { { echo "$SERVICES" | tr ' ' '\n'; printf 'powerd\nwifid\nx\nlab126_gui\n'; } >"$T/jobs"; }
+# The jobs running, sorted on one line.
+jobs() { sort "$T/jobs" | tr '\n' ' '; }
+# A kindil that notes the jobs running while it runs, once session.sh's
+# background stopper has had a moment.
+WATCH="/bin/sleep 1; sort $T/jobs | tr '\\n' ' ' >$T/during"
 [ -n "$SERVICES" ] || { echo "FAIL no SERVICES in session.sh"; exit 1; }
 kual
 sed -e "s#^EXT=.*#EXT=$T/ext#" \
   -e "s#^SKIP=.*#SKIP=$T/SKIP#" \
+  -e "s#^CHARGER=.*#CHARGER=$T/charging#" \
   -e "s#^KINDIL_WIFI=.*#KINDIL_WIFI=\"$T/udhcpc.pid $T/wpa.pid\"#" \
   -e "s#^export PATH=.*#export PATH=$T/stub:/usr/bin:/bin#" \
   "$SESSION" >"$T/run/session.sh"
@@ -128,14 +134,19 @@ expect "a replaced binary is" "$("$T/run/kindil" --version)" "kindil 1.1.0"
 
 reset
 rm -f "$T/upstart"
-fake "$T/ext/kindil" 1.0.0 "exit 0"
+kual
+before="$(jobs)"
+fake "$T/ext/kindil" 1.0.0 "$WATCH; exit 0"
 run
-expect "started from KUAL, it stops Amazon's UI and starts it again" "$(tr '\n' ',' <"$T/upstart")" "stop lab126_gui,start lab126_gui,"
+expect "while kindil runs, Amazon's UI, powerd and the services it has no use for are stopped" \
+  "$(cat "$T/during")" "wifid x "
+expect "and leaving brings every one of them back" "$(jobs)" "$before"
+expect "powerd is stopped before kindil starts" "$(grep -n 'stop powerd' "$T/upstart" | cut -d: -f1)" "2"
 rm -f "$T/upstart"
 : >"$T/jobs"
 run
-expect "after a standalone boot, leaving starts Amazon's services, then X and with it Amazon's UI" \
-  "$(tr '\n' ',' <"$T/upstart")" "start wifid,$(for j in $SERVICES; do printf 'start %s,' "$j"; done)start x,"
+expect "after a standalone boot, leaving starts powerd, Amazon's services and X, which brings Amazon's UI" \
+  "$(jobs)" "$({ echo "$SERVICES" | tr ' ' '\n'; printf 'powerd\nwifid\nx\n'; } | sort | tr '\n' ' ')"
 
 expect "session.sh and boot.sh stop and start the same services" "$SERVICES" "$BOOT_SERVICES"
 
@@ -146,8 +157,8 @@ rm -f "$T/upstart"
 fake "$T/ext/kindil" 1.0.0 "echo 999998 >$T/udhcpc.pid; echo 999999 >$T/wpa.pid; exit 0"
 run
 expect "leaving after kindil ran Wi-Fi gives wifid a fresh supplicant, the driver loaded" \
-  "$(tr '\n' ',' <"$T/upstart" | cut -d, -f1-2)$([ -f "$T/wpa.pid" ] && echo ' pid left')" \
-  "stop wifis,start wifid"
+  "$(grep -c 'stop wifis\|stop wifim' "$T/upstart") $(grep -cx wifid "$T/jobs")$([ -f "$T/wpa.pid" ] && echo ' pid left')" \
+  "1 1"
 
 reset
 rm -f "$T/runs"
