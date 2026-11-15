@@ -1301,6 +1301,12 @@ impl Ctx {
             Effect::Reconnect => self.reconnect_wifi(),
             Effect::ReleaseStorage => self.release_storage(),
             Effect::StorageBack => self.storage_back(),
+            Effect::DriveNotice(notice) => {
+                if let Some(text) = view::drive_notice(notice) {
+                    eprintln!("kindil: {text}");
+                    notify(&ui, &text);
+                }
+            }
         }
     }
 
@@ -1426,6 +1432,8 @@ impl Ctx {
             let _ = state.store.save();
         }
         self.show_sync();
+        // kindil's own USB drive mode waits for this before unmounting.
+        self.host.storage_released();
     }
 
     /// The computer may have added, renamed or removed books.

@@ -96,6 +96,9 @@ impl Listener {
     pub fn next(&self) -> std::io::Result<Uevent> {
         match *self {}
     }
+    pub fn next_within(&self, _: std::time::Duration) -> std::io::Result<Option<Uevent>> {
+        match *self {}
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -154,6 +157,28 @@ mod socket {
                 );
             }
             Ok(Self(fd))
+        }
+
+        /// The next uevent, if one comes within `time`.
+        pub fn next_within(&self, time: std::time::Duration) -> io::Result<Option<Uevent>> {
+            let mut poll = libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let millis = libc::c_int::try_from(time.as_millis()).unwrap_or(libc::c_int::MAX);
+            // SAFETY: one valid pollfd for the call's duration.
+            match unsafe { libc::poll(&mut poll, 1, millis) } {
+                0 => Ok(None),
+                n if n > 0 => self.next().map(Some),
+                _ => {
+                    let error = io::Error::last_os_error();
+                    match error.raw_os_error() {
+                        Some(libc::EINTR) => Ok(None),
+                        _ => Err(error),
+                    }
+                }
+            }
         }
 
         /// Blocks until the next uevent the kernel broadcasts.

@@ -165,6 +165,9 @@ pub trait Host: Send + Sync {
     fn info(&self) -> DeviceInfo;
     /// Starts the threads that report the power button and USB drive mode.
     fn listen(&self, deliver: Deliver);
+    /// The UI has let go of the user storage after [`crate::system::Event::StorageLeaving`]:
+    /// kindil's own USB drive mode may unmount it.
+    fn storage_released(&self) {}
     /// Suspends to RAM; returns once the device is awake again.
     fn suspend(&self) -> anyhow::Result<()>;
     /// Suspends to RAM with a timed wake; returns once awake, by the timer or

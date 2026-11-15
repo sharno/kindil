@@ -173,6 +173,37 @@ pub fn doze_draw(drain: crate::drain::Drain) -> String {
     }
 }
 
+/// What USB drive mode run by kindil has to say; nothing for a cable
+/// pulled before the computer got the storage.
+pub fn drive_notice(notice: crate::drive::Notice) -> Option<String> {
+    use crate::drive::{Check, Mount, Notice, Refusal};
+    let refusal = |refusal: Refusal| match refusal {
+        Refusal::Busy { pid, name } => Some(format!("{name} ({pid}) has files open on it")),
+        Refusal::Unmount(Mount::Fsp) => Some("/mnt/us wouldn't unmount".into()),
+        Refusal::Unmount(Mount::Base) => Some("/mnt/base-us wouldn't unmount".into()),
+        Refusal::Gadget => Some("the USB storage driver failed".into()),
+        Refusal::Flag => Some("/var/local isn't writable".into()),
+        Refusal::Unplugged => None,
+    };
+    let check = |check: Check| match check {
+        Check::Clean => "clean".to_owned(),
+        Check::Repaired => "repaired".to_owned(),
+        Check::Failed(Some(code)) => format!("errors left (fsck {code}); read-only"),
+        Check::Failed(None) => "fsck didn't run; read-only".to_owned(),
+    };
+    match notice {
+        Notice::Refused(why) => refusal(why).map(|why| format!("USB drive: not shared, {why}")),
+        Notice::ReadOnly(c) => Some(format!("USB drive: storage {}", check(c))),
+        Notice::Repaired => Some("USB drive: storage errors repaired".into()),
+        Notice::Lost => Some("USB drive: the storage didn't come back; see the log".into()),
+        Notice::Checked(c) => Some(format!("Storage checked after USB: {}", check(c))),
+        Notice::Unchecked(why) => Some(format!(
+            "Storage not checked after USB: {}",
+            refusal(why).unwrap_or_else(|| "unplugged".into())
+        )),
+    }
+}
+
 pub fn facts(info: &DeviceInfo, version: &str) -> Vec<Fact> {
     let fact = |label: &str, value: String| Fact {
         label: label.into(),
@@ -271,6 +302,24 @@ pub fn position(page: usize, pages: usize) -> String {
 mod tests {
     use super::*;
     use crate::host::{Memory, Signal};
+
+    #[test]
+    fn usb_drive_notices() {
+        use crate::drive::{Check, Name, Notice, Refusal};
+        assert_eq!(
+            drive_notice(Notice::Refused(Refusal::Busy {
+                pid: 812,
+                name: Name::new("cvm")
+            }))
+            .unwrap(),
+            "USB drive: not shared, cvm (812) has files open on it"
+        );
+        assert_eq!(drive_notice(Notice::Refused(Refusal::Unplugged)), None);
+        assert_eq!(
+            drive_notice(Notice::ReadOnly(Check::Failed(Some(4)))).unwrap(),
+            "USB drive: storage errors left (fsck 4); read-only"
+        );
+    }
 
     #[test]
     fn units() {
