@@ -405,7 +405,20 @@ async fn connection(
             }
             return;
         }
-        logged_in = logged_in => logged_in.is_ok(),
+        logged_in = logged_in => {
+            if logged_in.is_err() {
+                // Its handler is gone without a login: the session is ending
+                // (a failed negotiation, say). Its error, not a timeout.
+                cut();
+                match tokio::time::timeout(WIND_DOWN, session).await {
+                    Ok(Err(error)) => noise(format_args!("{peer}: {error}")),
+                    Ok(Ok(())) => {}
+                    Err(_) => noise(format_args!("{peer}: ended without a login")),
+                }
+                return;
+            }
+            true
+        }
         () = tokio::time::sleep_until(deadline) => false,
     };
     if !in_time {
