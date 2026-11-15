@@ -69,6 +69,11 @@ pub struct KindleHost {
 impl KindleHost {
     /// Reads the front light's range; other services are reached per call.
     pub fn open() -> Self {
+        // Amazon's UI, which ran until now, widened them (src/perms.rs):
+        // narrowed before anything is read or run.
+        for line in crate::perms::narrow_own(Path::new(crate::perms::RUN)) {
+            eprintln!("kindil: {line}");
+        }
         Self {
             frontlight: Frontlight::open().map_err(|e| e.to_string()),
             net: Arc::default(),

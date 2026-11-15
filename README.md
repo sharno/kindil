@@ -216,6 +216,17 @@ faster.
 | `/mnt/us/books/` | Books |
 | `/mnt/us/books/.kindil-trash/` | Trashed books, recoverable |
 
+Each time Amazon's UI starts (at boot, and whenever kindil hands the screen
+back), Amazon's `/etc/upstart/framework.conf` runs `chgrp -R javausers
+/var/local; chmod -R g=u /var/local` and setgids every directory there. That
+makes kindil's binaries, its keys and passwords group-writable by
+`javausers`. kindil narrows its own files under `/var/local/kindil/` again at
+every start (`src/perms.rs`), and the launcher does the same for itself and
+the copy it runs, before running it. While Amazon's UI runs, the window stays
+open: the `javausers` group (Amazon's framework runs as `framework`) can
+change kindil's files, including the launcher root runs next and the trusted
+SSH keys, and `/var/local` itself is `framework`'s.
+
 ## Syncthing
 
 Optional and off by default. kindil does not download it: copy an ARM

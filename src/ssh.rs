@@ -133,7 +133,7 @@ impl Layout {
             ));
         }
         for file in [&self.authorized_keys(), &self.ignored_keys(), &self.log] {
-            match own_file(file) {
+            match crate::perms::narrow(file, 0o600) {
                 Ok(Some(was)) => say(format_args!(
                     "{} was {was:o}: made 0600 again",
                     file.display()
@@ -340,35 +340,6 @@ pub fn own_dir(dir: &Path) -> anyhow::Result<Option<u32>> {
         return Ok(None);
     }
     set_mode(dir, 0o700)?;
-    Ok(Some(was))
-}
-
-/// A file of kindil's in its directory, if there is one, put back to 0600
-/// if group or others got any access; never through a symlink, and only a
-/// regular file of kindil's user. Its mode before, if it was opened up.
-pub fn own_file(path: &Path) -> std::io::Result<Option<u32>> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    // O_NONBLOCK: a FIFO in its place doesn't hang the open.
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let meta = file.metadata()?;
-    // SAFETY: geteuid has no preconditions.
-    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
-        return Err(std::io::Error::other("not a file of kindil's"));
-    }
-    let was = meta.mode() & 0o7777;
-    if was & 0o7077 == 0 {
-        return Ok(None);
-    }
-    use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(Some(was))
 }
 
@@ -641,28 +612,6 @@ mod tests {
         );
     }
 
-    /// What the Kindle's /etc/upstart/framework.conf does to all of
-    /// /var/local each time the UI starts: `chmod -R g=u`, then `chmod g+s`
-    /// on every directory.
-    fn framework_starts(dir: &Path) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            let meta = std::fs::symlink_metadata(&path).unwrap();
-            let user = meta.permissions().mode() & 0o700;
-            let mut widened = (meta.permissions().mode() & 0o7707) | (user >> 3);
-            if meta.is_dir() {
-                set_mode(&path, widened).unwrap();
-                framework_starts(&path);
-                widened |= 0o2000;
-                // A non-root user outside the directory's group may not
-                // set it (macOS); g=u is the harm anyway.
-                let _ = set_mode(&path, widened);
-            } else if meta.is_file() {
-                set_mode(&path, widened).unwrap();
-            }
-        }
-    }
-
     #[test]
     fn closes_again_what_the_kindle_ui_opened_up() {
         let dir = tempfile::tempdir().unwrap();
@@ -673,7 +622,7 @@ mod tests {
         crate::ssh_keys::ignore(&layout.ignored_keys(), &["SHA256:x".into()]).unwrap();
         std::fs::write(&layout.log, "a line\n").unwrap();
         set_mode(&layout.log, 0o600).unwrap();
-        framework_starts(dir.path());
+        crate::perms::tests::framework_starts(dir.path());
         assert_eq!(mode(&layout.authorized_keys()), 0o660);
         assert_eq!(mode(&layout.dir), 0o770);
         assert_eq!(mode(&layout.binary), 0o775);
@@ -684,26 +633,6 @@ mod tests {
         for file in [layout.authorized_keys(), layout.ignored_keys(), layout.log] {
             assert_eq!(full(&file), 0o600, "{}", file.display());
         }
-    }
-
-    #[test]
-    fn repairs_only_its_own_files() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(own_file(&dir.path().join("none")).unwrap(), None);
-        let file = dir.path().join("keys");
-        std::fs::write(&file, "").unwrap();
-        set_mode(&file, 0o600).unwrap();
-        assert_eq!(own_file(&file).unwrap(), None);
-        set_mode(&file, 0o664).unwrap();
-        assert_eq!(own_file(&file).unwrap(), Some(0o664));
-        assert_eq!(mode(&file), 0o600);
-        // Not through a symlink, and not a directory.
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&file, &link).unwrap();
-        set_mode(&file, 0o666).unwrap();
-        assert!(own_file(&link).is_err());
-        assert_eq!(mode(&file), 0o666);
-        assert!(own_file(dir.path()).is_err());
     }
 
     #[test]

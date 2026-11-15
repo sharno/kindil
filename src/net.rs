@@ -473,7 +473,11 @@ impl Net {
 
     fn bring_up_supplicant(self: &Arc<Self>, generation: u64) -> anyhow::Result<()> {
         install_supplicant()?;
-        std::fs::write(WPA_CONF, WPA_CONF_TEXT)?;
+        crate::ssh::write_new(
+            std::path::Path::new(WPA_CONF),
+            WPA_CONF_TEXT.as_bytes(),
+            0o644,
+        )?;
         self.supervise("wpa_supplicant", generation, |net| {
             let mut child = spawn_supplicant()?;
             let loaded = wifi::open(INTERFACE).and_then(|wpa| {
@@ -820,10 +824,8 @@ fn install_supplicant() -> anyhow::Result<()> {
     if std::fs::read(WPA).ok().as_deref() == Some(WPA_BINARY) {
         return Ok(());
     }
-    let part = format!("{WPA}.part");
-    std::fs::write(&part, WPA_BINARY)?;
-    set_executable(&part)?;
-    std::fs::rename(&part, WPA)?;
+    // Not through a .part left in its place (src/perms.rs).
+    crate::ssh::write_new(std::path::Path::new(WPA), WPA_BINARY, 0o755)?;
     Ok(())
 }
 
@@ -897,11 +899,6 @@ pub fn network_id(reply: &str, ssid: &str) -> Option<u32> {
             .unwrap_or(name);
         (name == ssid).then_some(id)
     })
-}
-
-fn set_executable(path: &str) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
 }
 
 fn run(command: &mut Command) -> anyhow::Result<()> {

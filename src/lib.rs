@@ -16,6 +16,7 @@ pub mod launcher;
 pub mod lifeline;
 pub mod net;
 pub mod networks;
+pub mod perms;
 pub mod pmk;
 pub mod power;
 pub mod prefs;

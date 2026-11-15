@@ -60,6 +60,12 @@ impl Files {
     /// Copies the binary to run: a staged update gets one trial run;
     /// otherwise `slot`, the current binary or the previous one.
     fn pick(&self, slot: &Path) {
+        self.choose(slot);
+        // A copy kept as current may be as Amazon's UI left it.
+        narrow(&self.bin);
+    }
+
+    fn choose(&self, slot: &Path) {
         if self.next.is_file() && std::fs::rename(&self.next, &self.trial).is_ok() {
             if self.copy(&self.trial).is_ok() && std::fs::write(&self.trying, b"").is_ok() {
                 log("trying the update");
@@ -137,6 +143,48 @@ fn mtime(path: &Path) -> Option<u64> {
     Some(modified.duration_since(UNIX_EPOCH).ok()?.as_secs())
 }
 
+/// Amazon's UI, which ran until now, left what root runs here the
+/// javausers group's to change: /etc/upstart/framework.conf runs `chmod -R
+/// g=u /var/local` whenever it starts (src/perms.rs in the app). `path` is
+/// made 0755 at most again, through the open file, never through a
+/// symlink, and only if it is a regular file of the launcher's user.
+fn narrow(path: &Path) {
+    match narrowed(path) {
+        Ok(Some(was)) => log(&format!(
+            "{} was {was:o}: narrowed to {:o}",
+            path.display(),
+            was & 0o755
+        )),
+        Ok(None) => {}
+        Err(error) => log(&format!("{}: {error}", path.display())),
+    }
+}
+
+/// Its mode before, if it was narrowed.
+fn narrowed(path: &Path) -> std::io::Result<Option<u32>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let file = match std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let meta = file.metadata()?;
+    // SAFETY: geteuid has no preconditions.
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::other("not a file of the launcher's user"));
+    }
+    let was = meta.mode() & 0o7777;
+    if was & 0o755 == was {
+        return Ok(None);
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(was & 0o755))?;
+    Ok(Some(was))
+}
+
 fn executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -190,6 +238,9 @@ impl UsbDrive {
 
 pub fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
     crate::os::ignore(libc::SIGHUP);
+    // Before anything runs: the launcher itself (the boot job and KUAL run
+    // it next time), and below, in pick, the binary it runs.
+    narrow(&paths.run.join("launcher"));
     let files = Files::new(paths);
     // A trial cut short by a reboot or a kill never settled: drop it, so the
     // current binary runs and nothing keeps the untried one.
@@ -690,6 +741,81 @@ mod tests {
             .unwrap();
         env.session(&Fake::default());
         assert_eq!(env.running(), "kindil 1.1.0");
+    }
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    /// What /etc/upstart/framework.conf does to /var/local whenever Amazon's
+    /// UI starts: `chmod -R g=u`, and setgid on directories.
+    fn framework_starts(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.is_symlink() {
+                continue;
+            }
+            let was = mode(&path);
+            let widened = (was & 0o7707) | ((was & 0o700) >> 3);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(widened)).unwrap();
+            if meta.is_dir() {
+                framework_starts(&path);
+                let setgid = std::fs::Permissions::from_mode(widened | 0o2000);
+                let _ = std::fs::set_permissions(&path, setgid);
+            }
+        }
+    }
+
+    #[test]
+    fn what_root_runs_is_narrowed_again_before_it_runs() {
+        let env = Env::new();
+        let bin = env.paths.run.join("kindil");
+        // Each run notes the mode it runs with, and its inode: the same
+        // inode means the copy wasn't written again.
+        let note = format!(
+            "ls -li {} | awk '{{print $1, substr($2, 1, 10)}}' >>{}; exit 0",
+            bin.display(),
+            env.t().join("runs").display()
+        );
+        env.fake(&env.ext("kindil"), "1.0.0", &note);
+        let launcher = env.paths.run.join("launcher");
+        env.fake(&launcher, "launcher", "exit 0");
+        std::os::unix::fs::symlink(&bin, env.paths.run.join("kindil-dhcp")).unwrap();
+        env.session(&Fake::default());
+        // Amazon's UI after it: both group-writable.
+        framework_starts(env.t());
+        assert_eq!((mode(&bin), mode(&launcher)), (0o775, 0o775));
+        env.session(&Fake::default());
+        assert_eq!((mode(&bin), mode(&launcher)), (0o755, 0o755));
+        let runs = env.runs();
+        let runs: Vec<&str> = runs.split(' ').collect();
+        assert_eq!(runs.len(), 4, "{runs:?}");
+        assert_eq!(runs[0], runs[2], "the copy was kept, not written again");
+        assert_eq!((runs[1], runs[3]), ("-rwxr-xr-x", "-rwxr-xr-x"));
+    }
+
+    #[test]
+    fn narrows_only_a_file_of_its_own_never_through_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let env = Env::new();
+        let elsewhere = env.t().join("elsewhere");
+        std::fs::write(&elsewhere, "").unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let link = env.t().join("link");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        assert!(narrowed(&link).is_err());
+        assert!(narrowed(env.t()).is_err(), "a directory isn't narrowed");
+        assert_eq!(narrowed(&env.t().join("none")).unwrap(), None);
+        assert_eq!(mode(&elsewhere), 0o777);
+        assert_eq!(narrowed(&elsewhere).unwrap(), Some(0o777));
+        assert_eq!(mode(&elsewhere), 0o755);
     }
 
     #[test]

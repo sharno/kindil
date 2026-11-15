@@ -23,9 +23,8 @@ pub fn install(path: &Path) -> anyhow::Result<bool> {
     if std::fs::read(path).ok().as_deref() == Some(BINARY) {
         return Ok(false);
     }
-    let part = path.with_extension("part");
-    std::fs::write(&part, BINARY)?;
-    std::fs::set_permissions(&part, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
-    std::fs::rename(&part, path)?;
+    // A fresh .part (O_EXCL, a stale one or a symlink gone first): the
+    // directory is the javausers group's while Amazon's UI runs.
+    crate::ssh::write_new(path, BINARY, 0o755)?;
     Ok(true)
 }
