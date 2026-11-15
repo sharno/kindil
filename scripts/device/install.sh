@@ -19,7 +19,10 @@ SETTLE=20
 ONLINE_WAIT=180
 HOLD=60
 ID="${1:-manual}"
-BACKUP="$RUN/extension-backup.tgz"
+# On the user storage, which has room: /var/local is 64 MB, mostly Amazon's,
+# and a full one breaks settings. Uncompressed: gzip takes minutes here.
+BACKUP="$B/extension-backup.tar"
+ROLLBACK="$B/kindil.rollback"
 mkdir -p "$RUN"
 exec >>"$RUN/deploy.log" 2>&1
 
@@ -43,9 +46,9 @@ rollback() {
   log "$1; rolling back"
   killall kindil
   sleep "$SETTLE"
-  rm -rf "$E" && mkdir -p "$E" && tar xzf "$BACKUP" -C "$E" || log "restoring the backup failed"
-  if [ -f "$RUN/kindil.rollback" ]; then
-    cp "$RUN/kindil.rollback" "$E/bin/kindil.new" && mv "$E/bin/kindil.new" "$E/bin/kindil"
+  rm -rf "$E" && mkdir -p "$E" && tar xf "$BACKUP" -C "$E" || log "restoring the backup failed"
+  if [ -f "$ROLLBACK" ]; then
+    cp "$ROLLBACK" "$E/bin/kindil.new" && mv "$E/bin/kindil.new" "$E/bin/kindil"
   fi
   "$E/bin/start.sh"
   log "rolled back to $("$E/bin/kindil" --version 2>/dev/null)"
@@ -59,13 +62,15 @@ rm -rf x
 mkdir x && tar xzf bundle.tgz -C x || fail "can't unpack"
 new=x/extensions/kindil
 version="$("$new/bin/kindil" --version)" || fail "the new binary won't run"
-rm -f "$RUN/kindil.rollback"
-if [ -f kindil.rollback ]; then
-  cp kindil.rollback "$RUN/kindil.rollback" && chmod 755 "$RUN/kindil.rollback" ||
-    fail "can't keep the rollback binary"
+if [ -f "$ROLLBACK" ]; then
+  chmod 755 "$ROLLBACK" || fail "can't use the rollback binary"
 fi
 # Everything as it is now, to put back if the new version doesn't come up.
-tar czf "$BACKUP" -C "$E" . || fail "can't back up $E"
+rm -f "$BACKUP"
+tar cf "$BACKUP" -C "$E" . || {
+  rm -f "$BACKUP"
+  fail "can't back up $E"
+}
 log "installing $version"
 
 killall kindil
