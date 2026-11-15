@@ -9,11 +9,19 @@
 //! with a growing pause if it keeps dying. Off stops them and takes the
 //! interface down, and is remembered; the driver is never unloaded. Amazon's wifid only runs outside
 //! kindil: the launcher starts it for Amazon's UI.
-use crate::host::Power;
-use crate::wifi::{self, Credentials, Link};
+//!
+//! Behind a switch ([`station::SWITCH`] saying `kindil`), each start runs
+//! kindil's own Wi-Fi instead of wpa_supplicant: a keeper thread
+//! (src/station.rs) joins through the driver's wireless extensions, beside
+//! the same udhcpc. If it gives up, it falls back to wpa_supplicant for the
+//! rest of the run.
+use crate::host::{Power, Signal};
+use crate::station::{self, Kick};
+use crate::wext::{self, Bss, Driver};
+use crate::wifi::{self, Credentials, Link, Network};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const INTERFACE: &str = "wlan0";
@@ -52,6 +60,26 @@ const TRY_WAIT: Duration = Duration::from_secs(30);
 const HEALTHY: Duration = Duration::from_secs(60);
 const PAUSE_MIN: Duration = Duration::from_secs(1);
 const PAUSE_MAX: Duration = Duration::from_secs(60);
+/// A scan of kindil's own Wi-Fi this recent picks how to join a network
+/// chosen from it in Settings.
+const SCAN_FRESH: Duration = Duration::from_secs(120);
+
+/// Which Wi-Fi a start of kindil's stack runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Supplicant,
+    /// kindil's own (src/station.rs).
+    Kindil,
+}
+
+/// The switch's choice, unless kindil's own Wi-Fi gave up this run.
+pub fn backend(switch: Option<&str>, fell_back: bool) -> Backend {
+    if !fell_back && station::chosen(switch) {
+        Backend::Kindil
+    } else {
+        Backend::Supplicant
+    }
+}
 
 pub struct Net {
     /// Held through every transition (on, off, load, join, reconnect, a
@@ -65,6 +93,17 @@ pub struct Net {
     /// Bumped whenever kindil stops its stack, under `lifecycle`: children
     /// of an older stack exited because they were told to, and stay down.
     generation: AtomicU64,
+    /// The Wi-Fi the last start ran.
+    backend: Mutex<Backend>,
+    /// kindil's own Wi-Fi gave up: wpa_supplicant for the rest of the run.
+    fell_back: AtomicBool,
+    /// For kindil's own Wi-Fi's keeper: why to look again, and its wake-up.
+    kick: Mutex<Option<Kick>>,
+    kicked: Condvar,
+    /// Associations the keeper reported, for a reconnect to wait on.
+    joins: AtomicU64,
+    /// kindil's own Wi-Fi's last scan, and when.
+    seen: Mutex<Option<(Instant, Vec<Bss>)>>,
 }
 
 impl Default for Net {
@@ -74,6 +113,12 @@ impl Default for Net {
             power: Mutex::new(Power::Off),
             saved: Mutex::default(),
             generation: AtomicU64::new(0),
+            backend: Mutex::new(Backend::Supplicant),
+            fell_back: AtomicBool::new(false),
+            kick: Mutex::new(None),
+            kicked: Condvar::new(),
+            joins: AtomicU64::new(0),
+            seen: Mutex::new(None),
         }
     }
 }
@@ -98,7 +143,7 @@ impl Net {
         self.switch(power, saved)
     }
 
-    /// Gives wpa_supplicant `saved`, kindil's networks, when Wi-Fi is on.
+    /// Gives the running Wi-Fi `saved`, kindil's networks, when it is on.
     pub fn load(self: &Arc<Self>, saved: &[Credentials]) -> anyhow::Result<()> {
         let _transition = lock(&self.lifecycle);
         self.give(saved)
@@ -121,13 +166,76 @@ impl Net {
         joined
     }
 
+    /// The Wi-Fi the stack runs (or last ran).
+    pub fn backend(&self) -> Backend {
+        *lock(&self.backend)
+    }
+
+    /// The link, and its signal while associated.
+    pub fn link(&self) -> anyhow::Result<(Link, Option<Signal>)> {
+        match self.backend() {
+            Backend::Supplicant => {
+                let wpa = wifi::open(INTERFACE)?;
+                let link = wpa.link()?;
+                let signal = match link {
+                    Link::Associated { .. } => wpa.signal(),
+                    Link::NotAssociated => None,
+                };
+                Ok((link, signal))
+            }
+            Backend::Kindil => own_link(),
+        }
+    }
+
+    /// Scans and returns the networks around, strongest first.
+    pub fn scan(self: &Arc<Self>) -> anyhow::Result<Vec<Network>> {
+        if self.backend() == Backend::Supplicant {
+            return wifi::open(INTERFACE)?.scan();
+        }
+        anyhow::ensure!(self.power() == Power::On, "Wi-Fi is off");
+        let socket = wext::Socket::open(INTERFACE)?;
+        match station::scan(&socket, &std::thread::sleep) {
+            Ok(seen) => {
+                let networks = station::networks(&seen);
+                *lock(&self.seen) = Some((Instant::now(), seen));
+                Ok(networks)
+            }
+            Err(error) => {
+                let _transition = lock(&self.lifecycle);
+                if self.backend() == Backend::Kindil && self.power() == Power::On {
+                    self.fall_back(&format!("scanning: {error}"));
+                }
+                anyhow::bail!("scanning: {error}; try again")
+            }
+        }
+    }
+
     /// After a suspend: join again, then renew the address (usually kept).
     /// A supplicant that doesn't answer gets the whole stack started again.
     pub fn reconnect(self: &Arc<Self>) -> anyhow::Result<()> {
-        let _transition = lock(&self.lifecycle);
-        if self.power() == Power::Off {
-            return Ok(());
+        let joins = {
+            let _transition = lock(&self.lifecycle);
+            if self.power() == Power::Off {
+                return Ok(());
+            }
+            if self.backend() == Backend::Supplicant {
+                return self.reconnect_supplicant();
+            }
+            // The keeper joins again, the PMK again too, and renews.
+            let joins = self.joins.load(Ordering::SeqCst);
+            self.kick(Kick::Resumed);
+            joins
+        };
+        let since = Instant::now();
+        while self.joins.load(Ordering::SeqCst) == joins {
+            anyhow::ensure!(since.elapsed() < JOIN_WAIT, "no access point joined");
+            std::thread::sleep(Duration::from_millis(100));
         }
+        Ok(())
+    }
+
+    /// `reconnect` for wpa_supplicant, with `lifecycle` held.
+    fn reconnect_supplicant(self: &Arc<Self>) -> anyhow::Result<()> {
         let rejoined =
             wifi::open(INTERFACE).and_then(|wpa| wpa.command("REASSOCIATE").map(|_| wpa));
         let Ok(wpa) = rejoined else {
@@ -167,6 +275,11 @@ impl Net {
         if self.power() == Power::Off {
             return Ok(());
         }
+        if self.backend() == Backend::Kindil {
+            // Still on one of them? The keeper looks, and moves if not.
+            self.kick(Kick::Saved);
+            return Ok(());
+        }
         let wpa = wifi::open(INTERFACE)?;
         wpa.load(saved)?;
         wpa.command("REASSOCIATE").map(drop)
@@ -181,6 +294,11 @@ impl Net {
             Power::Off => self.switch(Power::On, candidate)?,
             Power::On => self.give(candidate)?,
         }
+        if self.backend() == Backend::Kindil && self.join_own(&candidate[0])? {
+            return renew_dhcp();
+        }
+        // wpa_supplicant, or kindil's own Wi-Fi fell back to it (with
+        // `candidate` loaded).
         let since = Instant::now();
         let wpa = wifi::open(INTERFACE)?;
         if let Some(id) = wpa
@@ -202,6 +320,76 @@ impl Net {
         anyhow::bail!("couldn't join {ssid}: check the password and that it is in range")
     }
 
+    /// Joins `credentials` with kindil's own Wi-Fi: Ok(true) once joined,
+    /// Ok(false) if the driver failed and it fell back to wpa_supplicant.
+    fn join_own(self: &Arc<Self>, credentials: &Credentials) -> anyhow::Result<bool> {
+        let socket = wext::Socket::open(INTERFACE)?;
+        let recent = lock(&self.seen)
+            .as_ref()
+            .filter(|(when, _)| when.elapsed() < SCAN_FRESH)
+            .map(|(_, seen)| seen.clone());
+        let seen = match recent {
+            Some(seen) => seen,
+            None => match station::scan(&socket, &std::thread::sleep) {
+                Ok(seen) => seen,
+                Err(error) => {
+                    self.fall_back(&format!("scanning: {error}"));
+                    return Ok(false);
+                }
+            },
+        };
+        let target = match station::choose(std::slice::from_ref(credentials), &seen) {
+            station::Choice::Join(target) | station::Choice::Blind(target) => target,
+            station::Choice::Unsupported { ssid, why } => anyhow::bail!(
+                "can't join {ssid}: {why} (remove {} to use wpa_supplicant)",
+                station::SWITCH
+            ),
+            station::Choice::Nothing => anyhow::bail!("no network to join"),
+        };
+        let epoch = Instant::now();
+        let joined = station::join(
+            &socket,
+            &target,
+            TRY_WAIT,
+            &|| epoch.elapsed(),
+            &std::thread::sleep,
+        );
+        match joined {
+            Ok(true) => Ok(true),
+            Ok(false) => anyhow::bail!(
+                "couldn't join {}: check the password and that it is in range",
+                target.ssid()
+            ),
+            Err(error) => {
+                self.fall_back(&format!("joining {}: {error}", target.ssid()));
+                Ok(false)
+            }
+        }
+    }
+
+    /// Gives up on kindil's own Wi-Fi for the run: its driver state
+    /// cleared (by the stop in `start`), wpa_supplicant started with the
+    /// saved networks.
+    fn fall_back(self: &Arc<Self>, why: &str) {
+        eprintln!(
+            "kindil: kindil's own Wi-Fi gives up ({why}); wpa_supplicant for the rest of this run"
+        );
+        self.fell_back.store(true, Ordering::SeqCst);
+        let saved = lock(&self.saved).clone();
+        if let Err(error) = self.start(&saved) {
+            eprintln!("kindil: Wi-Fi with wpa_supplicant: {error}");
+        }
+    }
+
+    /// Wakes the keeper; a resume outranks a change of networks.
+    fn kick(&self, kick: Kick) {
+        let mut pending = lock(&self.kick);
+        if *pending != Some(Kick::Resumed) {
+            *pending = Some(kick);
+        }
+        self.kicked.notify_all();
+    }
+
     /// kindil's whole stack up, with `saved` loaded; On only if it all came up.
     fn start(self: &Arc<Self>, saved: &[Credentials]) -> anyhow::Result<()> {
         self.stop();
@@ -210,6 +398,16 @@ impl Net {
         // kindil's own.
         clear_slate();
         *lock(&self.saved) = saved.to_vec();
+        let switch = std::fs::read_to_string(station::SWITCH).ok();
+        let chosen = backend(switch.as_deref(), self.fell_back.load(Ordering::SeqCst));
+        if chosen == Backend::Kindil {
+            eprintln!(
+                "kindil: Wi-Fi: kindil's own, without wpa_supplicant ({})",
+                station::SWITCH
+            );
+        }
+        *lock(&self.backend) = chosen;
+        *lock(&self.kick) = None;
         let result = self.bring_up();
         if result.is_err() {
             self.stop();
@@ -219,10 +417,30 @@ impl Net {
 
     fn bring_up(self: &Arc<Self>) -> anyhow::Result<()> {
         load_driver()?;
-        install_supplicant()?;
-        std::fs::write(WPA_CONF, WPA_CONF_TEXT)?;
         link_hook()?;
         let generation = self.generation.load(Ordering::SeqCst);
+        match self.backend() {
+            Backend::Supplicant => self.bring_up_supplicant(generation)?,
+            Backend::Kindil => {
+                let socket = wext::Socket::open(INTERFACE)?;
+                socket.set_up()?;
+                let keep = Keep {
+                    net: Arc::clone(self),
+                    generation,
+                    socket,
+                    epoch: Instant::now(),
+                };
+                std::thread::spawn(move || station::keep(&keep));
+            }
+        }
+        self.supervise("udhcpc", generation, |_| spawn_dhcp())?;
+        *lock(&self.power) = Power::On;
+        Ok(())
+    }
+
+    fn bring_up_supplicant(self: &Arc<Self>, generation: u64) -> anyhow::Result<()> {
+        install_supplicant()?;
+        std::fs::write(WPA_CONF, WPA_CONF_TEXT)?;
         self.supervise("wpa_supplicant", generation, |net| {
             let mut child = spawn_supplicant()?;
             let loaded = wifi::open(INTERFACE).and_then(|wpa| {
@@ -236,10 +454,7 @@ impl Net {
                 return Err(error);
             }
             Ok(child)
-        })?;
-        self.supervise("udhcpc", generation, |_| spawn_dhcp())?;
-        *lock(&self.power) = Power::On;
-        Ok(())
+        })
     }
 
     /// Starts a child with `spawn`, and again whenever it exits while this
@@ -293,11 +508,25 @@ impl Net {
     /// kindil's stack down; never fails halfway into a state On can't
     /// recover from.
     fn stop(&self) {
-        // Its children now exit for good.
+        // Its children now exit for good, and its keeper stops.
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.kicked.notify_all();
         *lock(&self.power) = Power::Off;
         terminate(DHCP_PID);
         terminate(WPA_PID);
+        if self.backend() == Backend::Kindil {
+            // Nothing does it for kindil's own Wi-Fi: leave the network and
+            // stop the firmware chasing it.
+            if let Err(error) = wext::Socket::open(INTERFACE)
+                .map_err(|error| station::DriverError {
+                    step: "socket",
+                    error,
+                })
+                .and_then(|socket| station::disconnect(&socket))
+            {
+                eprintln!("kindil: Wi-Fi: leaving the network: {error}");
+            }
+        }
         // Nothing to take down the first time (no driver yet): quietly.
         let quiet = |command: &mut Command| {
             let _ = command
@@ -310,6 +539,87 @@ impl Net {
         // Down, the interface is idle, and a suspend powers the chip off.
         quiet(Command::new("/sbin/ifconfig").args([INTERFACE, "down"]));
     }
+}
+
+/// What kindil's own Wi-Fi's keeper (src/station.rs) runs in: this stack,
+/// while it is the one wanted.
+struct Keep {
+    net: Arc<Net>,
+    generation: u64,
+    socket: wext::Socket,
+    epoch: Instant,
+}
+
+impl Keep {
+    fn wanted(&self) -> bool {
+        self.net.generation.load(Ordering::SeqCst) == self.generation
+    }
+}
+
+impl station::Context for Keep {
+    type D = wext::Socket;
+
+    fn now(&self) -> Duration {
+        self.epoch.elapsed()
+    }
+
+    fn sleep(&self, pause: Duration) {
+        std::thread::sleep(pause);
+    }
+
+    fn wait(&self, pause: Duration) -> Option<Kick> {
+        let pending = lock(&self.net.kick);
+        let (mut pending, _) = self
+            .net
+            .kicked
+            .wait_timeout_while(pending, pause, |kick| kick.is_none() && self.wanted())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.take()
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&wext::Socket, &[Credentials]) -> R) -> Option<R> {
+        let _transition = lock(&self.net.lifecycle);
+        if !self.wanted() {
+            return None;
+        }
+        let saved = lock(&self.net.saved).clone();
+        Some(f(&self.socket, &saved))
+    }
+
+    fn joined(&self, _ssid: &str) {
+        if let Err(error) = renew_dhcp() {
+            eprintln!("kindil: Wi-Fi: renewing the address: {error}");
+        }
+        self.net.joins.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn fall_back(&self, why: &str) {
+        let _transition = lock(&self.net.lifecycle);
+        if self.wanted() {
+            self.net.fall_back(why);
+        }
+    }
+}
+
+/// kindil's own Wi-Fi's link: the driver's access point and ESSID, the
+/// interface's address and the level in `/proc/net/wireless`.
+fn own_link() -> anyhow::Result<(Link, Option<Signal>)> {
+    let socket = wext::Socket::open(INTERFACE)?;
+    if socket.bssid()?.is_none() {
+        return Ok((Link::NotAssociated, None));
+    }
+    let ssid = String::from_utf8_lossy(&socket.essid()?).into_owned();
+    let signal = std::fs::read_to_string("/proc/net/wireless")
+        .ok()
+        .and_then(|text| wext::parse_proc_level(&text, INTERFACE))
+        .map(Signal);
+    Ok((
+        Link::Associated {
+            ssid,
+            ip: socket.ipv4(),
+        },
+        signal,
+    ))
 }
 
 /// Amazon's Wi-Fi jobs, if anything started them, and any wpa_supplicant or
@@ -543,5 +853,14 @@ mod tests {
     #[test]
     fn starts_off_until_its_stack_is_up() {
         assert_eq!(Net::default().power(), Power::Off);
+        assert_eq!(Net::default().backend(), Backend::Supplicant);
+    }
+
+    #[test]
+    fn the_switch_picks_the_backend_until_a_fall_back() {
+        assert_eq!(backend(None, false), Backend::Supplicant);
+        assert_eq!(backend(Some("kindil\n"), false), Backend::Kindil);
+        assert_eq!(backend(Some("kindil\n"), true), Backend::Supplicant);
+        assert_eq!(backend(Some("wpa\n"), false), Backend::Supplicant);
     }
 }
