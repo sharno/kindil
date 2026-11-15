@@ -157,6 +157,9 @@ if running lab126_gui; then
   stop lab126_gui
   sleep 2
 fi
+# kindil draws to the framebuffer itself: X has nothing to do while it runs.
+# The way back starts it again, and Amazon's UI with it.
+running x && stop x
 # kindil does powerd's work itself: battery, front light, charging limits,
 # sleep and the power button. Stopped first, and before kindil starts:
 # stopping powerd switches the front light off, which kindil then sets.

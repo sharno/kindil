@@ -13,7 +13,8 @@ done
 # line in $T/jobs.
 printf '#!/bin/sh\necho "stop $1" >>%s/upstart\ngrep -vx "$1" %s/jobs >%s/jobs.new; mv %s/jobs.new %s/jobs\n' \
   "$T" "$T" "$T" "$T" "$T" >"$T/stub/stop"
-printf '#!/bin/sh\necho "start $1" >>%s/upstart\necho "$1" >>%s/jobs\n' "$T" "$T" >"$T/stub/start"
+# Starting X brings Amazon's UI up with it, as upstart does.
+printf '#!/bin/sh\necho "start $1" >>%s/upstart\necho "$1" >>%s/jobs\n[ "$1" = x ] && echo lab126_gui >>%s/jobs\nexit 0\n' "$T" "$T" "$T" >"$T/stub/start"
 printf '#!/bin/sh\nif grep -qx "$1" %s/jobs; then echo "$1 start/running"; else echo "$1 stop/waiting"; fi\n' \
   "$T" >"$T/stub/status"
 chmod +x "$T"/stub/*
@@ -26,7 +27,7 @@ kual() { { echo "$SERVICES" | tr ' ' '\n'; printf 'powerd\nwifid\nx\nlab126_gui\
 jobs() { sort "$T/jobs" | tr '\n' ' '; }
 # A kindil that notes the jobs running while it runs, once session.sh's
 # background stopper has had a moment.
-WATCH="/bin/sleep 1; sort $T/jobs | tr '\\n' ' ' >$T/during"
+WATCH="echo 'kindil runs' >>$T/upstart; /bin/sleep 1; sort $T/jobs | tr '\\n' ' ' >$T/during"
 [ -n "$SERVICES" ] || { echo "FAIL no SERVICES in session.sh"; exit 1; }
 kual
 sed -e "s#^EXT=.*#EXT=$T/ext#" \
@@ -138,15 +139,16 @@ kual
 before="$(jobs)"
 fake "$T/ext/kindil" 1.0.0 "$WATCH; exit 0"
 run
-expect "while kindil runs, Amazon's UI, powerd and the services it has no use for are stopped" \
-  "$(cat "$T/during")" "wifid x "
+expect "while kindil runs, Amazon's UI, X, powerd and the services it has no use for are stopped" \
+  "$(cat "$T/during")" "wifid "
 expect "and leaving brings every one of them back" "$(jobs)" "$before"
-expect "powerd is stopped before kindil starts" "$(grep -n 'stop powerd' "$T/upstart" | cut -d: -f1)" "2"
+expect "powerd is stopped before kindil starts" \
+  "$([ "$(grep -n 'stop powerd' "$T/upstart" | cut -d: -f1)" -lt "$(grep -n 'kindil runs' "$T/upstart" | cut -d: -f1)" ] && echo before)" "before"
 rm -f "$T/upstart"
 : >"$T/jobs"
 run
 expect "after a standalone boot, leaving starts powerd, Amazon's services and X, which brings Amazon's UI" \
-  "$(jobs)" "$({ echo "$SERVICES" | tr ' ' '\n'; printf 'powerd\nwifid\nx\n'; } | sort | tr '\n' ' ')"
+  "$(jobs)" "$({ echo "$SERVICES" | tr ' ' '\n'; printf 'powerd\nwifid\nx\nlab126_gui\n'; } | sort | tr '\n' ' ')"
 
 expect "session.sh and boot.sh stop and start the same services" "$SERVICES" "$BOOT_SERVICES"
 
