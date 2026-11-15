@@ -9,7 +9,6 @@ pub mod frontlight;
 pub mod ghosting;
 pub mod host;
 pub mod kindle;
-pub mod lipc;
 pub mod net;
 pub mod networks;
 pub mod prefs;

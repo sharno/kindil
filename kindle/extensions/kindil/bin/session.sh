@@ -35,8 +35,10 @@ restore() {
   # an empty screen. boot.sh sets the flag again after a boot kindil stays up.
   rm -f "$SKIP"
   lipc-set-prop com.lab126.powerd preventScreenSaver 0
-  lipc-set-prop com.lab126.blanket load usb
-  lipc-set-prop com.lab126.blanket load splash
+  if [ -n "$GUI" ]; then
+    lipc-set-prop com.lab126.blanket load usb
+    lipc-set-prop com.lab126.blanket load splash
+  fi
   log "starting the Kindle UI"
   wifi_back
   # A standalone boot stopped these and X: Amazon's UI needs them all.
@@ -124,7 +126,9 @@ lipc-set-prop com.lab126.powerd preventScreenSaver 1
 # Stopping the GUI job signals its whole tree, which can include us.
 trap '' TERM
 # A standalone boot never started it.
+GUI=""
 if running lab126_gui; then
+  GUI=1
   # Let KUAL close its menu before the UI goes away.
   sleep 2
   log "stopping the Kindle UI"
@@ -133,9 +137,11 @@ if running lab126_gui; then
 fi
 trap restore EXIT
 # Amazon's screen modules would draw over kindil in USB drive mode and after
-# it; kindil draws its own screens.
-lipc-set-prop com.lab126.blanket unload usb
-lipc-set-prop com.lab126.blanket unload splash
+# it; kindil draws its own screens. Only Amazon's UI loads them.
+if [ -n "$GUI" ]; then
+  lipc-set-prop com.lab126.blanket unload usb
+  lipc-set-prop com.lab126.blanket unload splash
+fi
 eips -c
 
 if [ -f "$CONFIG" ]; then

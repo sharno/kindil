@@ -102,11 +102,11 @@ if [ -f "$SKIP" ]; then
   # Amazon's boot spinner stops only when X's language picker starts: left
   # running, it keeps drawing over kindil.
   stop early_progress
+  # session.sh tells powerd not to sleep on its own while kindil runs,
+  # which needs it answering. (kindil sets the front light itself.)
   await answers com.lab126.powerd state || log "powerd isn't answering"
   # kindil runs Wi-Fi itself.
   stop wifid
-  # What X's language picker does at boot to set up the front light.
-  lipc-set-prop com.lab126.powerd flStartup 1
 else
   # Let Amazon's UI get going; start.sh stops it again.
   await running lab126_gui || log "Amazon's UI didn't start"

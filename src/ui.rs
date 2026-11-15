@@ -888,7 +888,21 @@ impl Ctx {
     /// The light as last chosen; after a reboot nothing else sets it.
     fn restore_light(&self) {
         let Some(level) = self.state.borrow().store.prefs.light else {
-            return;
+            // Never chosen in kindil: adopt the level the light has (Amazon's,
+            // on a first run), so every later start sets it without powerd.
+            return self.background(
+                |host| host.brightness(),
+                |ui, level| match level {
+                    // Dark at boot isn't a choice: leave it to the next start.
+                    Ok(level) if level.percent() > 0 => {
+                        let percent = i32::from(level.percent());
+                        let k = ui.global::<Kindil>();
+                        k.set_brightness(percent);
+                        k.invoke_choose_brightness(percent);
+                    }
+                    Ok(_) | Err(_) => {}
+                },
+            );
         };
         self.background(
             move |host| host.set_brightness(level),

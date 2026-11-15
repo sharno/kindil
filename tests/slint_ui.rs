@@ -414,6 +414,16 @@ fn a_chosen_front_light_level_is_saved() {
 }
 
 #[test]
+fn a_light_never_chosen_in_kindil_is_adopted_at_start() {
+    // As on a first run: no level saved, the light at Amazon's 40%.
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    let saved = std::fs::read_to_string(f.dir.path().join("prefs.toml")).unwrap();
+    assert!(saved.contains("light = 40"), "saved: {saved}");
+    assert_eq!(f.k().get_brightness(), 40);
+}
+
+#[test]
 fn the_front_light_comes_back_to_the_saved_level_at_start() {
     // After a reboot the light is wherever the hardware starts it.
     let host = Arc::new(Simulated::default());
