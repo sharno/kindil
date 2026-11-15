@@ -93,6 +93,21 @@ impl Paths {
 /// keeps only its last half.
 const LOG_MAX: u64 = 256 * 1024;
 
+/// Past LOG_MAX, keeps the log's last half.
+fn trim(log: &std::path::Path) {
+    if std::fs::metadata(log).is_ok_and(|m| m.len() > LOG_MAX) {
+        if let Ok(text) = std::fs::read(log) {
+            // The file may have shrunk since: never slice past its start.
+            let half = usize::try_from(LOG_MAX / 2).unwrap_or(usize::MAX);
+            let keep = text.get(text.len().saturating_sub(half)..).unwrap_or(&[]);
+            let part = log.with_extension("log.old");
+            if std::fs::write(&part, keep).is_ok() {
+                let _ = std::fs::rename(&part, log);
+            }
+        }
+    }
+}
+
 /// Starts kindil's session, detached, unless one runs.
 pub fn start(paths: &Paths, os: &dyn os::Os) {
     if os::read_pid(&paths.pid_file).is_some_and(|pid| os.alive(pid)) {
@@ -101,15 +116,7 @@ pub fn start(paths: &Paths, os: &dyn os::Os) {
     let _ = std::fs::create_dir_all(&paths.run);
     let _ = std::fs::create_dir_all(&paths.user);
     let log = paths.log();
-    if std::fs::metadata(&log).is_ok_and(|m| m.len() > LOG_MAX) {
-        if let Ok(text) = std::fs::read(&log) {
-            let keep = &text[text.len() - (LOG_MAX / 2) as usize..];
-            let part = log.with_extension("log.old");
-            if std::fs::write(&part, keep).is_ok() {
-                let _ = std::fs::rename(&part, &log);
-            }
-        }
-    }
+    trim(&log);
     match os.spawn_session(&log) {
         Some(pid) => {
             let _ = std::fs::write(&paths.pid_file, format!("{pid}\n"));
@@ -121,15 +128,43 @@ pub fn start(paths: &Paths, os: &dyn os::Os) {
 fn main() -> std::process::ExitCode {
     let paths = Paths::default();
     let os = os::Device;
-    match std::env::args().nth(1).as_deref() {
+    // args_os: args() panics on an argument that isn't UTF-8.
+    let command = std::env::args_os().nth(1);
+    match command.as_ref().and_then(|c| c.to_str()) {
         Some("start") => start(&paths, &os),
         Some("session") => return session::session(&paths, &os),
         Some("boot") => boot::boot(&paths, &os),
-        Some("--version") => println!("launcher {}", env!("CARGO_PKG_VERSION")),
+        Some("--version") => os::say(
+            &mut std::io::stdout(),
+            &format!("launcher {}", env!("CARGO_PKG_VERSION")),
+        ),
         _ => {
-            eprintln!("usage: launcher start | session | boot | --version");
+            os::say(
+                &mut std::io::stderr(),
+                "usage: launcher start | session | boot | --version",
+            );
             return std::process::ExitCode::from(2);
         }
     }
     std::process::ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_long_log_keeps_its_last_half() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("kindil.log");
+        let mut text = vec![b'a'; usize::try_from(LOG_MAX).unwrap()];
+        text.extend_from_slice(b"last\n");
+        std::fs::write(&log, &text).unwrap();
+        trim(&log);
+        let kept = std::fs::read(&log).unwrap();
+        assert_eq!(kept.len(), usize::try_from(LOG_MAX / 2).unwrap());
+        assert!(kept.ends_with(b"last\n"));
+        trim(&log);
+        assert_eq!(std::fs::read(&log).unwrap(), kept, "short logs stay");
+    }
 }

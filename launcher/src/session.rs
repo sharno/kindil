@@ -162,9 +162,17 @@ pub fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
     }
     std::thread::scope(|scope| {
         // The rest in the background, so kindil starts at once. Ended before
-        // anything is brought back, so the two never race.
+        // anything is brought back, so the two never race. Through Builder:
+        // scope.spawn panics if no thread can be made; then one round now.
         let (done, rounds) = mpsc::channel::<()>();
-        let stopper = scope.spawn(move || stop_services(os, &rounds));
+        let stopper = std::thread::Builder::new()
+            .spawn_scoped(scope, move || stop_services(os, &rounds, STOP_ROUNDS))
+            .map_err(|error| {
+                log(&format!(
+                    "no thread for the stopper ({error}); stopping once"
+                ));
+                stop_services(os, &mpsc::channel().1, 1);
+            });
         // Amazon's screen modules would draw over kindil in USB drive mode
         // and after it; kindil draws its own screens. Only Amazon's UI loads
         // them.
@@ -175,20 +183,24 @@ pub fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
         os.clear_screen();
         run(paths, os, &files, slot);
         drop(done);
-        let _ = stopper.join();
+        if let Ok(stopper) = stopper {
+            let _ = stopper.join();
+        }
         restore(paths, os, gui);
     });
     ExitCode::SUCCESS
 }
 
-fn stop_services(os: &dyn Os, done: &mpsc::Receiver<()>) {
-    for _ in 0..STOP_ROUNDS {
+/// Up to `rounds` rounds STOP_EVERY apart, until `done` ends.
+fn stop_services(os: &dyn Os, done: &mpsc::Receiver<()>, rounds: u32) {
+    for round in 1..=rounds {
         for job in SERVICES {
             if os.running(job) {
                 os.stop(job);
             }
         }
-        if done.recv_timeout(STOP_EVERY) != Err(mpsc::RecvTimeoutError::Timeout) {
+        if round == rounds || done.recv_timeout(STOP_EVERY) != Err(mpsc::RecvTimeoutError::Timeout)
+        {
             return;
         }
     }

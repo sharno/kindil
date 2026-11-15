@@ -258,8 +258,19 @@ pub fn ignore(signal: i32) {
 
 /// A timestamped line on stdout (`start` points it at kindil.log), in the
 /// device's time zone.
+/// Never panics, unlike println!: a full /var/local (ENOSPC) or a closed
+/// stdout must not abort the launcher before it restores Amazon's UI.
 pub fn log(message: &str) {
-    println!("{} {message}", local_time());
+    say(
+        &mut std::io::stdout(),
+        &format!("{} {message}", local_time()),
+    );
+}
+
+/// `line` on `out`, errors ignored.
+pub fn say(out: &mut dyn std::io::Write, line: &str) {
+    let _ = out.write_all(format!("{line}\n").as_bytes());
+    let _ = out.flush();
 }
 
 /// From the system's `date`: musl reads the PW1's zone file (TZif with an
@@ -320,6 +331,22 @@ mod tests {
         assert!(child.wait().is_err());
         assert!(Device.alive(i32::try_from(std::process::id()).unwrap()));
         assert!(!Device.alive(0));
+    }
+
+    struct Full;
+
+    impl std::io::Write for Full {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+        }
+    }
+
+    #[test]
+    fn a_full_log_doesnt_take_the_launcher_down() {
+        say(&mut Full, "still here");
     }
 
     #[cfg(target_os = "linux")]
