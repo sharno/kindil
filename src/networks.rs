@@ -26,6 +26,14 @@ struct Saved {
     password: Option<String>,
 }
 
+impl Drop for Saved {
+    fn drop(&mut self) {
+        if let Some(password) = &mut self.password {
+            crate::pmk::wipe_string(password);
+        }
+    }
+}
+
 impl From<&Credentials> for Saved {
     fn from(credentials: &Credentials) -> Self {
         Self {
@@ -48,13 +56,19 @@ impl Networks {
         let _ = root_only(path);
         let file: File = std::fs::read_to_string(path)
             .ok()
-            .and_then(|text| toml::from_str(&text).ok())
+            .and_then(|mut text| {
+                let file = toml::from_str(&text).ok();
+                crate::pmk::wipe_string(&mut text);
+                file
+            })
             .unwrap_or_default();
         let list = file
             .networks
             .into_iter()
-            .filter_map(|saved| {
-                Credentials::parse(saved.ssid, saved.password.unwrap_or_default()).ok()
+            .filter_map(|mut saved| {
+                let ssid = std::mem::take(&mut saved.ssid);
+                let password = saved.password.take().unwrap_or_default();
+                Credentials::parse(ssid, password).ok()
             })
             .collect();
         Self {
@@ -88,12 +102,19 @@ impl Networks {
 
     /// Write-then-rename, readable by root only: it holds passwords.
     fn save(&self) -> anyhow::Result<()> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
         let file = File {
             networks: self.list.iter().map(Saved::from).collect(),
         };
-        let text = toml::to_string(&file)?;
+        let mut text = toml::to_string(&file)?;
+        drop(file);
+        let written = self.write(&text);
+        crate::pmk::wipe_string(&mut text);
+        written
+    }
+
+    fn write(&self, text: &str) -> anyhow::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }

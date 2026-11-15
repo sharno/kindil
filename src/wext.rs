@@ -78,6 +78,8 @@ pub trait Driver {
     /// Starts a scan; the driver ignores one asked for during another.
     fn trigger_scan(&self) -> io::Result<()>;
     /// The driver's table of access points, as a SIOCGIWSCAN event stream.
+    /// EAGAIN (a scan not done yet) comes back as the error, unretried:
+    /// the caller retries within its own bound, without holding locks.
     fn scan_results(&self) -> io::Result<Vec<u8>>;
 }
 
@@ -344,24 +346,34 @@ impl Driver for Socket {
     }
 
     fn scan_results(&self) -> io::Result<Vec<u8>> {
-        let mut size = 4096;
-        loop {
-            let mut buf = vec![0u8; size];
-            match self.point(SIOCGIWSCAN, buf.as_mut_ptr() as *mut c_void, size as u16, 0) {
-                Ok(length) => {
-                    buf.truncate(usize::from(length));
-                    return Ok(buf);
-                }
-                // Not done yet (other drivers; ar6000 reads a cached table).
-                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                }
-                // Too small: ar6000 says how much it needs, others don't.
-                Err(e) if e.raw_os_error() == Some(libc::E2BIG) && size < SCAN_BUFFER_MAX => {
-                    size = (size * 2).min(SCAN_BUFFER_MAX);
-                }
-                Err(e) => return Err(e),
+        read_growing(|buf| {
+            self.point(
+                SIOCGIWSCAN,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u16,
+                0,
+            )
+        })
+    }
+}
+
+/// Reads into a buffer that doubles from 4 KiB while `read` answers E2BIG,
+/// up to what an `iw_point` can describe; any other error (EAGAIN
+/// included) is returned as is. `read` fills the buffer and returns the
+/// length it wrote.
+pub fn read_growing(mut read: impl FnMut(&mut [u8]) -> io::Result<u16>) -> io::Result<Vec<u8>> {
+    let mut size = 4096;
+    loop {
+        let mut buf = vec![0u8; size];
+        match read(&mut buf) {
+            Ok(length) => {
+                buf.truncate(usize::from(length).min(size));
+                return Ok(buf);
             }
+            Err(e) if e.raw_os_error() == Some(libc::E2BIG) && size < SCAN_BUFFER_MAX => {
+                size = (size * 2).min(SCAN_BUFFER_MAX);
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -918,6 +930,75 @@ mod tests {
         s.0.extend_from_slice(&payload);
         let found = parse_scan(&s.0);
         assert_eq!(found[0].rsn.as_ref().unwrap().group, Cipher::Ccmp);
+    }
+
+    #[test]
+    fn the_scan_buffer_grows_on_e2big_up_to_the_most_an_iw_point_holds() {
+        let mut sizes = Vec::new();
+        let got = read_growing(|buf| {
+            sizes.push(buf.len());
+            if buf.len() < 20_000 {
+                Err(io::Error::from_raw_os_error(libc::E2BIG))
+            } else {
+                buf[..3].copy_from_slice(b"abc");
+                Ok(3)
+            }
+        })
+        .unwrap();
+        assert_eq!(got, b"abc");
+        assert_eq!(sizes, [4096, 8192, 16384, 32768]);
+        // Never more than 65535: then E2BIG is the answer.
+        let mut last = 0;
+        let error = read_growing(|buf| {
+            last = buf.len();
+            Err(io::Error::from_raw_os_error(libc::E2BIG))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::E2BIG));
+        assert_eq!(last, 65535);
+        // EAGAIN isn't retried here.
+        let mut calls = 0;
+        let error = read_growing(|_| {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(libc::EAGAIN))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EAGAIN));
+        assert_eq!(calls, 1);
+        // A driver claiming more than the buffer: cut to the buffer.
+        assert_eq!(read_growing(|_| Ok(60_000)).unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn hand_written_malformed_and_unaligned_streams() {
+        // An odd-length ESSID puts the next event at an odd offset.
+        let mut s: Vec<u8> = Vec::new();
+        s.extend_from_slice(&[20, 0, 0x15, 0x8b, 1, 0, 1, 2, 3, 4, 5, 6]);
+        s.extend_from_slice(&[0; 8]);
+        s.extend_from_slice(&[11, 0, 0x1b, 0x8b, 3, 0, 1, 0, b'a', b'b', b'c']);
+        // IWEVQUAL at offset 31.
+        s.extend_from_slice(&[8, 0, 0x01, 0x8c, 40, 201, 161, 7]);
+        // A point event claiming more data than it carries: ignored.
+        s.extend_from_slice(&[10, 0, 0x05, 0x8c, 200, 0, 0, 0, 48, 2]);
+        // A GENIE whose element is cut short: no suites.
+        s.extend_from_slice(&[12, 0, 0x05, 0x8c, 4, 0, 0, 0, 48, 20, 1, 0]);
+        let found = parse_scan(&s);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].bssid, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(found[0].ssid, b"abc");
+        assert_eq!(found[0].level, Some(-55));
+        assert_eq!(found[0].rsn, None);
+        // Events before any access point, an AP address too short, an event
+        // shorter than its header, and one running past the end.
+        let junk = [
+            8, 0, 0x01, 0x8c, 1, 2, 3, 4, // QUAL before any AP: skipped
+            6, 0, 0x15, 0x8b, 1, 0, // SIOCGIWAP without an address
+            3, 0, 0x1b, 0x8b, // shorter than a header: stop
+            0, 0,
+        ];
+        assert_eq!(parse_scan(&junk), []);
+        assert_eq!(parse_scan(&[200, 0, 0x15, 0x8b, 1, 0]), []);
+        assert_eq!(parse_scan(&[1, 0, 0x15]), []);
     }
 
     #[test]

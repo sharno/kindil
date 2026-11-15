@@ -30,6 +30,17 @@ impl std::fmt::Debug for Pmk {
     }
 }
 
+/// Zeroes a string's bytes, its spare capacity too, in place.
+pub fn wipe_string(text: &mut String) {
+    // SAFETY: zero bytes keep the string valid UTF-8; the spare capacity
+    // is initialised (zeroed) before it is counted in.
+    let bytes = unsafe { text.as_mut_vec() };
+    let len = bytes.len();
+    bytes.resize(bytes.capacity(), 0);
+    wipe(bytes);
+    bytes.truncate(len);
+}
+
 /// Zeroes `bytes` in a way the optimizer keeps.
 pub fn wipe(bytes: &mut [u8]) {
     for b in bytes.iter_mut() {
@@ -74,18 +85,21 @@ fn pbkdf2_hmac_sha1(password: &[u8], salt: &[u8], rounds: u32, out: &mut [u8]) {
     for (block, chunk) in out.chunks_mut(20).enumerate() {
         let mut first = salt.to_vec();
         first.extend_from_slice(&(block as u32 + 1).to_be_bytes());
-        let mut u = mac.sign(&first);
+        let mut u = [0u8; 20];
+        mac.sign_into(&first, &mut u);
         let mut t = u;
+        let mut next = [0u8; 20];
         for _ in 1..rounds {
-            let next = mac.sign(&u);
-            u = next;
-            for (t, u) in t.iter_mut().zip(u) {
+            mac.sign_into(&u, &mut next);
+            u.copy_from_slice(&next);
+            for (t, u) in t.iter_mut().zip(u.iter()) {
                 *t ^= u;
             }
         }
         chunk.copy_from_slice(&t[..chunk.len()]);
         wipe(&mut u);
         wipe(&mut t);
+        wipe(&mut next);
     }
 }
 
@@ -101,7 +115,7 @@ impl Hmac {
         if key.len() > 64 {
             let mut h = Sha1::new();
             h.update(key);
-            block[..20].copy_from_slice(&h.finish());
+            h.finish_into(&mut block[..20]);
         } else {
             block[..key.len()].copy_from_slice(key);
         }
@@ -116,12 +130,23 @@ impl Hmac {
         Self { inner, outer }
     }
 
-    fn sign(&self, message: &[u8]) -> [u8; 20] {
+    /// The MAC of `message` into `out`; the inner digest is wiped.
+    fn sign_into(&self, message: &[u8], out: &mut [u8; 20]) {
         let mut inner = self.inner.clone();
         inner.update(message);
+        let mut digest = [0u8; 20];
+        inner.finish_into(&mut digest);
         let mut outer = self.outer.clone();
-        outer.update(&inner.finish());
-        outer.finish()
+        outer.update(&digest);
+        wipe(&mut digest);
+        outer.finish_into(out);
+    }
+
+    #[cfg(test)]
+    fn sign(&self, message: &[u8]) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        self.sign_into(message, &mut out);
+        out
     }
 }
 
@@ -165,17 +190,23 @@ impl Sha1 {
         }
     }
 
-    fn finish(mut self) -> [u8; 20] {
+    /// The digest into `out` (20 bytes); the state is wiped as it drops.
+    fn finish_into(mut self, out: &mut [u8]) {
         let bits = self.length * 8;
         self.update(&[0x80]);
         while self.buffered != 56 {
             self.update(&[0]);
         }
         self.update(&bits.to_be_bytes());
-        let mut out = [0u8; 20];
-        for (chunk, word) in out.chunks_mut(4).zip(self.state) {
+        for (chunk, word) in out.chunks_mut(4).zip(self.state.iter()) {
             chunk.copy_from_slice(&word.to_be_bytes());
         }
+    }
+
+    #[cfg(test)]
+    fn finish(self) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        self.finish_into(&mut out);
         out
     }
 
@@ -286,5 +317,12 @@ mod tests {
         let mut key = [7u8; 4];
         wipe(&mut key);
         assert_eq!(key, [0; 4]);
+        let mut text = String::with_capacity(32);
+        text.push_str("correct horse");
+        let capacity = text.capacity();
+        wipe_string(&mut text);
+        assert_eq!(text.len(), 13);
+        assert!(text.bytes().all(|b| b == 0));
+        assert_eq!(text.capacity(), capacity);
     }
 }
