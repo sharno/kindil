@@ -40,8 +40,13 @@ enum Mode {
     /// restarts Amazon's UI around it
     #[cfg(feature = "kindle")]
     Kindle,
-    /// Print kernel uevents (power button, USB cable) as they arrive
-    Uevents,
+    /// Print kernel uevents (power button, USB cable) as they arrive, with
+    /// every field; after each USB one, the cable, LUN, gadget and mounts
+    Uevents {
+        /// Only the USB cable, controller, gadget and charger
+        #[arg(long)]
+        usb: bool,
+    },
     /// Install the uploaded release bundle, rolling back unless it comes up
     /// (run on the Kindle by `cargo xtask release`)
     Install { id: String },
@@ -168,10 +173,31 @@ fn kindle(cli: &Cli) -> anyhow::Result<Exit> {
     Ok(app.exit())
 }
 
-fn uevents() -> anyhow::Result<()> {
+/// For recording the PW1's USB events by hand (docs/USB-DRIVE-TEST.md).
+fn uevents(usb_only: bool) -> anyhow::Result<()> {
+    use std::io::Write;
     let listener = kindil::uevent::Listener::open()?;
+    let since = std::time::Instant::now();
+    println!("{:>9.3} {}", 0.0, kindil::usb::describe().trim());
     loop {
-        println!("{}", listener.next()?);
+        let event = listener.next()?;
+        let usb = kindil::drive::is_usb(&event);
+        if usb_only && !usb {
+            continue;
+        }
+        let at = since.elapsed().as_secs_f64();
+        println!("{at:>9.3} {event}");
+        if usb {
+            println!(
+                "{:>9} signal={:?}\n{:>9} {}",
+                "",
+                kindil::drive::signal(&event),
+                "",
+                kindil::usb::describe().trim()
+            );
+        }
+        // Piped into tee or a file: every line as it comes.
+        std::io::stdout().flush()?;
     }
 }
 
@@ -201,7 +227,7 @@ fn main() -> std::process::ExitCode {
         Mode::Desktop => desktop(&cli).map(|()| Exit::Quit),
         #[cfg(feature = "kindle")]
         Mode::Kindle => kindle(&cli),
-        Mode::Uevents => uevents().map(|()| Exit::Quit),
+        Mode::Uevents { usb } => uevents(*usb).map(|()| Exit::Quit),
         Mode::Install { id } => kindil::install::install(
             id,
             &kindil::install::Paths::default(),

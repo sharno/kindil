@@ -2,7 +2,8 @@
 //! sleeping on the power button or when idle, dozing between screen updates,
 //! and stepping aside while a computer has the user storage over USB.
 //!
-//! Events arrive from the kernel (power button), volumd (USB drive mode), the
+//! Events arrive from the kernel (power button), volumd or kindil's own USB
+//! drive mode (src/drive.rs), the
 //! minute clock (idle) and kindil's own workers and timers, so this is a
 //! reducer: a pure `step` from (mode, event) to the next mode and the effects
 //! to run. The UI runs the effects.
@@ -69,9 +70,12 @@ pub enum Event {
     Resumed,
     /// The kernel refused to suspend; the device stayed up with the screen asleep.
     SuspendFailed,
-    /// volumd will hand the user storage to a computer in a moment.
+    /// volumd, or kindil's own USB drive mode, will hand the user storage to
+    /// a computer in a moment.
     StorageLeaving,
     Drive(Drive),
+    /// Something to say about USB drive mode run by kindil.
+    DriveNotice(crate::drive::Notice),
     /// The storage has been back since this instant, for [`DRIVE_SETTLE`].
     DriveSettled(Instant),
 }
@@ -151,6 +155,8 @@ pub enum Effect {
     AwaitDrive(Instant),
     /// The user storage is back, possibly changed by the computer.
     StorageBack,
+    /// Show this.
+    DriveNotice(crate::drive::Notice),
 }
 
 /// Why an event changed nothing.
@@ -247,6 +253,14 @@ impl Mode {
             // The sleep screen stays and the light stays off; the next press wakes.
             (M::Asleep(Sleep::Suspended { .. }), E::SuspendFailed) => to(self, []),
             (_, E::StorageLeaving) => to(self, [Effect::ReleaseStorage]),
+            (_, E::DriveNotice(notice)) => to(
+                self,
+                notice
+                    .storage_back()
+                    .then_some(Effect::StorageBack)
+                    .into_iter()
+                    .chain([Effect::DriveNotice(notice)]),
+            ),
             (M::Awake { .. }, E::Drive(Drive::Computer)) => {
                 to(M::UsbDrive, [Effect::ReleaseStorage, Effect::ShowUsbDrive])
             }
@@ -787,6 +801,32 @@ mod tests {
         assert_eq!(never.auto_sleep, AutoSleep::Never);
         let doze: Holder = toml::from_str("auto_sleep = \"doze\"").unwrap();
         assert_eq!(doze.auto_sleep, AutoSleep::Doze);
+    }
+
+    #[test]
+    fn a_refused_export_brings_the_storage_back_in_any_mode() {
+        use crate::drive::{Notice, Refusal};
+        let refused = Notice::Refused(Refusal::Gadget);
+        let (mode, effects) = run(&[
+            (Event::StorageLeaving, 10_000),
+            (Event::DriveNotice(refused), 10_500),
+        ]);
+        assert!(matches!(mode, Mode::Awake { .. }));
+        assert_eq!(
+            effects,
+            [
+                Effect::ReleaseStorage,
+                Effect::StorageBack,
+                Effect::DriveNotice(refused)
+            ]
+        );
+        let (mode, effects) = run(&[
+            (Event::Drive(Drive::Computer), 10_000),
+            (Event::Drive(Drive::Kindle), 20_000),
+            (Event::DriveNotice(Notice::Repaired), 20_100),
+        ]);
+        assert!(matches!(mode, Mode::Returning { .. }));
+        assert_eq!(effects.last(), Some(&Effect::DriveNotice(Notice::Repaired)));
     }
 
     #[test]

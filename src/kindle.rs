@@ -1,6 +1,7 @@
 //! The stock Kindle OS as a [`Host`]: kindil runs as an app on top of Amazon's
 //! kernel and services, never as init, and changes nothing that survives a reboot
-//! except the documented USBNetwork "SSH at boot" flag file.
+//! except the documented USBNetwork "SSH at boot" flag file. USB drive mode is
+//! volumd's, unless switched to kindil's own (src/drive.rs, src/usb.rs).
 use crate::battery::{Battery, Charge};
 use crate::frontlight::Frontlight;
 use crate::host::{
@@ -61,6 +62,8 @@ pub struct KindleHost {
     frontlight: Result<Frontlight, String>,
     net: Arc<Net>,
     networks: Arc<Mutex<Networks>>,
+    /// The UI let go of the user storage (kindil's own USB drive mode).
+    released: Arc<crate::usb::Released>,
 }
 
 impl KindleHost {
@@ -70,6 +73,7 @@ impl KindleHost {
             frontlight: Frontlight::open().map_err(|e| e.to_string()),
             net: Arc::default(),
             networks: Arc::new(Mutex::new(Networks::open(Path::new(networks::PATH)))),
+            released: Arc::default(),
         }
     }
 }
@@ -300,11 +304,8 @@ impl Host for KindleHost {
                 std::thread::sleep(Duration::from_secs(1));
             }
         });
-        std::thread::spawn(move || {
-            if let Err(error) = volumd(|event| deliver(event)) {
-                eprintln!("kindil: USB drive mode: {error}");
-            }
-        });
+        let released = self.released.clone();
+        std::thread::spawn(move || usb_drive(&*deliver, &released));
         let net = self.net.clone();
         let networks = self.networks.clone();
         std::thread::spawn(move || {
@@ -312,6 +313,10 @@ impl Host for KindleHost {
         });
         // kindil's own SSH server (src/ssh.rs), beside USBNetwork's for now.
         crate::ssh::start();
+    }
+
+    fn storage_released(&self) {
+        self.released.notify();
     }
 
     fn suspend(&self) -> anyhow::Result<()> {
@@ -427,6 +432,32 @@ fn power_button(pressed: impl Fn()) -> std::io::Result<()> {
     loop {
         if is_power_button(&listener.next()?) {
             pressed();
+        }
+    }
+}
+
+/// USB drive mode: volumd's, followed, unless the switch gives it to
+/// kindil (src/drive.rs) and the launcher stopped volumd.
+fn usb_drive(deliver: &(dyn Fn(Event) + Send + Sync), released: &crate::usb::Released) {
+    let follow_volumd = || {
+        if let Err(error) = volumd(deliver) {
+            eprintln!("kindil: USB drive mode: {error}");
+        }
+    };
+    match crate::drive::Owner::read(Path::new(crate::drive::SWITCH)) {
+        crate::drive::Owner::Amazon => follow_volumd(),
+        crate::drive::Owner::Kindil => {
+            eprintln!("kindil: USB drive mode is kindil's; waiting for volumd to stop");
+            if !crate::usb::volumd_gone() {
+                eprintln!("kindil: volumd still runs; USB drive mode stays volumd's");
+                return follow_volumd();
+            }
+            loop {
+                if let Err(error) = crate::usb::run_drive(deliver, released) {
+                    eprintln!("kindil: USB drive: {error}; starting again");
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
         }
     }
 }
