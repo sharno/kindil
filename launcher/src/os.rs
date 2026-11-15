@@ -388,6 +388,10 @@ pub mod fake {
         /// At boot: Amazon's UI comes up while the launcher waits, if X
         /// runs to bring it.
         pub gui_coming: Mutex<bool>,
+        /// If set, the first pid file ended records whether this file
+        /// was absent then (the binary not yet copied).
+        pub on_end: Mutex<Option<std::path::PathBuf>>,
+        pub ended_before_copy: Mutex<Option<bool>>,
         /// A started session exits during the boot guard's wait.
         pub dies: Mutex<bool>,
         died: Mutex<bool>,
@@ -480,6 +484,12 @@ pub mod fake {
 
         fn end_pid_file(&self, pid_file: &Path) {
             if pid_file.exists() {
+                if let Some(watch) = &*self.on_end.lock().unwrap() {
+                    self.ended_before_copy
+                        .lock()
+                        .unwrap()
+                        .get_or_insert(!watch.exists());
+                }
                 self.ended.lock().unwrap().push(pid_file.to_owned());
             }
             let _ = std::fs::remove_file(pid_file);

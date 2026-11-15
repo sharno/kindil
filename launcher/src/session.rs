@@ -76,7 +76,7 @@ impl Files {
 
     /// Comparing the 16 MB binaries takes over 10 s at boot. Instead the copy
     /// records its source and has the source's modification time, set before
-    /// it is moved into place: the same source with the same time means the
+    /// the record is written: the same source with the same time means the
     /// copy is current.
     fn current(&self, source: &Path) -> bool {
         std::fs::read_to_string(&self.from).is_ok_and(|from| Path::new(from.trim()) == source)
@@ -84,21 +84,45 @@ impl Files {
             && mtime(source) == mtime(&self.bin)
     }
 
-    /// Through a file beside it and a rename: a crashed run's udhcpc may
-    /// still be running its hook from the old copy.
+    /// In place, never beside: /var/local is 64 MB, mostly Amazon's, with
+    /// room for one copy of kindil, not two. The old copy is unlinked first
+    /// (its space frees once nothing runs it) and the new one written fresh.
+    /// Unlinking, not truncating, also keeps this clear of ETXTBSY, which
+    /// the earlier write-beside-and-rename avoided: nothing runs the old
+    /// copy by then anyway, since kindil has exited and its Wi-Fi children
+    /// (whose udhcpc runs the hook from it) are ended before every pick.
+    /// The record of the source comes last, so a copy cut short (a full
+    /// disk, a power cut) never counts as current; a failed one is removed.
     fn copy(&self, source: &Path) -> std::io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::remove_file(&self.from);
-        let part = self.bin.with_extension("part");
-        std::fs::copy(source, &part)?;
-        let modified = std::fs::metadata(source)?.modified()?;
-        std::fs::File::options()
-            .write(true)
-            .open(&part)?
-            .set_modified(modified)?;
-        std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755))?;
-        std::fs::rename(&part, &self.bin)?;
+        // Left by older launchers, which copied beside.
+        let _ = std::fs::remove_file(self.bin.with_extension("part"));
+        match std::fs::remove_file(&self.bin) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        let written = self.write(source);
+        if written.is_err() {
+            let _ = std::fs::remove_file(&self.bin);
+        }
+        written?;
         std::fs::write(&self.from, format!("{}\n", source.display()))
+    }
+
+    fn write(&self, source: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut from = std::fs::File::open(source)?;
+        let modified = from.metadata()?.modified()?;
+        let mut to = std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&self.bin)?;
+        std::io::copy(&mut from, &mut to)?;
+        to.sync_all()?;
+        to.set_modified(modified)?;
+        // The mode given at creation passes through the umask.
+        to.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o755))
     }
 
     fn drop_trial(&self) {
@@ -130,6 +154,7 @@ pub fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
     // Event watchers an earlier kindil left behind (orphans, now init's);
     // they ignore TERM.
     os.kill_orphaned_watchers();
+    end_wifi_children(paths, os);
     let slot = files.installed.clone();
     files.pick(&slot);
     if !executable(&files.bin) {
@@ -216,11 +241,6 @@ fn run(paths: &Paths, os: &dyn Os, files: &Files, mut slot: PathBuf) {
     };
     let mut crashes: Vec<u64> = Vec::new();
     loop {
-        // kindil's own Wi-Fi children from a run that crashed or was killed:
-        // stopped before it runs again, which starts its Wi-Fi afresh.
-        for pid_file in &paths.wifi_pids {
-            os.end_pid_file(pid_file);
-        }
         log(&os.version(&files.bin).unwrap_or_else(|| "kindil ?".into()));
         let status = os.run(&files.bin, &args);
         log(&format!("kindil exited ({status})"));
@@ -257,7 +277,17 @@ fn run(paths: &Paths, os: &dyn Os, files: &Files, mut slot: PathBuf) {
                 }
             }
         }
+        end_wifi_children(paths, os);
         files.pick(&slot);
+    }
+}
+
+/// kindil's own Wi-Fi children from a run that crashed or was killed:
+/// stopped before it runs again, which starts its Wi-Fi afresh, and before
+/// its binary is replaced, which udhcpc runs as its hook.
+fn end_wifi_children(paths: &Paths, os: &dyn Os) {
+    for pid_file in &paths.wifi_pids {
+        os.end_pid_file(pid_file);
     }
 }
 
@@ -591,6 +621,49 @@ mod tests {
             .unwrap();
         env.session(&Fake::default());
         assert_eq!(env.running(), "kindil 1.1.0");
+    }
+
+    #[test]
+    fn a_failed_copy_leaves_nothing_behind_and_isnt_current() {
+        let env = Env::new();
+        let files = Files::new(&env.paths);
+        env.fake(&env.ext("kindil"), "1.0.0", "exit 0");
+        files.copy(&env.ext("kindil")).unwrap();
+        assert!(files.current(&env.ext("kindil")));
+        // A directory opens but won't read: the copy fails once begun.
+        let broken = env.ext("broken");
+        std::fs::create_dir(&broken).unwrap();
+        assert!(files.copy(&broken).is_err());
+        assert!(!files.bin.exists() && !files.from.exists());
+        assert!(!env.paths.run.join("kindil.part").exists());
+        assert!(!files.current(&broken) && !files.current(&env.ext("kindil")));
+        // The next pick copies afresh.
+        files.pick(&env.ext("kindil"));
+        assert_eq!(env.running(), "kindil 1.0.0");
+    }
+
+    #[test]
+    fn a_copy_left_beside_by_an_older_launcher_goes() {
+        let env = Env::new();
+        let part = env.paths.run.join("kindil.part");
+        std::fs::write(&part, "half a binary").unwrap();
+        env.fake(&env.ext("kindil"), "1.0.0", "exit 0");
+        env.session(&Fake::default());
+        assert!(!part.exists());
+        assert_eq!(env.running(), "kindil 1.0.0");
+    }
+
+    #[test]
+    fn the_wifi_children_end_before_the_binary_they_run_is_replaced() {
+        let env = Env::new();
+        let wpa = &env.paths.wifi_pids[1];
+        std::fs::write(wpa, "9\n").unwrap();
+        env.fake(&env.ext("kindil"), "1.0.0", "exit 0");
+        let os = Fake::default();
+        // Records whether the binary was there when the children ended.
+        *os.on_end.lock().unwrap() = Some(env.paths.run.join("kindil"));
+        env.session(&os);
+        assert_eq!(*os.ended_before_copy.lock().unwrap(), Some(true));
     }
 
     #[test]
