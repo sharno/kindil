@@ -33,8 +33,8 @@ P='export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin;'
 - **Proof:** 2 minutes after applying, if upstart still knows the
   `framework` job, the counter file is deleted (`overlays proven` in the
   log). If not, the overlays are unbound, upstart reloads, and the boot
-  stays counted. At 2 the overlays are skipped (`2 boots with overlays
-  weren't proven; skipping them`) until the counter file is deleted.
+  stays counted. After one unproven boot the overlays are skipped (`the last boot with overlays
+  wasn't proven; skipping them`) until the counter file is deleted.
 - **The replacement** differs from Amazon's only in the permissions loop
   in `script`: `/var/local/kindil` is left out of `chgrp -R javausers`,
   `chmod -R g=u` and the setgid on directories; everything else gets

@@ -19,8 +19,11 @@ use crate::Paths;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-/// Boots in a row that applied overlays and weren't proven.
-pub const LIMIT: u32 = 2;
+/// Boots in a row that applied overlays and weren't proven. One: Amazon's
+/// own monitor shows its customer-service screen after two boots whose UI
+/// keeps failing, so a boot an overlay may have broken is followed by a
+/// stock one.
+pub const LIMIT: u32 = 1;
 
 pub struct Overlay {
     /// The file it replaces, from /.
@@ -112,7 +115,7 @@ pub fn apply(
     let tries = tries(paths);
     if tries >= LIMIT {
         log(format!(
-            "{LIMIT} boots with overlays weren't proven; skipping them \
+            "the last boot with overlays wasn't proven; skipping them \
              (delete {} to reset)",
             tries_file(paths).display()
         ));
@@ -346,10 +349,8 @@ mod tests {
     #[test]
     fn a_proven_boot_clears_the_count() {
         let mut env = Env::new();
-        std::fs::create_dir_all(&env.paths.run).unwrap();
-        std::fs::write(env.paths.run.join("overlay-tries"), "1\n").unwrap();
         let applied = env.apply().unwrap();
-        assert_eq!(env.tries(), 2);
+        assert_eq!(env.tries(), 1);
         env.prove(&applied);
         assert_eq!(env.tries(), 0);
         assert!(!env.paths.run.join("overlay-tries").exists());
