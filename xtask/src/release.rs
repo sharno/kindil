@@ -99,6 +99,12 @@ pub fn bundle(launcher: &[u8], binary: &[u8]) -> anyhow::Result<(Vec<u8>, String
     out.mode(tar::HeaderMode::Deterministic);
     for entry in tar::Archive::new(launcher).entries()? {
         let mut entry = entry?;
+        // Files only: unpacking makes their directories, and git archive's
+        // directory entries would include `kindle/` itself, empty once
+        // stripped.
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
         let path = entry.path()?.into_owned();
         let Ok(inside) = path.strip_prefix("kindle") else {
             continue;
@@ -237,6 +243,14 @@ mod tests {
 
     fn launcher() -> Vec<u8> {
         let mut out = tar::Builder::new(Vec::new());
+        // Directory entries, as git archive writes them.
+        for dir in ["kindle/", "kindle/extensions/", "kindle/extensions/kindil/"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(0o755);
+            out.append_data(&mut header, dir, std::io::empty()).unwrap();
+        }
         for (path, body) in [
             ("kindle/extensions/kindil/menu.json", "{}"),
             ("kindle/extensions/kindil/bin/start.sh", "#!/bin/sh\n"),
