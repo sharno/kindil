@@ -62,9 +62,8 @@ and a reboot always returns the Kindle to stock.
     a nap. None of Amazon's Wi-Fi services run while kindil does; on a
     first run it starts with no networks, ready to join one.
   - **SSH of its own**: kindil carries kindil-sshd (`sshd/`, Rust, on
-    russh with pure-Rust crypto) and runs it as its child on port 2222 for
-    now, beside USBNetwork's on 22: keys only (ed25519, RSA), commands and
-    shells. Its trusted keys are its own list in `/var/local/kindil/ssh/`,
+    russh) and runs it as its child on port 2222 for now, beside
+    USBNetwork's on 22: keys only (ed25519, RSA), commands and shells. Its trusted keys are its own list in `/var/local/kindil/ssh/`,
     which USBNetwork's `usbnet/etc/authorized_keys` seeds on the first start
     only: keys added on the USB storage later (anyone with the Kindle on a
     cable can) show in Settings → Remote access with their fingerprints, to
@@ -287,7 +286,6 @@ someone nearby to press the power button, or must end on their own first.
 | `ghosting.rs` | When to flash the panel |
 | `launcher.rs` | Writes out the launcher kindil carries, once it has run two minutes |
 | `vendor/slint-backend-kindle` | Display/touch backend, patched for full refresh |
-| `vendor/russh` | russh 0.65.1 with a pure-Rust AEAD backend (see its `KINDIL.md`) |
 | `sshd/` | kindil-sshd, its own small crate: keys-only SSH server (exec, shells on a pty) |
 | `launcher/` | The launcher, its own small crate: the session around kindil (Amazon's UI and services aside, crash restart, update trial, restore) and the boot guard |
 

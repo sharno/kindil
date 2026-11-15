@@ -10,24 +10,19 @@ license = "MIT"
 name = "kindil-sshd"
 path = "src/main.rs"
 
-# Small on purpose: russh's server, tokio on one thread, and libc for the
-# pseudo-terminal. Pure Rust: russh's AEADs on RustCrypto (vendor/russh's
-# `rustcrypto` feature), so no ring, aws-lc or OpenSSL, and no C at all.
+# Small on purpose: russh's server (upstream, with its ring backend; ring's
+# C is built by the same cross compiler as kindil's), tokio on one thread,
+# and libc for the pseudo-terminal.
 [dependencies]
 bytes = "1"
 # 0.4, like russh's: on musl it falls back to /dev/urandom when the kernel
 # has no getrandom() (the PW1's 2.6.31).
 getrandom = "0.4"
 libc = "0.2"
-russh = { version = "0.65.1", default-features = false, features = ["rustcrypto", "rsa"] }
+russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }
 tokio = { version = "1", features = ["rt", "net", "io-util", "process", "time", "sync", "macros"] }
 
 [dev-dependencies]
 tempfile = "3.27"
 libc = "0.2"
 
-# The AEADs russh uses here (vendor/russh's RustCrypto backend) are tested
-# against ring's. Tests only, and not for the Kindle's ARM: nothing of ring
-# (or C) in kindil-sshd itself.
-[target.'cfg(not(target_arch = "arm"))'.dev-dependencies]
-ring = "0.17"

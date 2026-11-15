@@ -61,8 +61,6 @@ slint-build = "=1.18.1"
 # Vendored to add request_full_refresh() for ghosting control; upstream candidate.
 [patch.crates-io]
 slint-backend-kindle = { path = "vendor/slint-backend-kindle" }
-# Vendored to add a pure-Rust (RustCrypto) AEAD backend: no ring, no aws-lc-rs.
-russh = { path = "vendor/russh" }
 
 [profile.release]
 # Speed over size: the binary is a few MB either way, and page turns matter more.
