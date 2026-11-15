@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 
 const REPO: &str = "sharno/kindil";
 const DEPLOY: &str = "/mnt/us/kindil-deploy";
+const LOG: &str = "/var/local/kindil/deploy.log";
+/// How long `kindil install` gets to show it runs: a line in the log, or
+/// still running.
+const LAUNCH: Duration = Duration::from_secs(30);
 
 /// A release's binary, its signature checked.
 pub struct Binary {
@@ -186,17 +190,24 @@ pub fn install(
     ))?;
     let paths: Vec<&Path> = files.iter().map(|p| p.as_path()).collect();
     device.put(&paths, DEPLOY)?;
-    device.run(&format!(
-        "chmod 755 {DEPLOY}/kindil.install && \
-         setsid {DEPLOY}/kindil.install install {id} </dev/null >>/var/local/kindil/deploy.log 2>&1 &"
+    // The log's directory first: on a Kindle kindil never ran on, the
+    // redirect would fail and the install never start.
+    let launched = device.run(&format!(
+        "mkdir -p /var/local/kindil && chmod 755 {DEPLOY}/kindil.install && \
+         {{ setsid {DEPLOY}/kindil.install install {id} </dev/null >>{LOG} 2>&1 & \
+         echo \"launched $!\"; }}"
     ))?;
+    let pid = launched
+        .lines()
+        .find_map(|line| line.strip_prefix("launched "))
+        .and_then(|pid| pid.trim().parse::<u32>().ok())
+        .with_context(|| format!("couldn't launch kindil install on the Kindle: {launched}"))?;
+    started(&device, &id, pid)?;
     println!("installing v{} (run {id})", new.version);
     // The Kindle drops off the network while kindil restarts: keep asking.
     let since = Instant::now();
     while since.elapsed() < Duration::from_secs(15 * 60) {
-        if let Ok(log) = device.run(&format!(
-            "grep 'install {id}: ' /var/local/kindil/deploy.log"
-        )) {
+        if let Ok(log) = device.run(&format!("grep 'install {id}: ' {LOG}")) {
             match outcome(&log, &id) {
                 Some(Ok(summary)) => {
                     println!("{summary}");
@@ -209,6 +220,47 @@ pub fn install(
         std::thread::sleep(Duration::from_secs(10));
     }
     bail!("no outcome after 15 minutes; see /var/local/kindil/deploy.log on the Kindle")
+}
+
+/// Whether install `id` got going, from its lines in the log and, after
+/// them, "alive" or "gone" for its process: Ok(true) if it did, Ok(false)
+/// if it can't be told yet, Err with what it said if it ended first.
+pub fn launch(said: &str, id: &str) -> Result<bool, String> {
+    let prefix = format!("install {id}: ");
+    if said.lines().any(|line| line.contains(&prefix)) {
+        return Ok(true);
+    }
+    if said.lines().any(|line| line.trim() == "gone") {
+        let said: Vec<&str> = said.lines().filter(|l| l.trim() != "gone").collect();
+        return Err(said.join("\n"));
+    }
+    Ok(false)
+}
+
+/// Waits up to LAUNCH for install `id` (process `pid`) to log a line, and
+/// fails at once if it exits without one: a binary that won't run on the
+/// Kindle, a full disk.
+fn started(device: &Device, id: &str, pid: u32) -> anyhow::Result<()> {
+    let since = Instant::now();
+    loop {
+        // The log after the process check: a line written as it exits is
+        // still seen.
+        let said = device.run(&format!(
+            "if kill -0 {pid} 2>/dev/null; then s=alive; else s=gone; fi; \
+             grep 'install {id}: ' {LOG} || tail -n 5 {LOG} 2>/dev/null; echo $s"
+        ))?;
+        match launch(&said, id) {
+            Ok(true) => return Ok(()),
+            Err(said) => bail!("kindil install {id} exited at once; the log ends:\n{said}"),
+            Ok(false) if since.elapsed() >= LAUNCH => {
+                // Still running: the backup of a large extension can take a
+                // while on the PW1.
+                println!("kindil install {id} runs but hasn't logged yet");
+                return Ok(());
+            }
+            Ok(false) => std::thread::sleep(Duration::from_secs(2)),
+        }
+    }
 }
 
 fn tempdir() -> anyhow::Result<std::path::PathBuf> {
@@ -303,6 +355,28 @@ mod tests {
         );
         // The same inputs, the same bundle.
         assert_eq!(super::bundle(&launcher(), b"the release").unwrap().1, sum);
+    }
+
+    #[test]
+    fn tells_whether_the_install_got_going() {
+        assert_eq!(launch("alive\n", "7"), Ok(false), "too early to tell");
+        assert_eq!(
+            launch(
+                "2026-11-15 00:12:25 install 7: installing kindil 0.9.1\ngone\n",
+                "7"
+            ),
+            Ok(true),
+            "it said something: the outcome tells the rest"
+        );
+        assert_eq!(
+            launch("sh: kindil.install: not found\ngone\n", "7"),
+            Err("sh: kindil.install: not found".into())
+        );
+        assert_eq!(
+            launch("x install 6: done: kindil 0.9.0\ngone\n", "7"),
+            Err("x install 6: done: kindil 0.9.0".into()),
+            "another run's lines don't count"
+        );
     }
 
     #[test]
