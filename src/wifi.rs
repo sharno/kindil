@@ -34,18 +34,28 @@ impl Ssid {
     }
 }
 
-/// WPA2 passphrase: 8..=63 printable ASCII characters. Never logged.
+/// WPA2 passphrase: 8..=63 printable ASCII characters. Never logged;
+/// every copy is wiped when dropped (src/pmk.rs).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Passphrase(String);
 
 impl TryFrom<String> for Passphrase {
     type Error = &'static str;
-    fn try_from(value: String) -> Result<Self, Self::Error> {
+    fn try_from(mut value: String) -> Result<Self, Self::Error> {
         let printable = value.bytes().all(|b| (32..127).contains(&b));
         match value.len() {
             8..=63 if printable => Ok(Self(value)),
-            _ => Err("password must be 8–63 printable ASCII characters"),
+            _ => {
+                crate::pmk::wipe_string(&mut value);
+                Err("password must be 8–63 printable ASCII characters")
+            }
         }
+    }
+}
+
+impl Drop for Passphrase {
+    fn drop(&mut self) {
+        crate::pmk::wipe_string(&mut self.0);
     }
 }
 
@@ -71,8 +81,14 @@ impl Credentials {
     }
 
     /// An empty password means an open network.
-    pub fn parse(ssid: String, password: String) -> Result<Self, &'static str> {
-        let ssid = Ssid::try_from(ssid)?;
+    pub fn parse(ssid: String, mut password: String) -> Result<Self, &'static str> {
+        let ssid = match Ssid::try_from(ssid) {
+            Ok(ssid) => ssid,
+            Err(error) => {
+                crate::pmk::wipe_string(&mut password);
+                return Err(error);
+            }
+        };
         if password.is_empty() {
             Ok(Self::Open(ssid))
         } else {
@@ -232,6 +248,8 @@ impl Wpa {
         let result = settings
             .iter()
             .try_for_each(|command| self.command(command).map(drop));
+        // The psk command holds the passphrase.
+        settings.iter_mut().for_each(crate::pmk::wipe_string);
         if let Err(error) = result {
             let _ = self.command(&format!("REMOVE_NETWORK {id}"));
             return Err(error);

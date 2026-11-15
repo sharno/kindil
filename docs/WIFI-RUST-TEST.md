@@ -26,12 +26,15 @@ driver's profile under the keeper.
   preferred saved network in range, and joins with "essid off", the WPA2
   profile (SIOCSIWAUTH), the PMK (SIOCSIWENCODEEXT, alg 4) and the ESSID. The
   firmware does the 4-way handshake. udhcpc and the kindil-dhcp hook are the
-  same as before; a join counts only once a lease comes after it (within
-  15 s of associating: the hook stamps `/var/run/kindil-lease`), since a
-  wrong password can associate for a few seconds but gets no DHCP through.
-  Joining another network releases the old lease first (SIGUSR2), the same
-  network renews it (SIGUSR1). Settings' scans are done by the keeper
-  between joins, never during one. It checks the access point (SIOCGIWAP) every 3 s; on a loss
+  same programs as before, but a join counts only once a lease comes after
+  it, within 15 s of associating, since a wrong password can associate for
+  a few seconds but gets no DHCP through. For a new network (and a first
+  join) kindil restarts udhcpc; the same network's lease is renewed by the
+  udhcpc that holds it (SIGUSR1). The hook leaves a marker per udhcpc,
+  `/var/run/kindil-lease.PID` (`bound|renew IP NANOS`), and only the
+  running udhcpc's marker counts, with that IP on wlan0, while still on
+  the same access point. Settings' scans are done by the keeper between
+  joins, never during one. It checks the access point (SIOCGIWAP) every 3 s; on a loss
   it gives the firmware 10 s to rejoin by itself, then joins again (PMK
   again), with pauses doubling from 2 s to a minute between failed tries.
   After a suspend it joins the same network again straight away.
@@ -43,8 +46,14 @@ driver's profile under the keeper.
   in range (associating without an address counts as failing), a refused saved network in range, or 3 driver errors in
   a row: it logs `kindil's own Wi-Fi gives up (...)`, disassociates, turns
   the ESSID off and starts wpa_supplicant with the saved networks for the
-  rest of this run (until kindil restarts). A saved network out of sight
-  (maybe hidden) is tried blind, and never makes it fall back.
+  rest of this run (until kindil restarts). If its start fails, it is
+  tried again with growing pauses until it comes up or Wi-Fi is switched
+  off or on. Saved networks out of sight (out of range, or hidden) are
+  tried unseen in turn, each first with a CCMP group and then TKIP (or as
+  it was last seen); once every saved network has failed unseen twice
+  (about 2 minutes away from all of them) it falls back too. Leaving it
+  resets the driver's profile (ESSID off, WPA off) even if the
+  disassociation fails. Forgetting the network it is on leaves it.
 - **The launcher** is unchanged: udhcpc's pid file still tells it kindil
   ran Wi-Fi. When kindil exits, wifid starts Amazon's wpa_supplicant, which
   resets the driver's profile itself.
@@ -79,6 +88,8 @@ sleep 25
    Expect within 30 s: the "kindil's own" log line, `joined NAME`, and
    - `pidof wpa_supplicant` empty (Amazon's included);
    - `cat /var/run/kindil-udhcpc.pid` alive;
+   - `cat /var/run/kindil-lease.$(cat /var/run/kindil-udhcpc.pid)`: `bound`
+     and the address `ifconfig wlan0` shows;
    - `cat /proc/net/wireless` status 0001 or so, level above 0;
    - `ifconfig wlan0` with the lease's address; `route -n` default via the
      router; `cat /etc/resolv.conf` the name servers;
@@ -111,13 +122,14 @@ sleep 25
    internet. The lifeline can't help while it dozes: stay nearby.
 6. **The access point dropping it.** Without the owner, options from
    least to most invasive:
-   - out of range: carry the Kindle away until the bars go, then back.
-     Expect `lost the access point`, then `joined NAME` within a minute of
-     coming back (blind tries back off to a minute at most);
+   - out of range: carry the Kindle away until the bars go, then back
+     within a minute. Expect `lost the access point`, then `joined NAME`
+     soon after coming back. Away for longer (every saved network failing
+     unseen twice, about 2 minutes), it falls back to wpa_supplicant for
+     the run: expected;
    - the router's client list: block or kick the Kindle's MAC for a minute;
    - a phone hotspot as the only saved network, switched off and on.
-   Expect no "gives up" line for the out-of-range case: only in range with
-   tries failing does it fall back.
+   Expect no "gives up" line for a short absence.
 7. **One hour hold.** Leave it on, Sleep when idle Never, plugged in, for
    an hour, pinging the router every minute from the Kindle
    (`while sleep 60; do ping -c1 -W5 ROUTER >/dev/null && echo ok || echo LOST; done`)

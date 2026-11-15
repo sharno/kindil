@@ -66,6 +66,8 @@ const SCAN_FRESH: Duration = Duration::from_secs(120);
 /// How long a Settings scan waits for kindil's own Wi-Fi's keeper, which
 /// scans between joins (a join and its lease take up to about 30 s).
 const SCAN_LIMIT: Duration = Duration::from_secs(60);
+/// How often udhcpc's supervisor looks whether it still runs.
+const DHCP_POLL: Duration = Duration::from_millis(500);
 
 /// A scan's access points, or why it failed.
 type Scanned = Result<Vec<Bss>, String>;
@@ -118,8 +120,10 @@ pub struct Net {
     /// kindil's own Wi-Fi's last scan, when, and how many so far.
     seen: Mutex<Option<(Instant, Scanned)>>,
     scans: AtomicU64,
-    /// The network udhcpc's lease was last asked for.
-    lease_for: Mutex<Option<String>>,
+    /// The udhcpc that holds a network's lease, as proven by its hook.
+    lease_for: Mutex<Option<(u32, String)>>,
+    /// The running udhcpc, and since when.
+    dhcp: Mutex<Option<(Child, Instant)>>,
 }
 
 impl Default for Net {
@@ -137,6 +141,7 @@ impl Default for Net {
             seen: Mutex::new(None),
             scans: AtomicU64::new(0),
             lease_for: Mutex::new(None),
+            dhcp: Mutex::new(None),
         }
     }
 }
@@ -358,7 +363,7 @@ impl Net {
             .and_then(|(_, seen)| seen.as_ref().ok().cloned());
         let seen = match recent {
             Some(seen) => seen,
-            None => match station::scan(&socket, &std::thread::sleep) {
+            None => match station::scan(&socket, &crate::dhcp::monotonic, &std::thread::sleep) {
                 Ok(seen) => seen,
                 Err(error) => {
                     self.fall_back(&format!("scanning: {error}"));
@@ -367,7 +372,9 @@ impl Net {
             },
         };
         let target = match station::choose(std::slice::from_ref(credentials), &seen) {
-            station::Choice::Join(target) | station::Choice::Blind(target) => target,
+            station::Choice::Join(target) => target,
+            // Unseen (hidden, maybe): the usual WPA2 with CCMP.
+            station::Choice::Unseen => station::Target::blind(credentials, wext::Cipher::Ccmp),
             station::Choice::Unsupported { ssid, why } => anyhow::bail!(
                 "can't join {ssid}: {why} (remove {} to use wpa_supplicant)",
                 station::SWITCH
@@ -376,7 +383,7 @@ impl Net {
         };
         let joined = station::join(
             &socket,
-            &**self,
+            &Locked(self),
             &target,
             TRY_WAIT,
             &crate::dhcp::monotonic,
@@ -409,8 +416,32 @@ impl Net {
         self.fell_back.store(true, Ordering::SeqCst);
         let saved = lock(&self.saved).clone();
         if let Err(error) = self.start(&saved) {
-            eprintln!("kindil: Wi-Fi with wpa_supplicant: {error}");
+            eprintln!("kindil: Wi-Fi with wpa_supplicant: {error}; trying again");
+            self.keep_starting();
         }
+    }
+
+    /// After a failed start of the fallback: starts again, with growing
+    /// pauses, until it comes up, or Wi-Fi is switched off or started anew
+    /// meanwhile (a newer generation).
+    fn keep_starting(self: &Arc<Self>) {
+        let net = Arc::clone(self);
+        let mut generation = self.generation.load(Ordering::SeqCst);
+        std::thread::spawn(move || {
+            retry_start(&std::thread::sleep, &mut || {
+                let _transition = lock(&net.lifecycle);
+                if net.generation.load(Ordering::SeqCst) != generation
+                    || Net::wanted() == Power::Off
+                {
+                    return None;
+                }
+                let saved = lock(&net.saved).clone();
+                let started = net.start(&saved);
+                // A failed start stopped its stack: the next generation.
+                generation = net.generation.load(Ordering::SeqCst);
+                Some(started)
+            });
+        });
     }
 
     /// Wakes the keeper; a resume outranks a change of networks.
@@ -466,7 +497,7 @@ impl Net {
                 std::thread::spawn(move || station::keep(&keep));
             }
         }
-        self.supervise("udhcpc", generation, |_| spawn_dhcp())?;
+        self.supervise_dhcp(generation)?;
         *lock(&self.power) = Power::On;
         Ok(())
     }
@@ -538,6 +569,118 @@ impl Net {
         Ok(())
     }
 
+    /// udhcpc, as a child polled every half second rather than waited on,
+    /// so kindil's own Wi-Fi can replace it ([`Net::restart_dhcp`]): started
+    /// again whenever it exits unasked while this stack (`generation`) is
+    /// wanted, as [`Net::supervise`] does.
+    fn supervise_dhcp(self: &Arc<Self>, generation: u64) -> anyhow::Result<()> {
+        *lock(&self.dhcp) = Some((spawn_dhcp()?, Instant::now()));
+        let net = Arc::clone(self);
+        std::thread::spawn(move || {
+            let wanted = |net: &Net| net.generation.load(Ordering::SeqCst) == generation;
+            let mut pause = PAUSE_MIN;
+            loop {
+                std::thread::sleep(DHCP_POLL);
+                if !wanted(&net) {
+                    return;
+                }
+                let exited = match lock(&net.dhcp).as_mut() {
+                    Some((child, since)) => child
+                        .try_wait()
+                        .ok()
+                        .flatten()
+                        .map(|status| (status, since.elapsed())),
+                    None => None,
+                };
+                let Some((status, lived)) = exited else {
+                    continue;
+                };
+                pause = if lived >= HEALTHY {
+                    PAUSE_MIN
+                } else {
+                    (pause * 2).min(PAUSE_MAX)
+                };
+                eprintln!("kindil: udhcpc exited ({status}); starting it again in {pause:?}");
+                loop {
+                    std::thread::sleep(pause);
+                    let _transition = lock(&net.lifecycle);
+                    if !wanted(&net) {
+                        return;
+                    }
+                    let mut slot = lock(&net.dhcp);
+                    // Replaced meanwhile by kindil's own Wi-Fi.
+                    if slot
+                        .as_mut()
+                        .is_some_and(|(child, _)| matches!(child.try_wait(), Ok(None)))
+                    {
+                        break;
+                    }
+                    match spawn_dhcp() {
+                        Ok(child) => {
+                            *slot = Some((child, Instant::now()));
+                            break;
+                        }
+                        Err(error) => {
+                            eprintln!("kindil: udhcpc: {error}");
+                            pause = (pause * 2).min(PAUSE_MAX);
+                        }
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// The running udhcpc's pid.
+    fn dhcp_pid(&self) -> Option<u32> {
+        let mut slot = lock(&self.dhcp);
+        let (child, _) = slot.as_mut()?;
+        matches!(child.try_wait(), Ok(None)).then(|| child.id())
+    }
+
+    /// A fresh udhcpc in place of the running one (ended and waited for
+    /// first), under the current generation; its pid. `lifecycle` held.
+    fn restart_dhcp(&self) -> anyhow::Result<u32> {
+        let mut slot = lock(&self.dhcp);
+        if let Some((mut child, _)) = slot.take() {
+            end(&mut child);
+        }
+        let _ = std::fs::remove_file(DHCP_PID);
+        let child = spawn_dhcp()?;
+        let pid = child.id();
+        *slot = Some((child, Instant::now()));
+        crate::dhcp::clear_markers(Some(pid));
+        Ok(pid)
+    }
+
+    /// For kindil's own Wi-Fi, `lifecycle` held: a lease for `ssid`, by the
+    /// udhcpc that holds it renewing, or else by a fresh udhcpc.
+    fn ask_lease(&self, ssid: &str) -> anyhow::Result<station::Ticket> {
+        let since = crate::dhcp::monotonic();
+        let pid = self.dhcp_pid();
+        let held = lock(&self.lease_for).clone();
+        if let (Some(pid), Some((holder, network))) = (pid, held) {
+            // SAFETY: plain kill(2) on kindil's own udhcpc child.
+            if holder == pid
+                && network == ssid
+                && unsafe { libc::kill(pid as i32, libc::SIGUSR1) } == 0
+            {
+                return Ok(station::Ticket {
+                    pid,
+                    since,
+                    renew: true,
+                });
+            }
+        }
+        *lock(&self.lease_for) = None;
+        let pid = self.restart_dhcp()?;
+        Ok(station::Ticket {
+            pid,
+            since,
+            renew: false,
+        })
+    }
+
     /// kindil's stack down; never fails halfway into a state On can't
     /// recover from.
     fn stop(&self) {
@@ -545,6 +688,10 @@ impl Net {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.kicked.notify_all();
         *lock(&self.power) = Power::Off;
+        if let Some((mut child, _)) = lock(&self.dhcp).take() {
+            end(&mut child);
+        }
+        *lock(&self.lease_for) = None;
         terminate(DHCP_PID);
         terminate(WPA_PID);
         if self.backend() == Backend::Kindil {
@@ -586,6 +733,13 @@ impl Keep {
     fn wanted(&self) -> bool {
         self.net.generation.load(Ordering::SeqCst) == self.generation
     }
+
+    /// `f` under the lifecycle lock, while this keeper's stack is the one
+    /// running.
+    fn guarded<R>(&self, f: impl FnOnce(&Arc<Net>) -> R) -> Option<R> {
+        let _transition = lock(&self.net.lifecycle);
+        self.wanted().then(|| f(&self.net))
+    }
 }
 
 impl station::Context for Keep {
@@ -608,6 +762,10 @@ impl station::Context for Keep {
                 kicks.rejoin.is_none() && !kicks.scan && self.wanted()
             })
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A newer stack's kicks are its keeper's.
+        if !self.wanted() {
+            return None;
+        }
         if std::mem::take(&mut pending.scan) {
             return Some(Kick::Scan);
         }
@@ -619,58 +777,101 @@ impl station::Context for Keep {
         if !self.wanted() {
             return None;
         }
-        let saved = lock(&self.net.saved).clone();
+        // Borrowed, not copied: no passphrase copies per poll.
+        let saved = lock(&self.net.saved);
         Some(f(&self.socket, &saved))
     }
 
-    fn joined(&self, _ssid: &str) {
-        self.net.joins.fetch_add(1, Ordering::SeqCst);
+    fn joined(&self, _ssid: &str) -> Option<()> {
+        self.guarded(|net| {
+            net.joins.fetch_add(1, Ordering::SeqCst);
+        })
     }
 
-    fn scanned(&self, result: Result<Vec<Bss>, String>) {
-        *lock(&self.net.seen) = Some((Instant::now(), result));
-        self.net.scans.fetch_add(1, Ordering::SeqCst);
+    fn scanned(&self, result: Result<Vec<Bss>, String>) -> Option<()> {
+        self.guarded(|net| {
+            *lock(&net.seen) = Some((Instant::now(), result));
+            net.scans.fetch_add(1, Ordering::SeqCst);
+        })
     }
 
     fn fall_back(&self, why: &str) {
-        let _transition = lock(&self.net.lifecycle);
-        if self.wanted() {
-            self.net.fall_back(why);
-        }
+        self.guarded(|net| net.fall_back(why));
     }
 }
 
 impl station::Dhcp for Keep {
-    fn ask(&self, ssid: &str) {
-        self.net.ask(ssid);
+    fn ask(&self, ssid: &str) -> Option<Result<station::Ticket, String>> {
+        self.guarded(|net| net.ask_lease(ssid).map_err(|e| format!("{e:#}")))
     }
 
-    fn leased(&self) -> Option<Duration> {
-        self.net.leased()
+    fn marker(&self, pid: u32) -> Option<crate::dhcp::Marker> {
+        crate::dhcp::marker(pid)
+    }
+
+    fn address(&self) -> Option<std::net::Ipv4Addr> {
+        self.socket.ipv4()
+    }
+
+    fn proven(&self, ticket: &station::Ticket, ssid: &str) -> Option<()> {
+        self.guarded(|net| *lock(&net.lease_for) = Some((ticket.pid, ssid.to_owned())))
     }
 }
 
-/// udhcpc for kindil's own Wi-Fi.
-impl station::Dhcp for Net {
-    fn ask(&self, ssid: &str) {
-        let mut lease_for = lock(&self.lease_for);
-        if lease_for.as_deref() != Some(ssid) {
-            // Another network: its server won't renew the old lease.
-            if let Err(error) = signal_dhcp(libc::SIGUSR2) {
-                eprintln!("kindil: Wi-Fi: releasing the address: {error}");
-            }
-            *lease_for = Some(ssid.to_owned());
-        }
-        if let Err(error) = renew_dhcp() {
-            eprintln!("kindil: Wi-Fi: renewing the address: {error}");
-        }
+/// udhcpc for a Settings join, which holds `lifecycle` throughout.
+struct Locked<'a>(&'a Net);
+
+impl station::Dhcp for Locked<'_> {
+    fn ask(&self, ssid: &str) -> Option<Result<station::Ticket, String>> {
+        Some(self.0.ask_lease(ssid).map_err(|e| format!("{e:#}")))
     }
 
-    fn leased(&self) -> Option<Duration> {
-        let socket = wext::Socket::open(INTERFACE).ok()?;
-        socket.ipv4()?;
-        crate::dhcp::leased()
+    fn marker(&self, pid: u32) -> Option<crate::dhcp::Marker> {
+        crate::dhcp::marker(pid)
     }
+
+    fn address(&self) -> Option<std::net::Ipv4Addr> {
+        wext::Socket::open(INTERFACE).ok()?.ipv4()
+    }
+
+    fn proven(&self, ticket: &station::Ticket, ssid: &str) -> Option<()> {
+        *lock(&self.0.lease_for) = Some((ticket.pid, ssid.to_owned()));
+        Some(())
+    }
+}
+
+/// Tries `attempt` after each pause (2 s, doubling to a minute) until it
+/// succeeds (true) or answers `None`: cancelled (false).
+fn retry_start(
+    sleep: &dyn Fn(Duration),
+    attempt: &mut dyn FnMut() -> Option<anyhow::Result<()>>,
+) -> bool {
+    let mut backoff = station::Backoff::default();
+    loop {
+        sleep(backoff.pause());
+        match attempt() {
+            None => return false,
+            Some(Ok(())) => return true,
+            Some(Err(error)) => {
+                eprintln!("kindil: Wi-Fi with wpa_supplicant: {error}; trying again")
+            }
+        }
+    }
+}
+
+/// Ends a child: TERM, then KILL after a few seconds; reaped either way.
+fn end(child: &mut Child) {
+    // SAFETY: plain kill(2) on kindil's own child.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let since = Instant::now();
+    while since.elapsed() < Duration::from_secs(3) {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// kindil's own Wi-Fi's link: the driver's access point and ESSID, the
@@ -865,16 +1066,11 @@ fn spawn_dhcp() -> anyhow::Result<Child> {
 
 /// Asks udhcpc to renew the lease now; it was kept through a nap.
 fn renew_dhcp() -> anyhow::Result<()> {
-    signal_dhcp(libc::SIGUSR1)
-}
-
-/// SIGUSR1 renews, SIGUSR2 releases the lease.
-fn signal_dhcp(signal: i32) -> anyhow::Result<()> {
     let pid = pid(DHCP_PID)
         .filter(|&pid| alive(pid))
         .ok_or_else(|| anyhow::anyhow!("udhcpc isn't running"))?;
     // SAFETY: plain kill(2) on udhcpc's own pid.
-    unsafe { libc::kill(pid, signal) };
+    unsafe { libc::kill(pid, libc::SIGUSR1) };
     Ok(())
 }
 
@@ -941,5 +1137,111 @@ mod tests {
         assert_eq!(backend(Some("kindil\n"), false), Backend::Kindil);
         assert_eq!(backend(Some("kindil\n"), true), Backend::Supplicant);
         assert_eq!(backend(Some("wpa\n"), false), Backend::Supplicant);
+    }
+
+    fn keeper(net: &Arc<Net>) -> Keep {
+        Keep {
+            net: Arc::clone(net),
+            generation: net.generation.load(Ordering::SeqCst),
+            socket: wext::Socket::open("lo").unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_keeper_of_an_older_stack_affects_nothing() {
+        use station::{Context, Dhcp};
+        let net = Arc::new(Net::default());
+        let keep = keeper(&net);
+        let ticket = station::Ticket {
+            pid: 7,
+            since: Duration::ZERO,
+            renew: false,
+        };
+        // Its own stack: effects go through.
+        assert_eq!(keep.joined("Home"), Some(()));
+        assert_eq!(keep.scanned(Ok(vec![])), Some(()));
+        assert_eq!(keep.proven(&ticket, "Home"), Some(()));
+        assert_eq!(net.joins.load(Ordering::SeqCst), 1);
+        assert_eq!(net.scans.load(Ordering::SeqCst), 1);
+        assert!(keep.with(|_, _| ()).is_some());
+        // A newer stack (an Off, or a start): nothing more.
+        *lock(&net.lease_for) = None;
+        net.generation.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(keep.joined("Home"), None);
+        assert_eq!(keep.scanned(Ok(vec![])), None);
+        assert_eq!(keep.proven(&ticket, "Home"), None);
+        assert_eq!(keep.ask("Home"), None);
+        assert!(keep.with(|_, _| ()).is_none());
+        assert_eq!(net.joins.load(Ordering::SeqCst), 1);
+        assert_eq!(net.scans.load(Ordering::SeqCst), 1);
+        assert_eq!(*lock(&net.lease_for), None);
+        assert!(lock(&net.dhcp).is_none(), "no udhcpc started");
+        // Nor does it fall back on the newer stack's behalf.
+        keep.fall_back("old news");
+        assert!(!net.fell_back.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_keeper_of_an_older_stack_leaves_the_newer_ones_kicks() {
+        use station::Context;
+        let net = Arc::new(Net::default());
+        let old = keeper(&net);
+        net.generation.fetch_add(1, Ordering::SeqCst);
+        net.kick(Kick::Saved);
+        net.kick(Kick::Scan);
+        assert_eq!(old.wait(Duration::ZERO), None);
+        assert_eq!(old.wait(Duration::from_millis(20)), None);
+        let new = keeper(&net);
+        assert_eq!(new.wait(Duration::ZERO), Some(Kick::Scan));
+        assert_eq!(new.wait(Duration::ZERO), Some(Kick::Saved));
+        assert_eq!(new.wait(Duration::ZERO), None);
+        // A resume outranks a change of networks.
+        net.kick(Kick::Resumed);
+        net.kick(Kick::Saved);
+        assert_eq!(new.wait(Duration::ZERO), Some(Kick::Resumed));
+    }
+
+    #[test]
+    fn a_stop_wakes_a_waiting_keeper() {
+        use station::Context;
+        let net = Arc::new(Net::default());
+        let keep = keeper(&net);
+        let waiter = std::thread::spawn(move || {
+            let since = Instant::now();
+            let kick = keep.wait(Duration::from_secs(30));
+            (kick, since.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        net.generation.fetch_add(1, Ordering::SeqCst);
+        net.kicked.notify_all();
+        let (kick, waited) = waiter.join().unwrap();
+        assert_eq!(kick, None);
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+    }
+
+    #[test]
+    fn a_failed_fallback_start_is_retried_until_it_comes_up_or_is_cancelled() {
+        let slept = std::cell::RefCell::new(Vec::new());
+        let sleep = |pause: Duration| slept.borrow_mut().push(pause.as_secs());
+        let mut tries = 0;
+        let up = retry_start(&sleep, &mut || {
+            tries += 1;
+            Some(if tries < 3 {
+                Err(anyhow::anyhow!("the Wi-Fi driver didn't come up"))
+            } else {
+                Ok(())
+            })
+        });
+        assert!(up);
+        assert_eq!(tries, 3);
+        assert_eq!(*slept.borrow(), [2, 4, 8]);
+        // Switched off (or started anew) meanwhile: no more tries.
+        let mut tries = 0;
+        let up = retry_start(&|_| {}, &mut || {
+            tries += 1;
+            (tries < 2).then(|| Err(anyhow::anyhow!("no")))
+        });
+        assert!(!up);
+        assert_eq!(tries, 2);
     }
 }
