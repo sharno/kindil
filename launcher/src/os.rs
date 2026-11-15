@@ -26,7 +26,8 @@ pub trait Os: Sync {
     fn end_pid_file(&self, pid_file: &Path);
     /// Kills lipc-wait-event processes an earlier kindil left to init.
     fn kill_orphaned_watchers(&self);
-    /// Whether the process `pid` is alive.
+    /// Whether the process `pid` is alive: not one that exited, even if
+    /// nobody has reaped it yet.
     fn alive(&self, pid: i32) -> bool;
     /// Starts `launcher session` detached, its output appended to `log`;
     /// its pid.
@@ -174,8 +175,17 @@ impl Os for Device {
     }
 
     fn alive(&self, pid: i32) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        // A child of ours that has exited (`launcher boot` started the
+        // session it waits on) is reaped here; anyone else's waitpid
+        // refuses (ECHILD) and leaves alone.
+        // SAFETY: waitpid(2) with WNOHANG and a valid status pointer.
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         // SAFETY: signal 0 only checks that the process exists.
-        pid > 0 && unsafe { libc::kill(pid, 0) == 0 }
+        unsafe { libc::kill(pid, 0) == 0 && !zombie(pid) }
     }
 
     fn spawn_session(&self, log: &Path) -> Option<i32> {
@@ -206,6 +216,15 @@ impl Os for Device {
         let child = command.spawn().ok()?;
         i32::try_from(child.id()).ok()
     }
+}
+
+/// Whether `pid` has exited and waits for its parent to reap it: kill(2)
+/// still finds it. "pid (comm) state ..."; the comm may hold anything.
+fn zombie(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('Z'))
+    })
 }
 
 pub fn version(binary: &Path) -> Option<String> {
@@ -277,6 +296,43 @@ fn utc_time() -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exited_child() -> std::process::Child {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        child
+    }
+
+    #[test]
+    fn a_session_that_exited_isnt_alive_though_nobody_waited_for_it() {
+        // `launcher boot` starts the session and outlives it: unreaped, it
+        // would still answer kill(pid, 0).
+        let mut child = exited_child();
+        let pid = i32::try_from(child.id()).unwrap();
+        assert!(!Device.alive(pid));
+        // Already reaped by alive: ECHILD.
+        assert!(child.wait().is_err());
+        assert!(Device.alive(i32::try_from(std::process::id()).unwrap()));
+        assert!(!Device.alive(0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_zombie_is_told_apart() {
+        let mut child = exited_child();
+        let pid = i32::try_from(child.id()).unwrap();
+        assert!(zombie(pid));
+        assert!(!zombie(i32::try_from(std::process::id()).unwrap()));
+        child.wait().unwrap();
+    }
+}
+
 /// A device for the tests: upstart's jobs in a set, everything done
 /// recorded; binaries are real scripts, run for real.
 #[cfg(test)]
@@ -305,6 +361,9 @@ pub mod fake {
         /// At boot: Amazon's UI comes up while the launcher waits, if X
         /// runs to bring it.
         pub gui_coming: Mutex<bool>,
+        /// A started session exits during the boot guard's wait.
+        pub dies: Mutex<bool>,
+        died: Mutex<bool>,
     }
 
     impl Fake {
@@ -357,7 +416,10 @@ pub mod fake {
             self.jobs.lock().unwrap().remove(job);
         }
 
-        fn sleep(&self, _: Duration) {
+        fn sleep(&self, time: Duration) {
+            if *self.dies.lock().unwrap() && time >= Duration::from_secs(60) {
+                *self.died.lock().unwrap() = true;
+            }
             let mut jobs = self.jobs.lock().unwrap();
             if *self.gui_coming.lock().unwrap() && jobs.contains("x") {
                 jobs.insert("lab126_gui".into());
@@ -399,7 +461,7 @@ pub mod fake {
         fn kill_orphaned_watchers(&self) {}
 
         fn alive(&self, pid: i32) -> bool {
-            pid == UP
+            pid == UP && !*self.died.lock().unwrap()
         }
 
         fn spawn_session(&self, _: &Path) -> Option<i32> {

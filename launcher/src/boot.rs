@@ -90,6 +90,8 @@ pub fn boot(paths: &Paths, os: &dyn Os) {
     log("starting kindil");
     crate::start(paths, os);
     os.sleep(SETTLE);
+    // The session is our child: one that exited is reaped here, not taken
+    // for one still running (os::Device::alive).
     if os::read_pid(&paths.pid_file).is_some_and(|pid| os.alive(pid)) {
         let _ = std::fs::remove_file(&tries_file);
         log("kindil is up");
@@ -250,6 +252,16 @@ mod tests {
         env.up(true);
         env.boot("c");
         assert_eq!(env.starts(), 2);
+    }
+
+    #[test]
+    fn a_session_that_started_but_exited_before_the_wait_ended_didnt_stay_up() {
+        let env = Env::new();
+        env.flag("standalone");
+        *env.os.dies.lock().unwrap() = true;
+        env.boot("a");
+        assert_eq!((env.starts(), env.tries()), (1, "1".into()));
+        assert_eq!(env.skip(), "framework", "no standalone boot next time");
     }
 
     #[test]
