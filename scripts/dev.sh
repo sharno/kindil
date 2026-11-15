@@ -118,6 +118,7 @@ check)
 	cargo test
 	tests/launcher.sh
 	tests/boot.sh
+	tests/install.sh
 	;;
 help) sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//' ;;
 *) die "unknown command: $1" ;;
