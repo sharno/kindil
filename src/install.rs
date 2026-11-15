@@ -8,7 +8,8 @@
 //! must be the one running, with its own Wi-Fi joined and addressed (or just
 //! running, with Wi-Fi switched off), and still so a minute later. Otherwise
 //! the backup goes back, launcher files and all, with the rollback binary
-//! sent along if there is one. Large files stay on the user storage:
+//! sent along if there is one, and the launcher on the system storage as it
+//! was (a release that ran two minutes writes its own, src/launcher.rs). Large files stay on the user storage:
 //! /var/local is 64 MB, mostly Amazon's.
 use anyhow::{bail, Context};
 use sha2::{Digest, Sha256};
@@ -22,6 +23,8 @@ pub struct Paths {
     pub extension: PathBuf,
     /// The running copy's directory: /var/local/kindil.
     pub run: PathBuf,
+    /// The launcher the shims run: /var/local/kindil/launcher.
+    pub launcher: PathBuf,
 }
 
 impl Default for Paths {
@@ -30,6 +33,7 @@ impl Default for Paths {
             deploy: "/mnt/us/kindil-deploy".into(),
             extension: "/mnt/us/extensions/kindil".into(),
             run: "/var/local/kindil".into(),
+            launcher: crate::launcher::PATH.into(),
         }
     }
 }
@@ -80,16 +84,20 @@ impl Kindle for Device {
             .arg("kindil")
             .output()
             .is_ok_and(|out| out.status.success());
-        let reports = std::process::Command::new(run.join("kindil"))
-            .arg("--version")
-            .output()
-            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == version);
-        running && reports && (run.join("wifi-off").exists() || wifi_joined(run))
+        up(version, run, running, || wifi_joined(run))
     }
 
     fn sleep(&self, time: Duration) {
         std::thread::sleep(time);
     }
+}
+
+/// kindil runs, the copy that runs is `version` (not the launcher's
+/// fallback to the previous one), and it has its Wi-Fi, or Wi-Fi is off.
+fn up(version: &str, run: &Path, running: bool, joined: impl FnOnce() -> bool) -> bool {
+    running
+        && version_of(&run.join("kindil")).is_ok_and(|v| v == version)
+        && (run.join("wifi-off").exists() || joined())
 }
 
 /// kindil's own supplicant runs, joined, with an address.
@@ -152,6 +160,12 @@ fn run(id: &str, paths: &Paths, timing: &Timing, kindle: &dyn Kindle) -> anyhow:
     // Everything as it is now, to put back if the new version doesn't come up.
     let backup = paths.deploy.join("extension-backup.tar");
     archive(&paths.extension, &backup).context("failed: can't back up the extension")?;
+    // Small (half a MB): kept on the user storage beside the bundle.
+    let launcher = paths.deploy.join("launcher-backup");
+    let _ = std::fs::remove_file(&launcher);
+    if paths.launcher.exists() {
+        std::fs::copy(&paths.launcher, &launcher).context("failed: can't back up the launcher")?;
+    }
     log(id, &format!("installing {version}"));
 
     kindle.stop_kindil();
@@ -237,10 +251,30 @@ fn rollback_to(
     if let Err(error) = restored {
         log(id, &format!("restoring the backup failed: {error:#}"));
     }
+    if let Err(error) = restore_launcher(paths) {
+        log(id, &format!("restoring the launcher failed: {error:#}"));
+    }
     kindle.start_kindil(&paths.extension);
     let back = version_of(&paths.extension.join("bin/kindil")).unwrap_or_else(|_| "?".into());
     log(id, &format!("rolled back to {back}"));
     bail!("rolled back: {reason}")
+}
+
+/// The launcher as it was before the install: the backup through a file
+/// beside it and a rename, or none if there was none (the shims then have
+/// the rolled-back kindil write its own).
+fn restore_launcher(paths: &Paths) -> anyhow::Result<()> {
+    let backup = paths.deploy.join("launcher-backup");
+    if backup.exists() {
+        replace(&backup, &paths.launcher)?;
+        executable(&paths.launcher)?;
+    } else {
+        match std::fs::remove_file(&paths.launcher) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -348,19 +382,31 @@ mod tests {
     }
 
     /// The Kindle as the tests see it: whether the new version comes up and
-    /// stays up, and what was done to it.
+    /// stays up, and what was done to it. Starting kindil copies the binary
+    /// to run, as the launcher does.
     struct Fake {
         comes_up: bool,
         stays_up: bool,
+        /// The launcher runs the previous version instead.
+        falls_back: bool,
+        /// kindil joins Wi-Fi.
+        wifi: bool,
+        /// Where 2.0.0, once up, writes its launcher, as after two minutes.
+        launcher: Option<PathBuf>,
+        run: PathBuf,
         checks: RefCell<u32>,
         calls: RefCell<Vec<String>>,
     }
 
     impl Fake {
-        fn new(comes_up: bool, stays_up: bool) -> Self {
+        fn new(s: &Setup, comes_up: bool, stays_up: bool) -> Self {
             Self {
                 comes_up,
                 stays_up,
+                falls_back: false,
+                wifi: true,
+                launcher: None,
+                run: s.paths.run.clone(),
                 checks: RefCell::new(0),
                 calls: RefCell::default(),
             }
@@ -374,12 +420,23 @@ mod tests {
         fn start_kindil(&self, extension: &Path) {
             let version = version_of(&extension.join("bin/kindil")).unwrap();
             self.calls.borrow_mut().push(format!("start {version}"));
+            let bin = extension.join("bin");
+            let runs = if self.falls_back && bin.join("kindil.previous").exists() {
+                bin.join("kindil.previous")
+            } else {
+                bin.join("kindil")
+            };
+            replace(&runs, &self.run.join("kindil")).unwrap();
+            if let (Some(launcher), "kindil 2.0.0", true) =
+                (&self.launcher, version.as_str(), self.comes_up)
+            {
+                std::fs::write(launcher, "launcher 2.0.0").unwrap();
+            }
         }
-        fn up(&self, version: &str, _: &Path) -> bool {
+        fn up(&self, version: &str, run: &Path) -> bool {
             *self.checks.borrow_mut() += 1;
-            version == "kindil 2.0.0"
-                && self.comes_up
-                && (self.stays_up || *self.checks.borrow() == 1)
+            let running = self.comes_up && (self.stays_up || *self.checks.borrow() == 1);
+            up(version, run, running, || self.wifi)
         }
         fn sleep(&self, _: Duration) {}
     }
@@ -396,6 +453,7 @@ mod tests {
             deploy: dir.path().join("deploy"),
             extension: dir.path().join("ext"),
             run: dir.path().join("run"),
+            launcher: dir.path().join("run/launcher"),
         };
         for d in [&paths.deploy, &paths.run, &paths.extension.join("bin")] {
             std::fs::create_dir_all(d).unwrap();
@@ -434,7 +492,7 @@ mod tests {
     fn a_bundle_that_fails_its_checksum_changes_nothing() {
         let s = setup();
         std::fs::write(s.paths.deploy.join("bundle.sha256"), "junk").unwrap();
-        let fake = Fake::new(true, true);
+        let fake = Fake::new(&s, true, true);
         let error = install("t", &s.paths, &timing(), &fake).unwrap_err();
         assert!(error.to_string().contains("checksum mismatch"), "{error}");
         assert_eq!(installed(&s.paths, "kindil"), "kindil 1.0.0");
@@ -444,7 +502,7 @@ mod tests {
     #[test]
     fn a_version_that_comes_up_and_holds_is_kept() {
         let s = setup();
-        let fake = Fake::new(true, true);
+        let fake = Fake::new(&s, true, true);
         install("t", &s.paths, &timing(), &fake).unwrap();
         assert_eq!(installed(&s.paths, "kindil"), "kindil 2.0.0");
         assert_eq!(
@@ -468,7 +526,7 @@ mod tests {
     #[test]
     fn a_version_that_never_comes_up_is_rolled_back_whole() {
         let s = setup();
-        let fake = Fake::new(false, false);
+        let fake = Fake::new(&s, false, false);
         let error = install("t", &s.paths, &timing(), &fake).unwrap_err();
         assert!(error.to_string().contains("rolled back"), "{error}");
         assert_eq!(installed(&s.paths, "kindil"), "kindil 1.0.0");
@@ -479,7 +537,7 @@ mod tests {
     #[test]
     fn a_version_that_goes_down_again_is_rolled_back() {
         let s = setup();
-        let fake = Fake::new(true, false);
+        let fake = Fake::new(&s, true, false);
         assert!(install("t", &s.paths, &timing(), &fake).is_err());
         assert_eq!(installed(&s.paths, "kindil"), "kindil 1.0.0");
     }
@@ -488,9 +546,93 @@ mod tests {
     fn a_rollback_binary_sent_along_is_the_one_rolled_back_to() {
         let s = setup();
         std::fs::write(s.paths.deploy.join("kindil.rollback"), binary("0.9.0")).unwrap();
-        let fake = Fake::new(false, false);
+        let fake = Fake::new(&s, false, false);
         assert!(install("t", &s.paths, &timing(), &fake).is_err());
         assert_eq!(installed(&s.paths, "kindil"), "kindil 0.9.0");
         assert_eq!(launcher(&s.paths), "old launcher");
+    }
+
+    fn launcher_file(paths: &Paths) -> Option<String> {
+        std::fs::read_to_string(&paths.launcher).ok()
+    }
+
+    #[test]
+    fn the_launcher_falling_back_to_the_previous_version_isnt_taken_for_the_new_one() {
+        let s = setup();
+        let fake = Fake {
+            falls_back: true,
+            ..Fake::new(&s, true, true)
+        };
+        let error = install("t", &s.paths, &timing(), &fake).unwrap_err();
+        assert!(error.to_string().contains("rolled back"), "{error}");
+        assert_eq!(installed(&s.paths, "kindil"), "kindil 1.0.0");
+    }
+
+    #[test]
+    fn with_wifi_switched_off_kindil_running_is_enough() {
+        let s = setup();
+        std::fs::write(s.paths.run.join("wifi-off"), "").unwrap();
+        let fake = Fake {
+            wifi: false,
+            ..Fake::new(&s, true, true)
+        };
+        install("t", &s.paths, &timing(), &fake).unwrap();
+        assert_eq!(installed(&s.paths, "kindil"), "kindil 2.0.0");
+    }
+
+    #[test]
+    fn with_wifi_on_but_not_joined_it_isnt_up() {
+        let s = setup();
+        let fake = Fake {
+            wifi: false,
+            ..Fake::new(&s, true, true)
+        };
+        assert!(install("t", &s.paths, &timing(), &fake).is_err());
+        assert_eq!(installed(&s.paths, "kindil"), "kindil 1.0.0");
+    }
+
+    #[test]
+    fn a_rollback_brings_back_the_launcher_the_new_version_wrote() {
+        let s = setup();
+        std::fs::write(&s.paths.launcher, "launcher 1.0.0").unwrap();
+        let fake = Fake {
+            launcher: Some(s.paths.launcher.clone()),
+            ..Fake::new(&s, true, false)
+        };
+        assert!(install("t", &s.paths, &timing(), &fake).is_err());
+        assert_eq!(launcher_file(&s.paths).as_deref(), Some("launcher 1.0.0"));
+        assert!(!s.paths.run.join("launcher.new").exists());
+        let mode = std::fs::metadata(&s.paths.launcher).unwrap().permissions();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&mode) & 0o111,
+            0o111
+        );
+    }
+
+    #[test]
+    fn a_rollback_with_no_launcher_before_leaves_none() {
+        let s = setup();
+        let fake = Fake {
+            launcher: Some(s.paths.launcher.clone()),
+            ..Fake::new(&s, true, false)
+        };
+        assert!(install("t", &s.paths, &timing(), &fake).is_err());
+        assert_eq!(
+            launcher_file(&s.paths),
+            None,
+            "the shims write kindil's own"
+        );
+    }
+
+    #[test]
+    fn a_kept_version_keeps_its_launcher() {
+        let s = setup();
+        std::fs::write(&s.paths.launcher, "launcher 1.0.0").unwrap();
+        let fake = Fake {
+            launcher: Some(s.paths.launcher.clone()),
+            ..Fake::new(&s, true, true)
+        };
+        install("t", &s.paths, &timing(), &fake).unwrap();
+        assert_eq!(launcher_file(&s.paths).as_deref(), Some("launcher 2.0.0"));
     }
 }
