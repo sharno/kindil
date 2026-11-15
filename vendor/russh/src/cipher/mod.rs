@@ -48,7 +48,8 @@ pub(crate) mod block;
 pub(crate) mod cbc;
 pub(crate) mod chacha20poly1305;
 #[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
-pub(crate) mod rustcrypto;
+#[doc(hidden)] // kindil: public for kindil-sshd's tests against ring
+pub mod rustcrypto;
 pub(crate) mod clear;
 pub(crate) mod gcm;
 

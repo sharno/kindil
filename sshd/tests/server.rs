@@ -296,3 +296,84 @@ fn makes_its_host_key_once_root_only() {
     assert!(pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
     let _ = made.to_openssh(LineEnding::LF).unwrap();
 }
+
+/// Connects offering only `kex` and `cipher`; whether it logs in.
+async fn login_with(
+    addr: SocketAddr,
+    key: PrivateKey,
+    kex: russh::kex::Name,
+    cipher: russh::cipher::Name,
+) -> bool {
+    let mut config = client::Config::default();
+    config.preferred.kex = vec![kex, russh::kex::EXTENSION_SUPPORT_AS_CLIENT].into();
+    config.preferred.cipher = vec![cipher].into();
+    let Ok(mut handle) = client::connect(Arc::new(config), addr, Client).await else {
+        return false;
+    };
+    let key = PrivateKeyWithHashAlg::new(Arc::new(key), None);
+    matches!(handle.authenticate_publickey("root", key).await, Ok(r) if r.success())
+}
+
+#[tokio::test]
+async fn offers_only_elliptic_curve_kex_and_aead_ciphers() {
+    use russh::{cipher, kex};
+    let key = ed25519(1);
+    let server = serve(&line(key.public_key()), 8).await;
+    for kex in [
+        kex::MLKEM768X25519_SHA256,
+        kex::CURVE25519,
+        kex::CURVE25519_PRE_RFC_8731,
+    ] {
+        for cipher in [
+            cipher::CHACHA20_POLY1305,
+            cipher::AES_256_GCM,
+            cipher::AES_128_GCM,
+        ] {
+            assert!(
+                login_with(server.addr, key.clone(), kex, cipher).await,
+                "{kex:?} {cipher:?}"
+            );
+        }
+    }
+    for kex in [
+        kex::DH_G14_SHA256,
+        kex::DH_G16_SHA512,
+        kex::DH_G18_SHA512,
+        kex::DH_GEX_SHA256,
+    ] {
+        assert!(
+            !login_with(server.addr, key.clone(), kex, cipher::CHACHA20_POLY1305).await,
+            "{kex:?}"
+        );
+    }
+    for cipher in [
+        cipher::AES_128_CTR,
+        cipher::AES_256_CTR,
+        cipher::AES_256_CBC,
+    ] {
+        assert!(
+            !login_with(server.addr, key.clone(), kex::CURVE25519, cipher).await,
+            "{cipher:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn refuses_rsa_signatures_with_sha1() {
+    let key = rsa();
+    let server = serve(&line(key.public_key()), 8).await;
+    let config = Arc::new(client::Config::default());
+    let mut handle = client::connect(config, server.addr, Client).await.unwrap();
+    let sha1 = PrivateKeyWithHashAlg::new(Arc::new(key.clone()), None);
+    assert!(!handle
+        .authenticate_publickey("root", sha1)
+        .await
+        .unwrap()
+        .success());
+    let sha512 = PrivateKeyWithHashAlg::new(Arc::new(key), Some(russh::keys::HashAlg::Sha512));
+    assert!(handle
+        .authenticate_publickey("root", sha512)
+        .await
+        .unwrap()
+        .success());
+}

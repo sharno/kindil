@@ -18,7 +18,11 @@ RustCrypto's `aes-gcm` and `ssh-cipher` (already in russh's tree, through
 
 - `src/cipher/rustcrypto.rs` (new): the part of ring's AEAD API that
   `gcm.rs` and `chacha20poly1305.rs` use, for `aes128-gcm@openssh.com`,
-  `aes256-gcm@openssh.com` and `chacha20-poly1305@openssh.com`.
+  `aes256-gcm@openssh.com` and `chacha20-poly1305@openssh.com`. Each key
+  also opens and seals at most 2^28 packets (`PACKETS_PER_KEY`): opening
+  more fails (the connection ends), sealing more panics. russh rekeys long
+  before; this holds even when a peer stalls a key exchange. The module is
+  public, hidden, for kindil-sshd's tests against ring.
 - `src/cipher/{mod,gcm,chacha20poly1305}.rs`: with neither `ring` nor
   `aws-lc-rs`, import from it instead.
 - `src/lib.rs`, `src/helpers.rs`: `rustcrypto` counts as a backend.

@@ -13,7 +13,8 @@ use russh::keys::ssh_key::private::Ed25519Keypair;
 use russh::keys::ssh_key::{AuthorizedKeys, LineEnding};
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
 use russh::server::{Auth, ChannelOpenHandle, Handle, Msg, Session};
-use russh::{Channel, ChannelId, MethodKind, MethodSet, SshId};
+use russh::{Channel, ChannelId, MethodKind, MethodSet, Preferred, SshId};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -174,11 +175,59 @@ pub fn authorized(file: &Path, key: &PublicKey) -> io::Result<bool> {
     }))
 }
 
-/// russh's settings: keys only, a few tries, no idle limit but keepalives.
+/// The algorithms offered, and nothing else: elliptic-curve key exchange
+/// only (finite-field Diffie-Hellman is slow work an unauthenticated peer
+/// could ask for, on the Kindle's one core), AEAD ciphers only (so no MAC is
+/// ever negotiated), no compression. The host key is ed25519 (the only one
+/// there is); user keys sign with ed25519 or RSA with SHA-2.
+pub fn preferred() -> Preferred {
+    use russh::keys::HashAlg;
+    Preferred {
+        kex: Cow::Borrowed(&[
+            russh::kex::MLKEM768X25519_SHA256,
+            russh::kex::CURVE25519,
+            russh::kex::CURVE25519_PRE_RFC_8731,
+            // Not algorithms: RFC 8308 extensions and OpenSSH's strict key
+            // exchange (Terrapin).
+            russh::kex::EXTENSION_SUPPORT_AS_SERVER,
+            russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER,
+        ]),
+        key: Cow::Borrowed(&[
+            Algorithm::Ed25519,
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512),
+            },
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha256),
+            },
+        ]),
+        host_key_certificates: Cow::Borrowed(&[]),
+        cipher: Cow::Borrowed(&[
+            russh::cipher::CHACHA20_POLY1305,
+            russh::cipher::AES_256_GCM,
+            russh::cipher::AES_128_GCM,
+        ]),
+        mac: Cow::Borrowed(&[]),
+        compression: Cow::Borrowed(&[russh::compression::NONE]),
+    }
+}
+
+/// Whether a user key may sign with `algorithm`: not RSA with SHA-1.
+fn signs_well(algorithm: &Algorithm) -> bool {
+    matches!(
+        algorithm,
+        Algorithm::Ed25519 | Algorithm::Rsa { hash: Some(_) }
+    )
+}
+
+/// russh's settings: keys only, a few tries, no idle limit but keepalives,
+/// fresh keys every 128 MiB or hour each way.
 pub fn config(key: PrivateKey, settings: &Settings) -> russh::server::Config {
     let mut methods = MethodSet::empty();
     methods.push(MethodKind::PublicKey);
     russh::server::Config {
+        preferred: preferred(),
+        limits: russh::Limits::new(128 << 20, 128 << 20, Duration::from_secs(3600)),
         server_id: SshId::Standard("SSH-2.0-kindil".into()),
         methods,
         auth_rejection_time: Duration::from_secs(1),
@@ -527,11 +576,13 @@ impl russh::server::Handler for Connection {
         user: &str,
         offer: russh::server::PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
-        Ok(if self.allowed(user, offer.public_key) {
-            Auth::Accept
-        } else {
-            Auth::reject()
-        })
+        Ok(
+            if signs_well(offer.algorithm) && self.allowed(user, offer.public_key) {
+                Auth::Accept
+            } else {
+                Auth::reject()
+            },
+        )
     }
 
     async fn auth_publickey(
@@ -539,7 +590,7 @@ impl russh::server::Handler for Connection {
         user: &str,
         key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        if !self.allowed(user, key.public_key) {
+        if !signs_well(key.algorithm) || !self.allowed(user, key.public_key) {
             log(format_args!("{}: refused {user}", self.peer));
             return Ok(Auth::reject());
         }
