@@ -55,8 +55,9 @@ pub enum Execution {
 pub struct Presented {
     /// Frames drawn, each counted once sent to the panel.
     pub frames: Arc<AtomicU64>,
-    /// Blocks until the panel has finished its last update.
-    pub wait_idle: fn(),
+    /// Blocks until the panel has finished its last update; false if it
+    /// can't tell.
+    pub wait_idle: fn() -> bool,
 }
 
 pub struct Options {
@@ -81,12 +82,19 @@ struct Display {
     dashboard: Arc<DashboardFrames>,
 }
 
-/// The dashboard frames shown so far, and the panel frame count when the
-/// last one was handed to the window: the panel frame after that has it.
+/// The last dashboard frame handed to the window: the doze wake it was drawn
+/// for, if any, and the panel frame count then (the panel frame after that
+/// has it).
 #[derive(Default)]
 struct DashboardFrames {
-    shown: Mutex<(u64, u64)>,
+    shown: Mutex<Shown>,
     changed: Condvar,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Shown {
+    wake: Option<u64>,
+    frames: u64,
 }
 
 /// The doze wake whose redraw is awaited. Its end is claimed once, by the
@@ -119,41 +127,39 @@ impl Display {
             .map_or(0, |p| p.frames.load(Ordering::Acquire))
     }
 
-    /// A dashboard frame (or its error) was just handed to the window, on
-    /// the UI thread, before the loop draws it.
-    fn dashboard_shown(&self) {
+    /// A dashboard frame (or its error) for `wake` was just handed to the
+    /// window, on the UI thread, before the loop draws it.
+    fn dashboard_shown(&self, wake: Option<u64>) {
         let frames = self.frames();
-        let mut shown = lock(&self.dashboard.shown);
-        *shown = (shown.0 + 1, frames);
+        *lock(&self.dashboard.shown) = Shown { wake, frames };
         self.dashboard.changed.notify_all();
     }
 
-    fn dashboards_shown(&self) -> u64 {
-        lock(&self.dashboard.shown).0
-    }
-
-    /// Blocks until the dashboard frame after `shown` has been drawn and the
-    /// panel has finished it (`shown` None: any frame after `drawn`). False
-    /// at `deadline`. Logs how long each step took.
-    fn wait_drawn(&self, shown: Option<u64>, drawn: u64, deadline: Instant) -> bool {
+    /// Blocks until the dashboard frame drawn for `wake` is on the panel and
+    /// the panel has finished it (`wake` None: any panel frame after
+    /// `drawn`). False at `deadline`, or if the panel can't say it finished.
+    /// Logs how long each step took.
+    fn wait_drawn(&self, wake: Option<u64>, drawn: u64, deadline: Instant) -> bool {
         let Some(presented) = &self.presented else {
             return false;
         };
         let since = Instant::now();
         let ms = || since.elapsed().as_millis();
         let left = || deadline.saturating_duration_since(Instant::now());
-        let drawn = match shown {
+        let drawn = match wake {
             None => drawn,
-            Some(before) => {
-                let (frames, timeout) = self
+            Some(wake) => {
+                let (shown, timeout) = self
                     .dashboard
                     .changed
-                    .wait_timeout_while(lock(&self.dashboard.shown), left(), |s| s.0 <= before)
+                    .wait_timeout_while(lock(&self.dashboard.shown), left(), |s| {
+                        s.wake.is_none_or(|shown| shown < wake)
+                    })
                     .unwrap_or_else(|e| e.into_inner());
                 if timeout.timed_out() {
                     return false;
                 }
-                frames.1
+                shown.frames
             }
         };
         let rendered = ms();
@@ -164,7 +170,12 @@ impl Display {
             std::thread::sleep(Duration::from_millis(5));
         }
         let sent = ms();
-        (presented.wait_idle)();
+        if !(presented.wait_idle)() {
+            eprintln!(
+                "kindil: doze redraw: the panel can't say it finished; napping at the ceiling"
+            );
+            return false;
+        }
         eprintln!(
             "kindil: doze redraw: dashboard rendered at {rendered} ms, drawn and sent at {sent} ms, panel done at {} ms",
             ms()
@@ -220,7 +231,8 @@ enum Worker {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tick {
     /// Render the minute now; no network, which may still be down after a nap.
-    Draw,
+    /// A doze wake's draw carries the wake, which its frame reports back.
+    Draw(Option<u64>),
     /// Fetch what is due, then render.
     Fetch,
 }
@@ -1201,8 +1213,15 @@ impl Ctx {
     fn apply(&self, effect: Effect) {
         let Some(ui) = self.ui() else { return };
         match effect {
-            Effect::ShowSleep => self.show_system(&ui, System::Asleep),
-            Effect::ShowUsbDrive => self.show_system(&ui, System::UsbDrive),
+            // Out of doze, if in it: its wake ends, and its timer with it.
+            Effect::ShowSleep => {
+                self.draw_wake.begin();
+                self.show_system(&ui, System::Asleep);
+            }
+            Effect::ShowUsbDrive => {
+                self.draw_wake.begin();
+                self.show_system(&ui, System::UsbDrive);
+            }
             Effect::LightOff => self.device_later(|host| {
                 let level = host.brightness().ok();
                 // A light that won't switch off doesn't stop the device sleeping.
@@ -1243,26 +1262,30 @@ impl Ctx {
                     }
                     window
                 };
-                // Before the redraw starts: what to wait for to see it drawn.
-                let dashboard = matches!(self.state.borrow().miqat, Worker::Started(_))
-                    .then(|| self.display.dashboards_shown());
+                // Before the redraw starts: this wake, and the panel frames
+                // drawn so far; its dashboard frame is tagged with the wake.
+                let wake = self.draw_wake.begin();
+                let dashboard = matches!(self.state.borrow().miqat, Worker::Started(_));
                 let drawn = self.display.frames();
-                self.catch_up(Tick::Draw);
+                self.catch_up(Tick::Draw(Some(wake)));
                 if window == Window::Online {
                     self.measure_doze(now);
                     self.reconnect_wifi();
                     let ctx = self.clone();
                     self.later(FETCH_AFTER, move || ctx.tick_miqat(Tick::Fetch));
                 }
-                self.settle_wake(window, dashboard, drawn);
+                self.settle_wake(wake, window, dashboard, drawn);
             }
             Effect::Rouse => {
+                // Out of doze: its wake ends, and its timer with it.
+                self.draw_wake.begin();
                 // Awake time would count against the doze.
                 *lock(&self.doze_gauge) = None;
                 self.catch_up(Tick::Fetch);
                 self.state.borrow_mut().idle = Idle::new(self.touches.count(), Instant::now());
             }
             Effect::Wake => {
+                self.draw_wake.begin();
                 self.show_system(&ui, System::App);
                 self.catch_up(Tick::Fetch);
                 self.state.borrow_mut().idle = Idle::new(self.touches.count(), Instant::now());
@@ -1284,12 +1307,12 @@ impl Ctx {
     /// Ends a doze wake: a drawing one as soon as its redraw is on the panel
     /// (the dashboard's new frame, if it has one), or at the window's length,
     /// whichever comes first; an online one at its length.
-    fn settle_wake(&self, window: Window, dashboard: Option<u64>, drawn: u64) {
+    fn settle_wake(&self, wake: u64, window: Window, dashboard: bool, drawn: u64) {
         let length = window.length();
         let Execution::Background = self.execution else {
             return self.after(length, DeviceEvent::PanelSettled);
         };
-        let wake = self.draw_wake.begin();
+        let dashboard = dashboard.then_some(wake);
         let since = Instant::now();
         let claim = {
             let draw_wake = self.draw_wake.clone();
@@ -1554,7 +1577,7 @@ fn miqat_worker(
     };
     let renderer = miqat::render::Renderer::new(config.display.contrast);
     let mut sources = miqat::sources::Sources::new(&config);
-    let show = |sources: &miqat::sources::Sources| {
+    let show = |sources: &miqat::sources::Sources, wake: Option<u64>| {
         let frame = crate::dashboards::render(&renderer, &config, Utc::now(), sources)
             .map(pixels)
             .map_err(|e| e.to_string());
@@ -1568,20 +1591,23 @@ fn miqat_worker(
                 }
                 Err(error) => k.set_miqat_error(error.into()),
             }
-            display.dashboard_shown();
+            display.dashboard_shown(wake);
         })
     };
     // First paint before any network, so a slow fetch never leaves it blank.
-    if show(&sources).is_err() {
+    if show(&sources, None).is_err() {
         return;
     }
     let mut tick = Tick::Fetch;
     loop {
-        match tick {
-            Tick::Fetch => sources.refresh(&config, Utc::now()),
-            Tick::Draw => {}
-        }
-        if show(&sources).is_err() {
+        let wake = match tick {
+            Tick::Fetch => {
+                sources.refresh(&config, Utc::now());
+                None
+            }
+            Tick::Draw(wake) => wake,
+        };
+        if show(&sources, wake).is_err() {
             return;
         }
         tick = match ticks.recv_timeout(until_next_minute(Utc::now())) {
@@ -1617,7 +1643,7 @@ mod tests {
             ghosting: Arc::default(),
             presented: Some(Presented {
                 frames: frames.clone(),
-                wait_idle: || {},
+                wait_idle: || true,
             }),
             dashboard: Arc::default(),
         };
@@ -1625,19 +1651,21 @@ mod tests {
     }
 
     #[test]
-    fn waits_for_the_frame_that_draws_the_new_dashboard() {
+    fn waits_for_the_frame_that_draws_its_own_wakes_dashboard() {
         let (display, frames) = eink();
-        let before = display.dashboards_shown();
         let deadline = Instant::now() + Duration::from_secs(5);
         let waiter = {
             let display = display.clone();
-            std::thread::spawn(move || display.wait_drawn(Some(before), 0, deadline))
+            std::thread::spawn(move || display.wait_drawn(Some(7), 0, deadline))
         };
-        // A frame from before the new dashboard doesn't count.
+        // A frame from before, and a dashboard rendered for an earlier wake
+        // or for no wake, don't count.
         frames.fetch_add(1, Ordering::Release);
+        display.dashboard_shown(Some(6));
+        display.dashboard_shown(None);
         std::thread::sleep(Duration::from_millis(30));
         assert!(!waiter.is_finished());
-        display.dashboard_shown();
+        display.dashboard_shown(Some(7));
         std::thread::sleep(Duration::from_millis(30));
         assert!(!waiter.is_finished(), "shown, not yet drawn");
         frames.fetch_add(1, Ordering::Release);
@@ -1645,10 +1673,25 @@ mod tests {
     }
 
     #[test]
+    fn a_panel_that_cant_say_it_finished_is_not_done() {
+        let frames = Arc::new(AtomicU64::new(1));
+        let display = Display {
+            panel: Panel::Lcd,
+            ghosting: Arc::default(),
+            presented: Some(Presented {
+                frames,
+                wait_idle: || false,
+            }),
+            dashboard: Arc::default(),
+        };
+        assert!(!display.wait_drawn(None, 0, Instant::now() + Duration::from_secs(5)));
+    }
+
+    #[test]
     fn gives_up_at_the_deadline() {
         let (display, _) = eink();
         let soon = Instant::now() + Duration::from_millis(40);
-        assert!(!display.wait_drawn(Some(display.dashboards_shown()), 0, soon));
+        assert!(!display.wait_drawn(Some(1), 0, soon));
         assert!(!display.wait_drawn(None, 0, soon));
         let (no_panel, _) = eink();
         let no_panel = Display {

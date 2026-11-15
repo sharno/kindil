@@ -356,22 +356,23 @@ impl Framebuffer {
 
 /// [`Framebuffer::wait_for_update_complete`] on a descriptor of its own,
 /// for threads other than the event loop's.
-pub(crate) fn wait_for_panel() {
+pub(crate) fn wait_for_panel() -> bool {
     let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/fb0") else {
-        return;
+        return false;
     };
     let mut marker = UpdateMarkerData {
         update_marker: 1,
         collision_test: 0,
     };
     // SAFETY: a valid fd and marker struct for the ioctl's duration.
-    unsafe {
+    let done = unsafe {
         libc::ioctl(
             file.as_raw_fd(),
             MXCFB_WAIT_FOR_UPDATE_COMPLETE as _,
             &mut marker as *mut _,
-        );
-    }
+        )
+    };
+    done >= 0
 }
 
 impl Drop for Framebuffer {

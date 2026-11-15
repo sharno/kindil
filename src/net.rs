@@ -54,18 +54,23 @@ const PAUSE_MIN: Duration = Duration::from_secs(1);
 const PAUSE_MAX: Duration = Duration::from_secs(60);
 
 pub struct Net {
+    /// Held through every transition (on, off, load, join, reconnect, a
+    /// supervisor's restart): they never interleave, so the last one asked
+    /// for is the state Wi-Fi ends in.
+    lifecycle: Mutex<()>,
     /// Whether kindil's Wi-Fi is up: On only once a start has succeeded.
     power: Mutex<Power>,
     /// The networks wpa_supplicant was last given: a restarted one gets them.
     saved: Mutex<Vec<Credentials>>,
-    /// Bumped whenever kindil stops its stack: children of an older one
-    /// exited because they were told to, and stay down.
+    /// Bumped whenever kindil stops its stack, under `lifecycle`: children
+    /// of an older stack exited because they were told to, and stay down.
     generation: AtomicU64,
 }
 
 impl Default for Net {
     fn default() -> Self {
         Self {
+            lifecycle: Mutex::new(()),
             power: Mutex::new(Power::Off),
             saved: Mutex::default(),
             generation: AtomicU64::new(0),
@@ -89,6 +94,59 @@ impl Net {
 
     /// Switches kindil's Wi-Fi, with `saved` loaded, and remembers it.
     pub fn set(self: &Arc<Self>, power: Power, saved: &[Credentials]) -> anyhow::Result<()> {
+        let _transition = lock(&self.lifecycle);
+        self.switch(power, saved)
+    }
+
+    /// Gives wpa_supplicant `saved`, kindil's networks, when Wi-Fi is on.
+    pub fn load(self: &Arc<Self>, saved: &[Credentials]) -> anyhow::Result<()> {
+        let _transition = lock(&self.lifecycle);
+        self.give(saved)
+    }
+
+    /// Tries `candidate` as a new first network: Ok once it has joined it.
+    /// Any failure puts `saved` back and is returned. Switches Wi-Fi on if off.
+    pub fn try_join(
+        self: &Arc<Self>,
+        candidate: &[Credentials],
+        saved: &[Credentials],
+    ) -> anyhow::Result<()> {
+        let _transition = lock(&self.lifecycle);
+        let joined = self.join(candidate);
+        if joined.is_err() {
+            if let Err(error) = self.give(saved) {
+                eprintln!("kindil: Wi-Fi: putting the saved networks back: {error}");
+            }
+        }
+        joined
+    }
+
+    /// After a suspend: join again, then renew the address (usually kept).
+    /// A supplicant that doesn't answer gets the whole stack started again.
+    pub fn reconnect(self: &Arc<Self>) -> anyhow::Result<()> {
+        let _transition = lock(&self.lifecycle);
+        if self.power() == Power::Off {
+            return Ok(());
+        }
+        let rejoined =
+            wifi::open(INTERFACE).and_then(|wpa| wpa.command("REASSOCIATE").map(|_| wpa));
+        let Ok(wpa) = rejoined else {
+            // Gone or hung (no answer within the socket's timeout).
+            eprintln!("kindil: wpa_supplicant isn't answering; starting Wi-Fi again");
+            let saved = lock(&self.saved).clone();
+            return self.start(&saved);
+        };
+        let since = Instant::now();
+        while !matches!(wpa.link(), Ok(Link::Associated { .. })) {
+            anyhow::ensure!(since.elapsed() < JOIN_WAIT, "no access point joined");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        renew_dhcp()
+    }
+
+    // Below, `lifecycle` is held by the caller.
+
+    fn switch(self: &Arc<Self>, power: Power, saved: &[Credentials]) -> anyhow::Result<()> {
         match power {
             Power::On => {
                 let _ = std::fs::remove_file(OFF_FLAG);
@@ -97,13 +155,14 @@ impl Net {
             Power::Off => {
                 std::fs::write(OFF_FLAG, b"")?;
                 self.stop();
+                // Off means no Wi-Fi at all, Amazon's included.
+                clear_slate();
                 Ok(())
             }
         }
     }
 
-    /// Gives wpa_supplicant `saved`, kindil's networks, when Wi-Fi is on.
-    pub fn load(self: &Arc<Self>, saved: &[Credentials]) -> anyhow::Result<()> {
+    fn give(self: &Arc<Self>, saved: &[Credentials]) -> anyhow::Result<()> {
         *lock(&self.saved) = saved.to_vec();
         if self.power() == Power::Off {
             return Ok(());
@@ -113,20 +172,14 @@ impl Net {
         wpa.command("REASSOCIATE").map(drop)
     }
 
-    /// Tries `candidate` as a new first network: Ok once it has joined it,
-    /// otherwise back to `saved` and an error. Switches Wi-Fi on if off.
-    pub fn try_join(
-        self: &Arc<Self>,
-        candidate: &[Credentials],
-        saved: &[Credentials],
-    ) -> anyhow::Result<()> {
+    fn join(self: &Arc<Self>, candidate: &[Credentials]) -> anyhow::Result<()> {
         let ssid = candidate
             .first()
             .map(|c| c.ssid().as_str().to_owned())
             .ok_or_else(|| anyhow::anyhow!("no network to join"))?;
         match self.power() {
-            Power::Off => self.set(Power::On, candidate)?,
-            Power::On => self.load(candidate)?,
+            Power::Off => self.switch(Power::On, candidate)?,
+            Power::On => self.give(candidate)?,
         }
         let since = Instant::now();
         let wpa = wifi::open(INTERFACE)?;
@@ -142,32 +195,11 @@ impl Net {
         while since.elapsed() < TRY_WAIT {
             if matches!(wpa.link(), Ok(Link::Associated { ssid: ref joined, .. }) if *joined == ssid)
             {
-                renew_dhcp()?;
-                return Ok(());
+                return renew_dhcp();
             }
             std::thread::sleep(Duration::from_millis(250));
         }
-        self.load(saved)?;
         anyhow::bail!("couldn't join {ssid}: check the password and that it is in range")
-    }
-
-    /// After a suspend: join again, then renew the address (usually kept).
-    /// A supplicant that doesn't answer gets the whole stack started again.
-    pub fn reconnect(self: &Arc<Self>) -> anyhow::Result<()> {
-        if self.power() == Power::Off {
-            return Ok(());
-        }
-        let Ok(wpa) = wifi::open(INTERFACE) else {
-            let saved = lock(&self.saved).clone();
-            return self.start(&saved);
-        };
-        wpa.command("REASSOCIATE")?;
-        let since = Instant::now();
-        while !matches!(wpa.link(), Ok(Link::Associated { .. })) {
-            anyhow::ensure!(since.elapsed() < JOIN_WAIT, "no access point joined");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        renew_dhcp()
     }
 
     /// kindil's whole stack up, with `saved` loaded; On only if it all came up.
@@ -212,7 +244,8 @@ impl Net {
     }
 
     /// Starts a child with `spawn`, and again whenever it exits while this
-    /// stack (`generation`) is still wanted.
+    /// stack (`generation`) is still wanted. A restart takes `lifecycle`,
+    /// so it never lands after a stop.
     fn supervise(
         self: &Arc<Self>,
         name: &'static str,
@@ -221,14 +254,13 @@ impl Net {
     ) -> anyhow::Result<()> {
         let mut child = spawn(self)?;
         let net = Arc::clone(self);
-        let wanted = move || net.generation.load(Ordering::SeqCst) == generation;
-        let net = Arc::clone(self);
         std::thread::spawn(move || {
+            let wanted = |net: &Net| net.generation.load(Ordering::SeqCst) == generation;
             let mut pause = PAUSE_MIN;
             loop {
                 let since = Instant::now();
                 let status = child.wait();
-                if !wanted() {
+                if !wanted(&net) {
                     return;
                 }
                 pause = if since.elapsed() >= HEALTHY {
@@ -239,7 +271,8 @@ impl Net {
                 eprintln!("kindil: {name} exited ({status:?}); starting it again in {pause:?}");
                 loop {
                     std::thread::sleep(pause);
-                    if !wanted() {
+                    let _transition = lock(&net.lifecycle);
+                    if !wanted(&net) {
                         return;
                     }
                     match spawn(&net) {
@@ -362,13 +395,23 @@ fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// Stops a process kindil started and confirms it is gone: TERM, then KILL
+/// after a few seconds, so nothing of an old stack overlaps a new one.
 fn terminate(file: &str) {
     if let Some(pid) = pid(file).filter(|&pid| alive(pid)) {
-        // SAFETY: plain kill(2) on a process kindil started.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
-        let since = Instant::now();
-        while alive(pid) && since.elapsed() < Duration::from_secs(3) {
-            std::thread::sleep(Duration::from_millis(50));
+        let gone_within = |signal, wait: Duration| {
+            // SAFETY: plain kill(2) on a process kindil started.
+            unsafe { libc::kill(pid, signal) };
+            let since = Instant::now();
+            while alive(pid) && since.elapsed() < wait {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            !alive(pid)
+        };
+        if !gone_within(libc::SIGTERM, Duration::from_secs(3))
+            && !gone_within(libc::SIGKILL, Duration::from_secs(2))
+        {
+            eprintln!("kindil: process {pid} ({file}) won't exit");
         }
     }
     let _ = std::fs::remove_file(file);

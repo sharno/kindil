@@ -137,9 +137,10 @@ impl Host for KindleHost {
     fn wifi(&self) -> Wifi {
         match self.net.power() {
             Power::Off => Wifi::Off,
+            // A supplicant that doesn't answer is being restarted: the switch
+            // stays usable, to switch Wi-Fi off or on again.
             Power::On => match wifi::open(INTERFACE).and_then(|wpa| Ok((wpa.link()?, wpa))) {
-                Err(e) => Wifi::Unavailable(e.to_string()),
-                Ok((Link::NotAssociated, _)) => Wifi::Searching,
+                Err(_) | Ok((Link::NotAssociated, _)) => Wifi::Searching,
                 Ok((Link::Associated { ssid, ip }, wpa)) => Wifi::Connected {
                     ssid,
                     ip,
@@ -435,13 +436,18 @@ fn volumd(deliver: impl Fn(Event)) -> anyhow::Result<()> {
 /// saved). A failed start is retried for a while; after that the switch
 /// in Settings tries again.
 fn start_wifi(net: &Arc<Net>, networks: &Mutex<Networks>) {
-    if Net::wanted() == Power::Off {
-        eprintln!("kindil: Wi-Fi is switched off");
-        return;
-    }
-    let saved = lock(networks).list().to_vec();
     let since = std::time::Instant::now();
     loop {
+        let saved = lock(networks).list().to_vec();
+        // Asked each time: switched off meanwhile, it stays off. Off still
+        // takes Wi-Fi from Amazon: no Wi-Fi at all while kindil runs.
+        if Net::wanted() == Power::Off {
+            eprintln!("kindil: Wi-Fi is switched off");
+            if let Err(error) = net.set(Power::Off, &saved) {
+                eprintln!("kindil: Wi-Fi off: {error}");
+            }
+            return;
+        }
         match net.set(Power::On, &saved) {
             Ok(()) => {
                 eprintln!("kindil: Wi-Fi up with {} saved networks", saved.len());

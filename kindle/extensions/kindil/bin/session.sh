@@ -63,12 +63,28 @@ running() { status "$1" 2>/dev/null | grep -q start/; }
 # go, and wifid starts Amazon's supplicant afresh. The driver stays loaded:
 # unloading it can hang, and wifid's driver job is fine with it loaded.
 KINDIL_WIFI="/var/run/kindil-udhcpc.pid /var/run/kindil-wpa.pid"
+
+# Ends the process a pid file names and confirms it is gone: TERM, then KILL
+# after 3 s, so nothing of kindil's Wi-Fi overlaps what starts next.
+end_pid() {
+  pid="$(cat "$1" 2>/dev/null)"
+  rm -f "$1"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 0
+  kill "$pid" 2>/dev/null
+  n=0
+  while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 30 ]; do
+    usleep 100000
+    n=$((n + 1))
+  done
+  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+  return 0
+}
+
 wifi_back() {
   ran=""
   for pidfile in $KINDIL_WIFI; do
     if [ -f "$pidfile" ]; then
-      kill "$(cat "$pidfile")" 2>/dev/null
-      rm -f "$pidfile"
+      end_pid "$pidfile"
       ran=1
     fi
   done
@@ -176,10 +192,7 @@ fi
 # kindil's own Wi-Fi children (src/net.rs) from a run that crashed or was
 # killed: stopped before it runs again, which starts its Wi-Fi afresh.
 stop_children() {
-  for pidfile in $KINDIL_WIFI; do
-    [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null
-    rm -f "$pidfile"
-  done
+  for pidfile in $KINDIL_WIFI; do end_pid "$pidfile"; done
 }
 
 while :; do

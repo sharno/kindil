@@ -37,8 +37,12 @@ impl Frontlight {
         Ok(Brightness::new(to_percent(level_of(raw))))
     }
 
+    /// 0% is off: the driver's 0, not powerd's dimmest level.
     pub fn set(&self, brightness: Brightness) -> anyhow::Result<()> {
-        let raw = LEVELS[to_level(brightness.percent()) as usize];
+        let raw = match brightness.percent() {
+            0 => 0,
+            percent => LEVELS[to_level(percent) as usize],
+        };
         Ok(std::fs::write(&self.path, raw.to_string())?)
     }
 }
@@ -98,6 +102,9 @@ mod tests {
             assert_eq!(back, to_percent(to_level(percent)), "{percent}%");
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "255");
+        light.set(Brightness::new(0)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "0", "0% is dark");
+        assert_eq!(light.brightness().unwrap(), Brightness::new(0));
         assert!(Frontlight::at(&dir.path().join("missing")).is_err());
     }
 }

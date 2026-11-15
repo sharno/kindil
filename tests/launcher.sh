@@ -6,7 +6,7 @@ SESSION="$(cd "$(dirname "$0")/.." && pwd)/kindle/extensions/kindil/bin/session.
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/stub" "$T/ext" "$T/run"
-for c in lipc-set-prop eips sleep; do
+for c in lipc-set-prop eips sleep usleep; do
   printf '#!/bin/sh\nexit 0\n' >"$T/stub/$c"
 done
 # Upstart's stop and start, recorded in order, and the jobs running, one per

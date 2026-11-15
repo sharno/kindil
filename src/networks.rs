@@ -98,13 +98,16 @@ impl Networks {
             std::fs::create_dir_all(dir)?;
         }
         let temp = self.path.with_extension("toml.tmp");
-        std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(&temp)?
-            .write_all(text.as_bytes())?;
+            .open(&temp)?;
+        // The mode applies only to a new file: one a crash left behind,
+        // perhaps wider, is made root only before it holds a password.
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        file.write_all(text.as_bytes())?;
         std::fs::rename(&temp, &self.path)?;
         root_only(&self.path)?;
         Ok(())
@@ -163,6 +166,21 @@ mod tests {
         // Opened again after something else widened it.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
         Networks::open(&path);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_leftover_temp_file_is_made_root_only_before_writing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("networks.toml");
+        let temp = path.with_extension("toml.tmp");
+        std::fs::write(&temp, "").unwrap();
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o666)).unwrap();
+        Networks::open(&path)
+            .add(wpa("Home", "correct horse"))
+            .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
