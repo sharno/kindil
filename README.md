@@ -243,7 +243,8 @@ weather and make no requests.
 ### On the Kindle
 
 `cargo xtask` (the `xtask/` crate) reaches the Kindle over SSH
-(`KINDIL_DEVICE`, optionally `KINDIL_SSH_KEY`):
+(`KINDIL_DEVICE`, optionally `KINDIL_SSH_KEY` and `KINDIL_SSH_PORT`), and
+copies files with plain `ssh` (no scp or sftp needed on the Kindle):
 
 ```sh
 cargo xtask release 0.9.1 [--rollback 0.9.0]   # install a release
