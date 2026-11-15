@@ -71,6 +71,7 @@ pub struct KindleBackend<State = NoSchedule> {
     full_refresh: Arc<AtomicBool>,
     touches: Arc<AtomicU64>,
     motion: Arc<AtomicBool>,
+    frames: Arc<AtomicU64>,
     _state: PhantomData<State>,
 }
 
@@ -138,6 +139,13 @@ impl<State> KindleBackend<State> {
         self.motion.clone()
     }
 
+    /// Counts the frames drawn, each counted once it has been sent to the
+    /// panel. With [`wait_for_panel`], an app can tell when a change it made
+    /// is on the glass. kindil patch.
+    pub fn frame_counter(&self) -> Arc<AtomicU64> {
+        self.frames.clone()
+    }
+
     /// Switch state, keeping the same internals.
     fn into_state<Next>(self) -> KindleBackend<Next> {
         KindleBackend {
@@ -149,6 +157,7 @@ impl<State> KindleBackend<State> {
             full_refresh: self.full_refresh,
             touches: self.touches,
             motion: self.motion,
+            frames: self.frames,
             _state: PhantomData,
         }
     }
@@ -233,6 +242,7 @@ pub fn install(font_data: &[u8]) -> Result<KindleBackend, slint::PlatformError> 
     let full_refresh = Arc::new(AtomicBool::new(false));
     let touches = Arc::new(AtomicU64::new(0));
     let motion = Arc::new(AtomicBool::new(false));
+    let frames = Arc::new(AtomicU64::new(0));
     let platform = KindlePlatform::new(
         wake_schedule.clone(),
         on_wake.clone(),
@@ -241,6 +251,7 @@ pub fn install(font_data: &[u8]) -> Result<KindleBackend, slint::PlatformError> 
         full_refresh.clone(),
         touches.clone(),
         motion.clone(),
+        frames.clone(),
     )
     .map_err(|e| slint::PlatformError::Other(format!("failed to init Kindle platform: {e}")))?;
     let window = platform.window.clone();
@@ -255,6 +266,14 @@ pub fn install(font_data: &[u8]) -> Result<KindleBackend, slint::PlatformError> 
         full_refresh,
         touches,
         motion,
+        frames,
         _state: PhantomData,
     })
+}
+
+/// Blocks until the e-ink controller has finished the last update sent to
+/// it, from any thread; immediately when none is pending. Best effort: an
+/// error returns at once. kindil patch.
+pub fn wait_for_panel() {
+    framebuffer::wait_for_panel();
 }

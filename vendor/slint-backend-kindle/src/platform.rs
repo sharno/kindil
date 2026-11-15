@@ -34,6 +34,7 @@ pub(crate) struct KindlePlatform {
     full_refresh: Arc<AtomicBool>,
     touches: Arc<AtomicU64>,
     motion: Arc<AtomicBool>,
+    frames: Arc<AtomicU64>,
 }
 
 /// A panel rectangle in physical pixels.
@@ -147,6 +148,7 @@ impl KindlePlatform {
         full_refresh: Arc<AtomicBool>,
         touches: Arc<AtomicU64>,
         motion: Arc<AtomicBool>,
+        frames: Arc<AtomicU64>,
     ) -> std::io::Result<Self> {
         let window = MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer);
         let wakeup = wakeup::make_wakeup()?;
@@ -163,6 +165,7 @@ impl KindlePlatform {
             full_refresh,
             touches,
             motion,
+            frames,
         })
     }
 
@@ -441,6 +444,9 @@ impl Platform for KindlePlatform {
                     };
                     frame_buffer.refresh_region(area.origin, area.size, pass);
                 }
+                // Counted once the frame is with the panel (or had nothing
+                // to send): an app can wait for the frame after a change.
+                self.frames.fetch_add(1, Ordering::Release);
             });
             motion = motion.after(frame, drawn);
         }

@@ -2,6 +2,8 @@ use clap::{Parser, Subcommand};
 use kindil::config::Config;
 use kindil::host::Simulated;
 use kindil::system::Touches;
+#[cfg(feature = "kindle")]
+use kindil::ui::Presented;
 use kindil::ui::{App, Execution, Exit, Options, Panel};
 use slint::ComponentHandle;
 use std::path::PathBuf;
@@ -73,6 +75,7 @@ fn preview(cli: &Cli, dir: &std::path::Path) -> anyhow::Result<()> {
         config,
         host: Arc::new(Simulated::default()),
         panel: Panel::Lcd,
+        presented: None,
         execution: Execution::Inline,
         touches: Touches::default(),
         now: chrono::Utc::now,
@@ -97,6 +100,7 @@ fn desktop(cli: &Cli) -> anyhow::Result<()> {
         config,
         host: Arc::new(Simulated::default()),
         panel: Panel::Lcd,
+        presented: None,
         execution: Execution::Background,
         touches: Touches::default(),
         now: chrono::Utc::now,
@@ -122,6 +126,10 @@ fn kindle(cli: &Cli) -> anyhow::Result<Exit> {
             full_refresh: backend.full_refresh_flag(),
             motion: backend.motion_flag(),
         },
+        presented: Some(Presented {
+            frames: backend.frame_counter(),
+            wait_idle: slint_backend_kindle::wait_for_panel,
+        }),
         execution: Execution::Background,
         touches: Touches::new(backend.touch_counter()),
         now: chrono::Utc::now,

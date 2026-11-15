@@ -89,6 +89,7 @@ impl Fixture {
                 full_refresh: Arc::default(),
                 motion: motion.clone(),
             },
+            presented: None,
             execution: Execution::Inline,
             touches: Touches::default(),
             now,
