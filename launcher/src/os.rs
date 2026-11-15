@@ -39,6 +39,15 @@ pub trait Os: Sync {
     /// Deletes every copy of the firewall rule kindil adds to let `port` in
     /// over Wi-Fi (src/ssh.rs).
     fn close_port(&self, port: u16);
+    /// Binds `source` over `target`, then remounts that bind read-only;
+    /// leaves nothing bound if either fails.
+    fn bind_ro(&self, source: &Path, target: &Path) -> Result<(), String>;
+    /// Unmounts what is mounted on `target`.
+    fn unmount(&self, target: &Path) -> bool;
+    /// `initctl reload-configuration`: upstart reads its jobs' files again.
+    fn reload_upstart(&self);
+    /// Whether upstart has a job named `job`, running or not.
+    fn job_known(&self, job: &str) -> bool;
 }
 
 /// The PW1 itself.
@@ -265,6 +274,88 @@ impl Os for Device {
     fn unload_module(&self, module: &str) {
         quiet("modprobe", &["-r", module]);
     }
+
+    fn bind_ro(&self, source: &Path, target: &Path) -> Result<(), String> {
+        bind_ro(source, target)
+    }
+
+    fn unmount(&self, target: &Path) -> bool {
+        unmount(target)
+    }
+
+    fn reload_upstart(&self) {
+        quiet("/sbin/initctl", &["reload-configuration"]);
+    }
+
+    fn job_known(&self, job: &str) -> bool {
+        // "Unknown job" exits 1; any state of a known job, 0.
+        quiet("/sbin/status", &[job])
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn c_path(path: &Path) -> Result<std::ffi::CString, String> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn mount(source: &Path, target: &Path, flags: libc::c_ulong) -> Result<(), String> {
+    let (source, target) = (c_path(source)?, c_path(target)?);
+    // SAFETY: mount(2) with valid NUL-terminated paths; no fs type or data.
+    let result = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bind_ro(source: &Path, target: &Path) -> Result<(), String> {
+    mount(source, target, libc::MS_BIND).map_err(|e| format!("bind: {e}"))?;
+    // A bind takes its mount's flags whatever MS_RDONLY says: read-only
+    // takes a remount of the bind itself.
+    mount(
+        source,
+        target,
+        libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+    )
+    .map_err(|e| {
+        unmount(target);
+        format!("read-only remount: {e}")
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_ro(_: &Path, _: &Path) -> Result<(), String> {
+    Err("bind mounts need Linux".into())
+}
+
+#[cfg(target_os = "linux")]
+fn unmount(target: &Path) -> bool {
+    let Ok(target) = c_path(target) else {
+        return false;
+    };
+    // SAFETY: umount2(2) with a valid NUL-terminated path. A file held
+    // open (EBUSY) is detached instead: gone for anyone opening it anew.
+    unsafe {
+        libc::umount2(target.as_ptr(), 0) == 0
+            || libc::umount2(target.as_ptr(), libc::MNT_DETACH) == 0
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unmount(_: &Path) -> bool {
+    false
 }
 
 /// Whether `pid` has exited and waits for its parent to reap it: kill(2)
@@ -447,6 +538,13 @@ pub mod fake {
         pub dies: Mutex<bool>,
         died: Mutex<bool>,
         pub modules: Mutex<BTreeSet<String>>,
+        /// Bind mounts, as files copied over their targets: each target
+        /// with the bytes it had.
+        pub binds: Mutex<Vec<(std::path::PathBuf, Vec<u8>)>>,
+        /// A bind over a target ending in this fails.
+        pub fail_bind: Mutex<Option<String>>,
+        /// Jobs upstart doesn't know.
+        pub unknown_jobs: Mutex<BTreeSet<String>>,
     }
 
     impl Fake {
@@ -476,6 +574,20 @@ pub mod fake {
 
         pub fn clear_upstart(&self) {
             self.upstart.lock().unwrap().clear();
+        }
+
+        /// A new boot: the binds are gone.
+        pub fn reboot(&self) {
+            for (target, bytes) in self.binds.lock().unwrap().drain(..).rev() {
+                std::fs::write(target, bytes).unwrap();
+            }
+        }
+
+        /// A path as the tests record it: from "root/" on.
+        fn short(path: &Path) -> String {
+            let path = path.to_string_lossy();
+            path.split_once("/root/")
+                .map_or_else(|| path.to_string(), |(_, rest)| rest.to_owned())
         }
     }
 
@@ -579,6 +691,46 @@ pub mod fake {
         fn unload_module(&self, module: &str) {
             self.upstart.lock().unwrap().push(format!("rmmod {module}"));
             self.modules.lock().unwrap().remove(module);
+        }
+
+        fn bind_ro(&self, source: &Path, target: &Path) -> Result<(), String> {
+            let fail = self.fail_bind.lock().unwrap().clone();
+            if fail.is_some_and(|end| target.to_string_lossy().ends_with(&end)) {
+                return Err("refused".into());
+            }
+            let name = source.file_name().unwrap().to_string_lossy();
+            self.upstart
+                .lock()
+                .unwrap()
+                .push(format!("bind {name} {}", Self::short(target)));
+            let bytes = std::fs::read(target).map_err(|e| e.to_string())?;
+            std::fs::copy(source, target).map_err(|e| e.to_string())?;
+            self.binds.lock().unwrap().push((target.to_owned(), bytes));
+            Ok(())
+        }
+
+        fn unmount(&self, target: &Path) -> bool {
+            self.upstart
+                .lock()
+                .unwrap()
+                .push(format!("unmount {}", Self::short(target)));
+            let mut binds = self.binds.lock().unwrap();
+            let Some(at) = binds.iter().rposition(|(t, _)| t == target) else {
+                return false;
+            };
+            let (_, bytes) = binds.remove(at);
+            std::fs::write(target, bytes).is_ok()
+        }
+
+        fn reload_upstart(&self) {
+            self.upstart
+                .lock()
+                .unwrap()
+                .push("reload-configuration".into());
+        }
+
+        fn job_known(&self, job: &str) -> bool {
+            !self.unknown_jobs.lock().unwrap().contains(job)
         }
     }
 }

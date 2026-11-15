@@ -598,6 +598,9 @@ mod tests {
                 sshd_pid: t.join("sshd.pid"),
                 pid_file: t.join("kindil.pid"),
                 boot_id: t.join("boot_id"),
+                overlays_on: vec![t.join("user/OVERLAYS")],
+                overlay_dir: t.join("overlay-copies"),
+                root: t.join("root"),
             };
             std::fs::create_dir_all(&paths.run).unwrap();
             std::fs::create_dir_all(&paths.ext).unwrap();

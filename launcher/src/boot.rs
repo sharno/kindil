@@ -5,6 +5,11 @@
 //! boots where kindil didn't stay up: then the Kindle boots to Amazon's UI
 //! as before. BOOT holding "standalone" also skips Amazon's UI from the next
 //! boot on; any boot where kindil doesn't stay up brings it back.
+//!
+//! Runtime overlays (overlay.rs) come first, on every boot while their own
+//! switch is on, whether kindil starts at boot or not: they keep Amazon's
+//! UI from widening kindil's files, which matters whenever it runs. The job
+//! then waits until they have had SETTLE to prove themselves.
 use crate::os::{self, Os};
 use crate::{Paths, SERVICES};
 use std::time::Duration;
@@ -39,6 +44,18 @@ fn wait_for(os: &dyn Os, check: impl Fn() -> bool) -> bool {
 }
 
 pub fn boot(paths: &Paths, os: &dyn Os) {
+    let mut say = |line: String| log(&format!("overlays: {line}"));
+    let applied = crate::overlay::apply(paths, os, crate::overlay::OVERLAYS, &mut say);
+    guard(paths, os);
+    if let Some(applied) = applied {
+        let since = os.now().saturating_sub(applied.at);
+        os.sleep(SETTLE.saturating_sub(Duration::from_secs(since)));
+        crate::overlay::prove(paths, os, &applied, &mut say);
+    }
+}
+
+/// The start-at-boot guard.
+fn guard(paths: &Paths, os: &dyn Os) {
     if !paths.flag.exists() {
         return;
     }
@@ -131,10 +148,30 @@ fn amazon_ui(paths: &Paths, os: &dyn Os) {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::os::fake::{Fake, UP};
     use std::path::Path;
+
+    /// Everything in the temporary directory `t`.
+    pub fn paths(t: &Path) -> Paths {
+        Paths {
+            run: t.join("state"),
+            ext: t.join("ext"),
+            user: t.join("user"),
+            config: t.join("user/kindil.toml"),
+            flag: t.join("BOOT"),
+            skip: t.join("SKIP"),
+            charger: t.join("charging"),
+            wifi_pids: vec![],
+            sshd_pid: t.join("sshd.pid"),
+            pid_file: t.join("pid"),
+            boot_id: t.join("boot_id"),
+            overlays_on: vec![t.join("OVERLAYS"), t.join("base-us-OVERLAYS")],
+            overlay_dir: t.join("overlay-copies"),
+            root: t.join("root"),
+        }
+    }
 
     struct Env {
         _dir: tempfile::TempDir,
@@ -154,19 +191,7 @@ mod tests {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let t = dir.path();
-            let paths = Paths {
-                run: t.join("state"),
-                ext: t.join("ext"),
-                user: t.join("user"),
-                config: t.join("user/kindil.toml"),
-                flag: t.join("BOOT"),
-                skip: t.join("SKIP"),
-                charger: t.join("charging"),
-                wifi_pids: vec![],
-                sshd_pid: t.join("sshd.pid"),
-                pid_file: t.join("pid"),
-                boot_id: t.join("boot_id"),
-            };
+            let paths = paths(t);
             let os = Fake::with_jobs(&boot_jobs());
             *os.gui_coming.lock().unwrap() = true;
             Self {
@@ -220,6 +245,61 @@ mod tests {
         let env = Env::new();
         env.boot("a");
         assert_eq!(env.starts(), 0);
+        assert_eq!(env.os.upstart(), "", "nor are overlays applied");
+    }
+
+    impl Env {
+        /// Overlays on, over Amazon's framework.conf; the target.
+        fn overlays(&self) -> std::path::PathBuf {
+            let target = self.paths.root.join("etc/upstart/framework.conf");
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, crate::overlay::OVERLAYS[0].original).unwrap();
+            self.touch(&self.paths.overlays_on[0]);
+            target
+        }
+    }
+
+    #[test]
+    fn overlays_apply_and_prove_themselves_without_start_at_boot() {
+        let env = Env::new();
+        let target = env.overlays();
+        env.boot("a");
+        assert_eq!(env.starts(), 0);
+        assert_eq!(
+            env.os.upstart(),
+            "bind etc_upstart_framework.conf etc/upstart/framework.conf,reload-configuration,"
+        );
+        assert_eq!(
+            std::fs::read(target).unwrap(),
+            crate::overlay::OVERLAYS[0].replacement
+        );
+        assert!(!env.paths.run.join("overlay-tries").exists(), "proven");
+    }
+
+    #[test]
+    fn overlays_come_before_kindil_starts_at_boot() {
+        let env = Env::new();
+        env.overlays();
+        env.flag("");
+        env.boot("a");
+        assert_eq!(env.starts(), 1);
+        assert!(env
+            .os
+            .upstart()
+            .starts_with("bind etc_upstart_framework.conf"));
+        assert!(!env.paths.run.join("overlay-tries").exists());
+    }
+
+    #[test]
+    fn overlays_past_their_limit_leave_start_at_boot_alone() {
+        let env = Env::new();
+        env.overlays();
+        std::fs::create_dir_all(&env.paths.run).unwrap();
+        std::fs::write(env.paths.run.join("overlay-tries"), "2\n").unwrap();
+        env.flag("");
+        env.boot("a");
+        assert_eq!((env.starts(), env.os.upstart()), (1, String::new()));
+        assert_eq!(read(&env.paths.run.join("overlay-tries")), "2");
     }
 
     #[test]
@@ -419,6 +499,14 @@ mod shim {
                     ),
                 ),
                 ("/mnt/us/kindil/BOOT", format!("{}/BOOT", t.display())),
+                (
+                    "/mnt/us/kindil/OVERLAYS",
+                    format!("{}/OVERLAYS", t.display()),
+                ),
+                (
+                    "/mnt/base-us/kindil/OVERLAYS",
+                    format!("{}/base-us-OVERLAYS", t.display()),
+                ),
                 (
                     "/var/local/kindil/launcher",
                     format!("{}/launcher", t.display()),

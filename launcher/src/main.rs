@@ -8,7 +8,10 @@
 //!   previous one.
 //! - `launcher boot`: the start-at-boot guard (bin/boot.sh, from
 //!   /etc/upstart/kindil.conf): kindil once per boot, and Amazon's UI again
-//!   after boots kindil doesn't stay up in.
+//!   after boots kindil doesn't stay up in. First, on every boot while
+//!   /mnt/us/kindil/OVERLAYS exists, it lays kindil's runtime overlays
+//!   over a few of Amazon's files (overlay.rs); the session never needs
+//!   them.
 //!
 //! It is the way back to Amazon's UI when kindil isn't well, so it is small,
 //! shares no code with kindil and changes rarely: kindil carries it and
@@ -17,6 +20,7 @@
 //! live in sbin, which SSH sessions lack: every command gets a full PATH.
 mod boot;
 mod os;
+mod overlay;
 mod session;
 
 use std::path::PathBuf;
@@ -67,6 +71,14 @@ pub struct Paths {
     /// The running session's pid.
     pub pid_file: PathBuf,
     pub boot_id: PathBuf,
+    /// Runtime overlays are on while any of these exists.
+    pub overlays_on: Vec<PathBuf>,
+    /// Root's own directory on tmpfs for the overlays' copies, out of
+    /// reach of the chmod Amazon's UI runs over /var/local, /var/tmp
+    /// (/tmp), /var/run, /var/log and /var/lock.
+    pub overlay_dir: PathBuf,
+    /// What overlays' targets are relative to.
+    pub root: PathBuf,
 }
 
 impl Default for Paths {
@@ -86,6 +98,14 @@ impl Default for Paths {
             sshd_pid: "/var/run/kindil-sshd.pid".into(),
             pid_file: "/var/tmp/kindil.pid".into(),
             boot_id: "/proc/sys/kernel/random/boot_id".into(),
+            // /mnt/base-us: the storage under /mnt/us's FUSE layer, should
+            // that not be up yet.
+            overlays_on: vec![
+                "/mnt/us/kindil/OVERLAYS".into(),
+                "/mnt/base-us/kindil/OVERLAYS".into(),
+            ],
+            overlay_dir: "/var/kindil-overlays".into(),
+            root: "/".into(),
         }
     }
 }
