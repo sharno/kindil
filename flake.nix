@@ -113,7 +113,10 @@
               # the native executable too. Select only the prebuilt ARM target.
               buildPhase = ''
                 runHook preBuild
-                # kindil carries its launcher (launcher/, src/launcher.rs).
+                # kindil carries its SSH server (sshd/, src/ssh.rs), built for size,
+                cargo build --locked --offline --profile sshd --target ${target} --package sshd --jobs "$NIX_BUILD_CORES"
+                export KINDIL_SSHD="$PWD/target/${target}/sshd/kindil-sshd"
+                # and its launcher (launcher/, src/launcher.rs).
                 cargo build --locked --offline --release --target ${target} --package launcher --jobs "$NIX_BUILD_CORES"
                 export KINDIL_LAUNCHER="$PWD/target/${target}/release/launcher"
                 cargo build --locked --offline --release --target ${target} --features kindle --jobs "$NIX_BUILD_CORES"

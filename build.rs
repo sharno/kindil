@@ -11,6 +11,12 @@ fn main() {
         "wpa_supplicant",
         "nix build .#wpa-supplicant-device",
     );
+    // Its SSH server (sshd/, built for the Kindle first).
+    embed(
+        "KINDIL_SSHD",
+        "kindil-sshd",
+        "cargo build -p sshd --profile sshd --target ...",
+    );
     // Its launcher (launcher/, built for the Kindle first).
     embed(
         "KINDIL_LAUNCHER",
