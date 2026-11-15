@@ -252,9 +252,18 @@ fn sha256(bytes: &[u8]) -> String {
 
 fn version_of(binary: &Path) -> anyhow::Result<String> {
     executable(binary)?;
-    let out = std::process::Command::new(binary)
-        .arg("--version")
-        .output()?;
+    // A file just written can stay open a moment in a child another thread
+    // forked and hasn't yet exec'd: running it fails with ETXTBSY meanwhile.
+    let mut tries = 0;
+    let out = loop {
+        match std::process::Command::new(binary).arg("--version").output() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => break result?,
+        }
+    };
     anyhow::ensure!(
         out.status.success(),
         "{} --version failed",

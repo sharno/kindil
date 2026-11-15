@@ -54,6 +54,22 @@ fn kill(pid: i32, signal: i32) {
     unsafe { libc::kill(pid, signal) };
 }
 
+/// Runs `spawn` again while it fails with ETXTBSY: a file just written can
+/// stay open a moment in a child another thread forked and hasn't yet
+/// exec'd (the tests write and run scripts in parallel).
+pub fn retrying<T>(mut spawn: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut tries = 0;
+    loop {
+        match spawn() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Sets `signal` to its default in a child about to exec: the launcher
 /// ignores some that kindil must get.
 fn default_signals(command: &mut Command) {
@@ -101,7 +117,7 @@ impl Os for Device {
         let mut command = Command::new(binary);
         command.args(args).env("PATH", PATH).stdin(Stdio::null());
         default_signals(&mut command);
-        match command.status() {
+        match retrying(|| command.status()) {
             Ok(status) => status
                 .code()
                 .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
@@ -193,12 +209,14 @@ impl Os for Device {
 }
 
 pub fn version(binary: &Path) -> Option<String> {
-    let out = Command::new(binary)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let out = retrying(|| {
+        Command::new(binary)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+    })
+    .ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
@@ -219,18 +237,34 @@ pub fn ignore(signal: i32) {
     unsafe { libc::signal(signal, libc::SIG_IGN) };
 }
 
-/// A timestamped line on stdout (`start` points it at kindil.log), with the
-/// date as `date '+%F %T'` writes it, in the device's time zone.
+/// A timestamped line on stdout (`start` points it at kindil.log), in the
+/// device's time zone.
 pub fn log(message: &str) {
     println!("{} {message}", local_time());
 }
 
+/// From the system's `date`: musl reads the PW1's zone file (TZif with an
+/// empty rule for later times) as UTC. UTC if `date` won't say.
 fn local_time() -> String {
+    Command::new("date")
+        .arg("+%F %T")
+        .env("PATH", PATH)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .filter(|time| !time.is_empty())
+        .unwrap_or_else(utc_time)
+}
+
+fn utc_time() -> String {
     // SAFETY: time(2) and localtime_r(3) with valid pointers.
     unsafe {
         let now = libc::time(std::ptr::null_mut());
         let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&now, &mut tm);
+        libc::gmtime_r(&now, &mut tm);
         format!(
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
             tm.tm_year + 1900,
