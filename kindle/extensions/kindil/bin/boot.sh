@@ -3,8 +3,12 @@
 # whose `boot` is the start-at-boot guard (launcher/src/boot.rs); it exits 0
 # whatever the boot. Any other exit (no launcher runs, or it crashed) brings
 # Amazon's UI with its framework, as after any boot kindil fails in.
+# OVERLAYS (or the same file under /mnt/us's FUSE layer) has the launcher lay
+# kindil's runtime overlays over a few of Amazon's files, start at boot or
+# not (launcher/src/overlay.rs).
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
-[ -f /mnt/us/kindil/BOOT ] || exit 0
+[ -f /mnt/us/kindil/BOOT ] || [ -f /mnt/us/kindil/OVERLAYS ] ||
+  [ -f /mnt/base-us/kindil/OVERLAYS ] || exit 0
 L=/var/local/kindil/launcher
 SKIP=/mnt/us/DONT_START_FRAMEWORK
 # The launcher's SERVICES (launcher/src/main.rs; a test keeps them alike).

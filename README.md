@@ -212,6 +212,8 @@ faster.
 | `/mnt/us/kindil/prefs.toml` | Choices made on the device; safe to delete |
 | `/mnt/us/kindil/BOOT` | Present: start kindil at boot; `standalone` inside: without Amazon's framework (see [Start at boot](#start-at-boot)) |
 | `/mnt/us/DONT_START_FRAMEWORK` | Amazon's flag to skip its framework; kindil sets and clears it for a standalone boot |
+| `/mnt/us/kindil/OVERLAYS` | Present: runtime overlays at boot (experimental; see below) |
+| `/var/local/kindil/overlay-tries` | Boots with overlays not yet proven; at 2 they are skipped |
 | `/etc/upstart/kindil.conf` | Only if you installed start at boot |
 | `/mnt/us/books/` | Books |
 | `/mnt/us/books/.kindil-trash/` | Trashed books, recoverable |
@@ -226,6 +228,18 @@ the copy it runs, before running it. While Amazon's UI runs, the window stays
 open: the `javausers` group (Amazon's framework runs as `framework`) can
 change kindil's files, including the launcher root runs next and the trusted
 SSH keys, and `/var/local` itself is `framework`'s.
+
+**Runtime overlays** (experimental, off by default;
+[docs/OVERLAY-TEST.md](docs/OVERLAY-TEST.md)): with
+`/mnt/us/kindil/OVERLAYS` present and the boot job installed, each boot's
+`launcher boot` lays a copy of `framework.conf` whose loop leaves
+`/var/local/kindil` out over Amazon's with a read-only bind mount, before
+Amazon's UI starts. The system partition stays as it is: a boot without the
+file is stock. It applies only over the exact `framework.conf` it was made
+from, and two boots in a row that don't run 2 minutes with it turn it off
+until `/var/local/kindil/overlay-tries` is deleted. `/var/local` stays
+`framework`'s, so Amazon's framework could still move `/var/local/kindil`
+aside.
 
 ## Syncthing
 
