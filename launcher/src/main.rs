@@ -56,9 +56,10 @@ pub struct Paths {
     pub skip: PathBuf,
     /// The charger's switch, which kindil may have left off.
     pub charger: PathBuf,
-    /// The pid files of kindil's own children: Wi-Fi's (src/net.rs) first,
-    /// then its SSH server (src/ssh.rs), the last.
-    pub child_pids: Vec<PathBuf>,
+    /// The pid files of kindil's own Wi-Fi children (src/net.rs).
+    pub wifi_pids: Vec<PathBuf>,
+    /// The pid file of kindil's own SSH server (src/ssh.rs).
+    pub sshd_pid: PathBuf,
     /// The running session's pid.
     pub pid_file: PathBuf,
     pub boot_id: PathBuf,
@@ -74,11 +75,11 @@ impl Default for Paths {
             flag: "/mnt/us/kindil/BOOT".into(),
             skip: "/mnt/us/DONT_START_FRAMEWORK".into(),
             charger: "/sys/devices/platform/aplite_charger.0/charging".into(),
-            child_pids: vec![
+            wifi_pids: vec![
                 "/var/run/kindil-udhcpc.pid".into(),
                 "/var/run/kindil-wpa.pid".into(),
-                "/var/run/kindil-sshd.pid".into(),
             ],
+            sshd_pid: "/var/run/kindil-sshd.pid".into(),
             pid_file: "/var/tmp/kindil.pid".into(),
             boot_id: "/proc/sys/kernel/random/boot_id".into(),
         }
@@ -86,6 +87,12 @@ impl Default for Paths {
 }
 
 impl Paths {
+    /// The pid files of all of kindil's own children: Wi-Fi's, then its SSH
+    /// server's.
+    pub fn child_pids(&self) -> impl Iterator<Item = &PathBuf> {
+        self.wifi_pids.iter().chain([&self.sshd_pid])
+    }
+
     pub fn log(&self) -> PathBuf {
         self.run.join("kindil.log")
     }

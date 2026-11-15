@@ -343,7 +343,7 @@ fn run(paths: &Paths, os: &dyn Os, files: &Files, mut slot: PathBuf) {
 /// or was killed: stopped before it runs again, which starts them afresh,
 /// and before its binary is replaced, which udhcpc runs as its hook.
 fn end_children(paths: &Paths, os: &dyn Os) {
-    for pid_file in &paths.child_pids {
+    for pid_file in paths.child_pids() {
         os.end_pid_file(pid_file);
     }
 }
@@ -388,14 +388,17 @@ fn restore(paths: &Paths, os: &dyn Os, gui: bool, usb: Option<UsbDrive>) {
 /// go, and so does its SSH server (src/ssh.rs) with the sessions open over
 /// it, and wifid starts Amazon's supplicant afresh. The driver stays loaded:
 /// unloading it can hang, and wifid's driver job is fine with it loaded.
+/// Only a Wi-Fi child's pid file says kindil ran Wi-Fi: the SSH server's
+/// doesn't, and Amazon's supplicant then stays.
 fn wifi_back(paths: &Paths, os: &dyn Os) {
     let mut ran = false;
-    for pid_file in &paths.child_pids {
+    for pid_file in &paths.wifi_pids {
         if pid_file.exists() {
             os.end_pid_file(pid_file);
             ran = true;
         }
     }
+    os.end_pid_file(&paths.sshd_pid);
     if ran && !os.running("wifid") {
         os.stop("wifis");
     }
@@ -427,7 +430,8 @@ mod tests {
                 flag: t.join("user/BOOT"),
                 skip: t.join("SKIP"),
                 charger: t.join("charging"),
-                child_pids: vec![t.join("udhcpc.pid"), t.join("wpa.pid"), t.join("sshd.pid")],
+                wifi_pids: vec![t.join("udhcpc.pid"), t.join("wpa.pid")],
+                sshd_pid: t.join("sshd.pid"),
                 pid_file: t.join("kindil.pid"),
                 boot_id: t.join("boot_id"),
             };
@@ -719,7 +723,7 @@ mod tests {
     #[test]
     fn the_wifi_children_end_before_the_binary_they_run_is_replaced() {
         let env = Env::new();
-        let wpa = &env.paths.child_pids[1];
+        let wpa = &env.paths.wifi_pids[1];
         std::fs::write(wpa, "9\n").unwrap();
         env.fake(&env.ext("kindil"), "1.0.0", "exit 0");
         let os = Fake::default();
@@ -758,7 +762,7 @@ mod tests {
     fn leaving_after_kindil_ran_wifi_gives_wifid_a_fresh_supplicant() {
         let env = Env::new();
         let os = Fake::default();
-        let [dhcp, wpa] = [&env.paths.child_pids[0], &env.paths.child_pids[1]];
+        let [dhcp, wpa] = [&env.paths.wifi_pids[0], &env.paths.wifi_pids[1]];
         let body = format!(
             "echo 1 >{}; echo 2 >{}; exit 0",
             dhcp.display(),
@@ -780,9 +784,26 @@ mod tests {
     }
 
     #[test]
+    fn leaving_with_only_the_ssh_server_left_keeps_amazons_supplicant() {
+        let env = Env::new();
+        let os = Fake::default();
+        let ssh = &env.paths.sshd_pid;
+        env.fake(
+            &env.ext("kindil"),
+            "1.0.0",
+            &format!("echo 7 >{}; exit 0", ssh.display()),
+        );
+        env.session(&os);
+        assert!(!os.upstart().contains("stop wifis"));
+        assert!(os.running("wifid"));
+        assert!(!ssh.exists());
+        assert_eq!(*os.ended.lock().unwrap(), std::slice::from_ref(ssh));
+    }
+
+    #[test]
     fn a_run_after_a_crash_doesnt_find_the_crashed_runs_wifi_children() {
         let env = Env::new();
-        let (runs, wpa) = (env.t().join("runs"), &env.paths.child_pids[1]);
+        let (runs, wpa) = (env.t().join("runs"), &env.paths.wifi_pids[1]);
         let body = format!(
             "echo ran >>{r}; [ -f {w} ] && echo found >>{r}; [ $(grep -c ran {r}) -ge 2 ] && exit 0; \
              echo 9 >{w}; exit 139",
@@ -867,7 +888,7 @@ mod tests {
     fn kindils_ssh_server_ends_before_each_run_and_on_the_way_out() {
         let env = Env::new();
         let os = Fake::default();
-        let (runs, ssh) = (env.t().join("runs"), &env.paths.child_pids[2]);
+        let (runs, ssh) = (env.t().join("runs"), &env.paths.sshd_pid);
         // Each run leaves its SSH server's pid file behind; the first crashes.
         let body = format!(
             "echo ran >>{r}; [ -f {s} ] && echo found >>{r}; echo 7 >{s}; \
