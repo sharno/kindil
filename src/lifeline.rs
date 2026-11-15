@@ -10,8 +10,10 @@
 //! It only acts while the Kindle is awake: no help for an experiment that
 //! keeps it asleep or dozing.
 //!
-//! It is kindil's own binary, run as `kindil-lifeline` (a link beside it,
-//! which `cargo xtask run` makes), so it never takes itself for kindil: it
+//! It is kindil's own binary, run as `kindil-lifeline` (a link in
+//! /var/local/kindil to the installed binary on the user storage, which
+//! `cargo xtask run` makes: linked to the running copy it would keep that
+//! copy's space taken), so it never takes itself for kindil: it
 //! leaves out its own process and ends kindil by pid, never `killall`. An
 //! experiment's `killall kindil` still finds it (busybox also matches the
 //! binary a process runs, links resolved), so it ignores the signals that
