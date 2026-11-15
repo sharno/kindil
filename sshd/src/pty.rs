@@ -47,7 +47,9 @@ pub fn open(size: Size) -> io::Result<(Master, OwnedFd)> {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut winsize,
+            // A raw pointer: glibc and musl take `*const winsize`, macOS
+            // `*mut`; a `*mut` serves both, `&mut` trips clippy on Linux.
+            &raw mut winsize,
         )
     })?;
     // SAFETY: both were just opened by openpty and are owned by nobody else.
