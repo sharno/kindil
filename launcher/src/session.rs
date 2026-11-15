@@ -154,7 +154,7 @@ pub fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
     // Event watchers an earlier kindil left behind (orphans, now init's);
     // they ignore TERM.
     os.kill_orphaned_watchers();
-    end_wifi_children(paths, os);
+    end_children(paths, os);
     let slot = files.installed.clone();
     files.pick(&slot);
     if !executable(&files.bin) {
@@ -277,16 +277,16 @@ fn run(paths: &Paths, os: &dyn Os, files: &Files, mut slot: PathBuf) {
                 }
             }
         }
-        end_wifi_children(paths, os);
+        end_children(paths, os);
         files.pick(&slot);
     }
 }
 
-/// kindil's own Wi-Fi children from a run that crashed or was killed:
-/// stopped before it runs again, which starts its Wi-Fi afresh, and before
-/// its binary is replaced, which udhcpc runs as its hook.
-fn end_wifi_children(paths: &Paths, os: &dyn Os) {
-    for pid_file in &paths.wifi_pids {
+/// kindil's own children (Wi-Fi's, its SSH server) from a run that crashed
+/// or was killed: stopped before it runs again, which starts them afresh,
+/// and before its binary is replaced, which udhcpc runs as its hook.
+fn end_children(paths: &Paths, os: &dyn Os) {
+    for pid_file in &paths.child_pids {
         os.end_pid_file(pid_file);
     }
 }
@@ -323,11 +323,12 @@ fn restore(paths: &Paths, os: &dyn Os, gui: bool) {
 }
 
 /// kindil ran Wi-Fi itself (src/net.rs): its DHCP client and wpa_supplicant
-/// go, and wifid starts Amazon's supplicant afresh. The driver stays loaded:
+/// go, and so does its SSH server (src/ssh.rs; sessions open over it carry
+/// on), and wifid starts Amazon's supplicant afresh. The driver stays loaded:
 /// unloading it can hang, and wifid's driver job is fine with it loaded.
 fn wifi_back(paths: &Paths, os: &dyn Os) {
     let mut ran = false;
-    for pid_file in &paths.wifi_pids {
+    for pid_file in &paths.child_pids {
         if pid_file.exists() {
             os.end_pid_file(pid_file);
             ran = true;
@@ -364,7 +365,11 @@ mod tests {
                 flag: t.join("user/BOOT"),
                 skip: t.join("SKIP"),
                 charger: t.join("charging"),
-                wifi_pids: vec![t.join("udhcpc.pid"), t.join("wpa.pid")],
+                child_pids: vec![
+                    t.join("udhcpc.pid"),
+                    t.join("wpa.pid"),
+                    t.join("dropbear.pid"),
+                ],
                 pid_file: t.join("kindil.pid"),
                 boot_id: t.join("boot_id"),
             };
@@ -656,7 +661,7 @@ mod tests {
     #[test]
     fn the_wifi_children_end_before_the_binary_they_run_is_replaced() {
         let env = Env::new();
-        let wpa = &env.paths.wifi_pids[1];
+        let wpa = &env.paths.child_pids[1];
         std::fs::write(wpa, "9\n").unwrap();
         env.fake(&env.ext("kindil"), "1.0.0", "exit 0");
         let os = Fake::default();
@@ -695,7 +700,7 @@ mod tests {
     fn leaving_after_kindil_ran_wifi_gives_wifid_a_fresh_supplicant() {
         let env = Env::new();
         let os = Fake::default();
-        let [dhcp, wpa] = [&env.paths.wifi_pids[0], &env.paths.wifi_pids[1]];
+        let [dhcp, wpa] = [&env.paths.child_pids[0], &env.paths.child_pids[1]];
         let body = format!(
             "echo 1 >{}; echo 2 >{}; exit 0",
             dhcp.display(),
@@ -719,7 +724,7 @@ mod tests {
     #[test]
     fn a_run_after_a_crash_doesnt_find_the_crashed_runs_wifi_children() {
         let env = Env::new();
-        let (runs, wpa) = (env.t().join("runs"), &env.paths.wifi_pids[1]);
+        let (runs, wpa) = (env.t().join("runs"), &env.paths.child_pids[1]);
         let body = format!(
             "echo ran >>{r}; [ -f {w} ] && echo found >>{r}; [ $(grep -c ran {r}) -ge 2 ] && exit 0; \
              echo 9 >{w}; exit 139",
@@ -729,6 +734,26 @@ mod tests {
         env.fake(&env.ext("kindil"), "1.0.0", &body);
         env.session(&Fake::default());
         assert_eq!(env.runs(), "ran ran");
+    }
+
+    #[test]
+    fn kindils_ssh_server_ends_before_each_run_and_on_the_way_out() {
+        let env = Env::new();
+        let os = Fake::default();
+        let (runs, ssh) = (env.t().join("runs"), &env.paths.child_pids[2]);
+        // Each run leaves its SSH server's pid file behind; the first crashes.
+        let body = format!(
+            "echo ran >>{r}; [ -f {s} ] && echo found >>{r}; echo 7 >{s}; \
+             [ $(grep -c ran {r}) -ge 2 ] && exit 0; exit 139",
+            r = runs.display(),
+            s = ssh.display()
+        );
+        env.fake(&env.ext("kindil"), "1.0.0", &body);
+        env.session(&os);
+        assert_eq!(env.runs(), "ran ran");
+        assert!(!ssh.exists());
+        let ended = os.ended.lock().unwrap();
+        assert_eq!(ended.iter().filter(|p| *p == ssh).count(), 2);
     }
 
     #[test]

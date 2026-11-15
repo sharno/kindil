@@ -83,8 +83,8 @@ fn arm_cargo(cc: &str) -> Command {
     command
 }
 
-/// dist/kindil, static ARMv7, with kindil's own wpa_supplicant and its
-/// launcher inside.
+/// dist/kindil, static ARMv7, with kindil's own wpa_supplicant, Dropbear
+/// and its launcher inside.
 pub fn device() -> anyhow::Result<PathBuf> {
     let cc = arm_linker()?;
     run(arm_cargo(&cc).args([
@@ -103,8 +103,15 @@ pub fn device() -> anyhow::Result<PathBuf> {
         "--print-out-paths",
         ".#wpa-supplicant-device",
     ]))?;
+    let dropbear = output(Command::new("nix").args([
+        "build",
+        "--no-link",
+        "--print-out-paths",
+        ".#dropbear-device",
+    ]))?;
     run(arm_cargo(&cc)
         .env("KINDIL_WPA_SUPPLICANT", format!("{wpa}/bin/wpa_supplicant"))
+        .env("KINDIL_DROPBEAR", format!("{dropbear}/bin/dropbearmulti"))
         .env("KINDIL_LAUNCHER", &launcher)
         .args([
             "build",
