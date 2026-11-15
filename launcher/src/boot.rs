@@ -347,3 +347,170 @@ mod tests {
         assert_eq!(env.os.upstart(), "stop lab126_gui,start lab126_gui,");
     }
 }
+
+/// bin/boot.sh, the shim the boot job runs, with stubbed upstart tools.
+#[cfg(test)]
+mod shim {
+    use crate::SERVICES;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    const BOOT_SH: &str = include_str!("../../kindle/extensions/kindil/bin/boot.sh");
+
+    #[test]
+    fn its_services_are_the_launchers() {
+        let line = BOOT_SH
+            .lines()
+            .find_map(|l| l.strip_prefix("SERVICES=\"")?.strip_suffix('"'))
+            .expect("a SERVICES line in boot.sh");
+        assert_eq!(line.split(' ').collect::<Vec<_>>(), SERVICES);
+    }
+
+    fn script(path: &Path, body: &str) {
+        std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    struct Boot {
+        dir: tempfile::TempDir,
+    }
+
+    impl Boot {
+        /// A standalone boot: BOOT and the framework skip flag set, the
+        /// launcher exiting `code` from `boot`, upstart's jobs `jobs`.
+        fn new(code: i32, jobs: &[&str]) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let t = dir.path();
+            let bin = t.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(t.join("jobs")).unwrap();
+            for job in jobs {
+                std::fs::write(t.join("jobs").join(job), "").unwrap();
+            }
+            let (j, c) = (t.join("jobs"), t.join("calls"));
+            let (j, c) = (j.display(), c.display());
+            script(
+                &bin.join("status"),
+                &format!("[ -f {j}/$1 ] && echo \"$1 start/running\" || echo \"$1 stop/waiting\""),
+            );
+            script(
+                &bin.join("start"),
+                &format!("echo \"start $1\" >>{c}; touch {j}/$1"),
+            );
+            script(
+                &bin.join("stop"),
+                &format!("echo \"stop $1\" >>{c}; rm -f {j}/$1"),
+            );
+            script(
+                &t.join("launcher"),
+                &format!("[ \"$1\" = --version ] && exit 0; exit {code}"),
+            );
+            std::fs::write(t.join("BOOT"), "standalone\n").unwrap();
+            std::fs::write(t.join("SKIP"), "").unwrap();
+            let mut sh = BOOT_SH.to_owned();
+            for (from, to) in [
+                (
+                    "export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                    format!("export PATH={}:/usr/bin:/bin", bin.display()),
+                ),
+                ("/mnt/us/kindil/BOOT", format!("{}/BOOT", t.display())),
+                (
+                    "/var/local/kindil/launcher",
+                    format!("{}/launcher", t.display()),
+                ),
+                (
+                    "/mnt/us/DONT_START_FRAMEWORK",
+                    format!("{}/SKIP", t.display()),
+                ),
+                ("/var/tmp/kindil.pid", format!("{}/pid", t.display())),
+                ("/proc/", format!("{}/proc/", t.display())),
+            ] {
+                assert!(sh.contains(from), "boot.sh names {from}");
+                sh = sh.replace(from, &to);
+            }
+            std::fs::write(t.join("boot.sh"), sh).unwrap();
+            Self { dir }
+        }
+
+        fn t(&self) -> &Path {
+            self.dir.path()
+        }
+
+        /// The upstart calls it made.
+        fn run(&self) -> String {
+            let status = crate::os::retrying(|| {
+                std::process::Command::new("/bin/sh")
+                    .arg(self.t().join("boot.sh"))
+                    .stdout(std::process::Stdio::null())
+                    .status()
+            })
+            .unwrap();
+            assert!(status.success(), "boot.sh exits 0");
+            std::fs::read_to_string(self.t().join("calls"))
+                .unwrap_or_default()
+                .lines()
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        fn skip(&self) -> bool {
+            self.t().join("SKIP").exists()
+        }
+    }
+
+    fn all_but(left: &[&str]) -> Vec<&'static str> {
+        let mut jobs: Vec<&str> = SERVICES.to_vec();
+        jobs.extend(["powerd", "wifid"]);
+        jobs.retain(|j| !left.contains(j));
+        jobs
+    }
+
+    #[test]
+    fn a_boot_the_launcher_handled_is_left_alone() {
+        let boot = Boot::new(0, &[]);
+        assert_eq!(boot.run(), "");
+        assert!(boot.skip());
+    }
+
+    #[test]
+    fn a_launcher_that_crashed_brings_amazons_full_ui() {
+        // A standalone boot: X stopped, some services never started.
+        let boot = Boot::new(139, &all_but(&["wifid", "todo"]));
+        assert_eq!(boot.run(), "start wifid,start todo,start x");
+        assert!(!boot.skip());
+    }
+
+    #[test]
+    fn no_launcher_that_runs_brings_amazons_full_ui() {
+        let boot = Boot::new(127, &all_but(&[]));
+        assert_eq!(boot.run(), "start x");
+        assert!(!boot.skip());
+    }
+
+    #[test]
+    fn amazons_ui_already_up_restarts_to_see_its_framework() {
+        let mut jobs = all_but(&[]);
+        jobs.extend(["x", "lab126_gui"]);
+        let boot = Boot::new(134, &jobs);
+        assert_eq!(boot.run(), "stop lab126_gui,start lab126_gui");
+    }
+
+    #[test]
+    fn a_session_the_launcher_started_restores_on_its_own() {
+        let boot = Boot::new(139, &all_but(&[]));
+        std::fs::write(boot.t().join("pid"), "77\n").unwrap();
+        let proc = boot.t().join("proc/77");
+        std::fs::create_dir_all(&proc).unwrap();
+        std::fs::write(proc.join("stat"), "77 (launcher) S 1 77 77").unwrap();
+        assert_eq!(boot.run(), "");
+        std::fs::write(proc.join("stat"), "77 (launcher) Z 1 77 77").unwrap();
+        assert_eq!(boot.run(), "start x", "unless it has exited");
+    }
+
+    #[test]
+    fn a_standalone_flag_gone_means_amazons_ui_comes_anyway() {
+        let boot = Boot::new(139, &[]);
+        std::fs::remove_file(boot.t().join("SKIP")).unwrap();
+        assert_eq!(boot.run(), "");
+    }
+}
