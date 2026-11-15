@@ -20,6 +20,7 @@ pub mod prefs;
 pub mod preview;
 pub mod reader;
 pub mod signals;
+pub mod ssh;
 pub mod sync;
 pub mod system;
 pub mod uevent;

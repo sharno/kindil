@@ -61,6 +61,12 @@ and a reboot always returns the Kindle to stock.
     them, and is remembered. Back online about a second after
     a nap. None of Amazon's Wi-Fi services run while kindil does; on a
     first run it starts with no networks, ready to join one.
+  - **SSH of its own**: kindil carries Dropbear (upstream, built by the
+    flake: dropbear, dropbearkey and scp in one static binary) and runs it as
+    its child on port 2222 for now, beside USBNetwork's on 22, keys only. It
+    uses USBNetwork's `usbnet/etc/authorized_keys`, copied to
+    `/var/local/kindil/ssh/` whenever it is there, and a host key of its own;
+    nothing of it is on `/mnt/us`. It ends with kindil; open sessions carry on.
   - **USB drive mode**: plugging into a computer shows a USB screen while the
     computer has `/mnt/us`; unplugging reloads the library and resumes
     Syncthing. A cable that keeps dropping doesn't flash the screen: kindil
@@ -189,6 +195,7 @@ faster.
 | `/mnt/us/extensions/kindil/` | KUAL launcher and the `kindil` binary; during an update also `kindil.next`, `kindil.trying`, and afterwards `kindil.previous` |
 | `/var/local/kindil/` | The running copy, the launcher and the log; off `/mnt/us`, which a computer takes in USB drive mode |
 | `/var/local/kindil/networks.toml` | The Wi-Fi networks joined in kindil, with their passwords (root only) |
+| `/var/local/kindil/dropbearmulti`, `/var/local/kindil/ssh/` | kindil's SSH server, its host key, authorized keys and `bin/` links (root only) |
 | `/mnt/us/kindil/kindil.toml` | Optional settings (every key has a default) |
 | `/mnt/us/kindil/miqat.toml` | Miqat's own settings: location, prayer method |
 | `/mnt/us/kindil/prefs.toml` | Choices made on the device; safe to delete |
@@ -265,6 +272,7 @@ someone nearby to press the power button, or must end on their own first.
 | `wifi.rs` | wpa_supplicant control socket, typed SSID/passphrase |
 | `net.rs` | Wi-Fi run by kindil: driver, supervised wpa_supplicant and udhcpc |
 | `networks.rs` | The saved Wi-Fi networks |
+| `ssh.rs` | SSH run by kindil: its Dropbear, keys, firewall port, supervised |
 | `sync.rs` | Syncthing as a typed state machine |
 | `update.rs` | Over-the-air updates: GitHub releases, signature check, trial and commit |
 | `system.rs` | Sleep, wake and USB drive mode as a state machine |

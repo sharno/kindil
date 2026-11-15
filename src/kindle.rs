@@ -310,6 +310,8 @@ impl Host for KindleHost {
         std::thread::spawn(move || {
             start_wifi(&net, &networks);
         });
+        // kindil's own SSH server (src/ssh.rs), beside USBNetwork's for now.
+        crate::ssh::start();
     }
 
     fn suspend(&self) -> anyhow::Result<()> {

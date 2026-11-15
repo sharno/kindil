@@ -396,7 +396,7 @@ fn alive(pid: i32) -> bool {
 
 /// Stops a process kindil started and confirms it is gone: TERM, then KILL
 /// after a few seconds, so nothing of an old stack overlaps a new one.
-fn terminate(file: &str) {
+pub(crate) fn terminate(file: &str) {
     if let Some(pid) = pid(file).filter(|&pid| alive(pid)) {
         let gone_within = |signal, wait: Duration| {
             // SAFETY: plain kill(2) on a process kindil started.
