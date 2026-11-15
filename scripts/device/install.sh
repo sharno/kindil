@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs on the Kindle, detached (scripts/device/release.sh starts it): installs
+# Runs on the Kindle, detached (`cargo xtask release` starts it): installs
 # the bundle in /mnt/us/kindil-deploy, then insists that the new version is
 # the one running, with its own Wi-Fi joined and addressed (or just running,
 # with Wi-Fi switched off), and still so a minute later. Otherwise it puts

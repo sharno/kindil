@@ -1,0 +1,3 @@
+[alias]
+# Development and device tasks: cargo xtask --help
+xtask = "run --quiet --package xtask --"

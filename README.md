@@ -91,7 +91,7 @@ SSH set `USE_WIFI="true"` and `USE_WIFI_SSHD_ONLY="true"` in
 
 ```sh
 export KINDIL_DEVICE=root@KINDLE_IP     # and KINDIL_SSH_KEY=~/.ssh/key, if needed
-scripts/device/release.sh 0.8.1         # a signed release, with rollback
+cargo xtask release 0.9.1               # a signed release, with rollback
 ```
 
 Or build and copy your own (the build needs Linux, for the Zig and ARM
@@ -99,8 +99,8 @@ toolchains in the flake):
 
 ```sh
 nix develop
-scripts/dev.sh device                  # dist/kindil, static ARMv7
-scripts/dev.sh deploy root@KINDLE_IP   # binary + KUAL launcher over SSH
+cargo xtask device                     # dist/kindil, static ARMv7
+cargo xtask deploy                     # build, then binary + KUAL launcher over SSH
 ```
 
 Or copy over USB: `kindle/extensions/kindil` to `/mnt/us/extensions/kindil`,
@@ -218,10 +218,10 @@ git clone --recurse-submodules git@github.com:sharno/kindil.git
 cd kindil
 nix develop
 
-scripts/dev.sh sim       # every screen → dist/sim/*.png, simulated device
-scripts/dev.sh desktop   # interactive window, simulated device
-scripts/dev.sh check     # fmt, clippy, tests
-scripts/dev.sh test-arm  # tests on ARM under qemu-arm
+cargo xtask sim       # every screen → dist/sim/*.png, simulated device
+cargo xtask desktop   # interactive window, simulated device
+cargo xtask check     # fmt, clippy, every test suite
+cargo xtask test-arm  # tests on ARM under qemu-arm
 ```
 
 `preview` and `desktop` use a simulated device: no file under `/mnt/us`, no
@@ -230,19 +230,20 @@ weather and make no requests.
 
 ### On the Kindle
 
-`scripts/device/` reaches the Kindle over SSH (`KINDIL_DEVICE`, optionally
-`KINDIL_SSH_KEY`):
+`cargo xtask` (the `xtask/` crate) reaches the Kindle over SSH
+(`KINDIL_DEVICE`, optionally `KINDIL_SSH_KEY`):
 
 ```sh
-scripts/device/release.sh 0.8.1 [--rollback 0.8.0]   # install a release
-scripts/device/run.sh experiment.sh 600 [ARGS]       # run a script, with a lifeline
-scripts/device/wait.sh [--hours N] [COMMAND]         # wait for it to answer
+cargo xtask release 0.9.1 [--rollback 0.9.0]   # install a release
+cargo xtask run experiment.sh 600 [ARGS]       # run a script, with a lifeline
+cargo xtask wait [--hours N] [COMMAND]         # wait for it to answer
 ```
 
-`release.sh` checks the release's signature, bundles it with the launcher
-files from its tag and waits for the Kindle; there `install.sh` installs it
+`release` checks the release's signature, bundles it with the launcher
+files from its tag and waits for the Kindle; there
+`scripts/device/install.sh` installs it
 and rolls back unless kindil comes back up with its Wi-Fi online and stays
-so for a minute. `run.sh` starts a script with `lifeline.sh` beside it,
+so for a minute. `run` starts a script with `scripts/device/lifeline.sh` beside it,
 which brings kindil and Wi-Fi back when the script ends or at the deadline.
 A lifeline needs the Kindle awake: tests that keep it asleep or dozing need
 someone nearby to press the power button, or must end on their own first.

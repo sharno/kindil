@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs on the Kindle beside an experiment (scripts/device/run.sh starts both):
+# Runs on the Kindle beside an experiment (`cargo xtask run` starts both):
 #   lifeline.sh DEADLINE_SECONDS TEST_PID
 # When the test exits, or at the deadline (wall clock), it kills the test if
 # still running, clears any wake alarm and resumes a paused kindil. If the

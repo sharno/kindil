@@ -31,12 +31,7 @@ jobs:
           nix flake check --no-build
           nix build --no-link .#kindil
           nix develop --command bash -euo pipefail -c '
-            cargo fmt --check
-            cargo test --locked
-            tests/launcher.sh
-            tests/boot.sh
-            tests/install.sh
-            cargo clippy --locked --all-targets --features kindle -- -D warnings
+            cargo xtask check
           '
       - name: ARM runtime tests and static device artifact
         if: matrix.kind == 'arm'

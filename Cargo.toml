@@ -1,3 +1,8 @@
+[workspace]
+members = [".", "xtask"]
+# `cargo build` and the Nix build at the root build the app alone.
+default-members = ["."]
+
 [package]
 name = "kindil"
 version = "0.9.1"

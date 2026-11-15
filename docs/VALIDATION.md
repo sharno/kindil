@@ -8,9 +8,9 @@ Nothing below writes a system partition.
 
 ```sh
 nix develop
-scripts/dev.sh check
-scripts/dev.sh test-arm
-scripts/dev.sh device
+cargo xtask check
+cargo xtask test-arm
+cargo xtask device
 qemu-arm dist/kindil --version
 ```
 
