@@ -37,7 +37,7 @@ jobs:
         if: matrix.kind == 'arm'
         run: |
           nix develop --command bash -euo pipefail -c '
-            scripts/dev.sh test-arm
+            cargo xtask test-arm
             device=$(nix build --no-link --print-out-paths .#kindil-device)
             mkdir -p dist
             cp "$device/bin/kindil" dist/kindil
