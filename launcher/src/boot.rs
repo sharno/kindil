@@ -411,7 +411,11 @@ mod shim {
             for (from, to) in [
                 (
                     "export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-                    format!("export PATH={}:/usr/bin:/bin", bin.display()),
+                    format!(
+                        "export PATH={}:{}",
+                        bin.display(),
+                        crate::os::path().to_string_lossy()
+                    ),
                 ),
                 ("/mnt/us/kindil/BOOT", format!("{}/BOOT", t.display())),
                 (

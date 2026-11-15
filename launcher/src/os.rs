@@ -43,10 +43,28 @@ pub struct Device;
 
 const PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
+/// The PATH every command gets.
+#[cfg(not(test))]
+fn path() -> &'static str {
+    PATH
+}
+
+/// The PW1's PATH, then the test's own: hosts such as NixOS keep the
+/// tools fake scripts call (cp, touch, date) elsewhere.
+#[cfg(test)]
+pub fn path() -> std::ffi::OsString {
+    let mut path = std::ffi::OsString::from(PATH);
+    if let Some(own) = std::env::var_os("PATH") {
+        path.push(":");
+        path.push(own);
+    }
+    path
+}
+
 fn quiet(program: &str, args: &[&str]) -> bool {
     Command::new(program)
         .args(args)
-        .env("PATH", PATH)
+        .env("PATH", path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -120,7 +138,7 @@ impl Os for Device {
     fn run(&self, binary: &Path, args: &[&str]) -> i32 {
         use std::os::unix::process::ExitStatusExt;
         let mut command = Command::new(binary);
-        command.args(args).env("PATH", PATH).stdin(Stdio::null());
+        command.args(args).env("PATH", path()).stdin(Stdio::null());
         default_signals(&mut command);
         match retrying(|| command.status()) {
             Ok(status) => status
@@ -204,7 +222,7 @@ impl Os for Device {
         let mut command = Command::new(exe);
         command
             .arg("session")
-            .env("PATH", PATH)
+            .env("PATH", path())
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err);
@@ -293,7 +311,7 @@ pub fn say(out: &mut dyn std::io::Write, line: &str) {
 fn local_time() -> String {
     Command::new("date")
         .arg("+%F %T")
-        .env("PATH", PATH)
+        .env("PATH", path())
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
