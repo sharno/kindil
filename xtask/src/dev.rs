@@ -240,8 +240,9 @@ pub fn run_on_device(script: &Path, deadline: u64, args: &[String]) -> anyhow::R
     print!(
         "{}",
         device.run(&format!(
-            "cd /var/local/kindil && sh {name} {} </dev/null >/dev/null 2>&1 & pid=$!; \
-             setsid /var/local/kindil/kindil lifeline {deadline} $pid </dev/null >>lifeline.log 2>&1 & \
+            "cd /var/local/kindil; sh /var/local/kindil/{name} {} </dev/null >/dev/null 2>&1 & pid=$!; \
+             setsid /var/local/kindil/kindil lifeline {deadline} $pid </dev/null \
+             >>/var/local/kindil/lifeline.log 2>&1 & \
              echo \"started {name} as $pid, lifeline at {deadline} s\"",
             quoted.join(" ")
         ))?
