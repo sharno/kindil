@@ -280,6 +280,7 @@ someone nearby to press the power button, or must end on their own first.
 | `power.rs` | powerd's rules kept by kindil: charging temperatures, critical battery |
 | `wifi.rs` | wpa_supplicant control socket, typed SSID/passphrase |
 | `net.rs` | Wi-Fi run by kindil: driver, supervised wpa_supplicant and udhcpc |
+| `station.rs`, `wext.rs`, `pmk.rs` | kindil's own Wi-Fi without wpa_supplicant, behind the `/var/local/kindil/wifi` switch (see [docs/WIFI-RUST-TEST.md](docs/WIFI-RUST-TEST.md)): the AR6003 firmware's WPA2-PSK offload through wireless-extension ioctls |
 | `networks.rs` | The saved Wi-Fi networks |
 | `ssh.rs` | SSH run by kindil: its kindil-sshd, keys, firewall port, supervised |
 | `sync.rs` | Syncthing as a typed state machine |

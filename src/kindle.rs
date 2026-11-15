@@ -12,14 +12,13 @@ use crate::networks::{self, Networks};
 use crate::system::{self, Event};
 use crate::uevent::Uevent;
 use crate::update::{Check, Commit, Github, Release, Slots, Version};
-use crate::wifi::{self, Credentials, Link, Network, Ssid};
+use crate::wifi::{Credentials, Link, Network, Ssid};
 use std::io::BufRead;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const INTERFACE: &str = "wlan0";
 /// How long kindil keeps retrying its Wi-Fi at start (a slow driver).
 const WIFI_START: Duration = Duration::from_secs(180);
 /// The PW1's fuel gauge; it stalls while suspended and catches up on resume.
@@ -143,13 +142,9 @@ impl Host for KindleHost {
             Power::Off => Wifi::Off,
             // A supplicant that doesn't answer is being restarted: the switch
             // stays usable, to switch Wi-Fi off or on again.
-            Power::On => match wifi::open(INTERFACE).and_then(|wpa| Ok((wpa.link()?, wpa))) {
+            Power::On => match self.net.link() {
                 Err(_) | Ok((Link::NotAssociated, _)) => Wifi::Searching,
-                Ok((Link::Associated { ssid, ip }, wpa)) => Wifi::Connected {
-                    ssid,
-                    ip,
-                    signal: wpa.signal(),
-                },
+                Ok((Link::Associated { ssid, ip }, signal)) => Wifi::Connected { ssid, ip, signal },
             },
         }
     }
@@ -164,7 +159,7 @@ impl Host for KindleHost {
     }
 
     fn scan(&self) -> anyhow::Result<Vec<Network>> {
-        wifi::open(INTERFACE)?.scan()
+        self.net.scan()
     }
 
     fn join(&self, credentials: &Credentials) -> anyhow::Result<()> {
