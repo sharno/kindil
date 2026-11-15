@@ -62,12 +62,21 @@ fn app_pids(proc: &Path, own: i32) -> Vec<i32> {
         .flatten()
         .filter_map(|entry| {
             let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
-            let comm = std::fs::read_to_string(entry.path().join("comm")).ok()?;
-            (comm.trim() == "kindil" && pid != own).then_some(pid)
+            // stat, not comm: Linux 2.6.31 has no /proc/PID/comm.
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            (name(&stat)? == "kindil" && pid != own).then_some(pid)
         })
         .collect();
     pids.sort_unstable();
     pids
+}
+
+/// The process name in a /proc/PID/stat line: "pid (name) state ...", where
+/// the name may itself hold spaces or parentheses.
+fn name(stat: &str) -> Option<&str> {
+    let start = stat.find('(')? + 1;
+    let end = stat.rfind(')')?;
+    stat.get(start..end)
 }
 
 /// Asks every kindil process to end, as `killall kindil` would, but by pid.
@@ -185,7 +194,12 @@ mod tests {
     fn process(proc: &Path, pid: i32, comm: &str) {
         let dir = proc.join(pid.to_string());
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("comm"), format!("{comm}\n")).unwrap();
+        // As 2.6.31 has it: stat only, no comm file.
+        std::fs::write(
+            dir.join("stat"),
+            format!("{pid} ({comm}) S 1 {pid} {pid} 0\n"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -201,6 +215,13 @@ mod tests {
         // Run as `kindil lifeline` (before the link), its comm is kindil.
         assert_eq!(app_pids(proc, 11), [10]);
         assert_eq!(app_pids(proc, 13), [10, 11]);
+    }
+
+    #[test]
+    fn reads_the_name_from_stat_even_with_spaces_or_parentheses() {
+        assert_eq!(name("1640 (kindil) S 1563 1563"), Some("kindil"));
+        assert_eq!(name("7 (a (b) c) R 1 7"), Some("a (b) c"));
+        assert_eq!(name("garbage"), None);
     }
 
     #[test]
