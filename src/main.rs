@@ -179,8 +179,19 @@ fn main() -> std::process::ExitCode {
     // Run as udhcpc's hook (a link named kindil-dhcp): no command line.
     let mut args = std::env::args();
     let name = args.next().unwrap_or_default();
-    if std::path::Path::new(&name).file_name() == Some(std::ffi::OsStr::new(kindil::dhcp::NAME)) {
+    let called = std::path::Path::new(&name).file_name();
+    if called == Some(std::ffi::OsStr::new(kindil::dhcp::NAME)) {
         kindil::dhcp::hook(&args.next().unwrap_or_default());
+        return std::process::ExitCode::SUCCESS;
+    }
+    // Run as `kindil-lifeline DEADLINE PID` (a link `cargo xtask run`
+    // makes), so it is told apart from kindil.
+    if called == Some(std::ffi::OsStr::new(kindil::lifeline::NAME)) {
+        let Some((deadline, pid)) = kindil::lifeline::parse(&args.collect::<Vec<_>>()) else {
+            eprintln!("usage: {} DEADLINE PID", kindil::lifeline::NAME);
+            return std::process::ExitCode::from(2);
+        };
+        kindil::lifeline::lifeline(deadline, pid);
         return std::process::ExitCode::SUCCESS;
     }
     let cli = Cli::parse();

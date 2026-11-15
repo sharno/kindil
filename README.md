@@ -247,7 +247,7 @@ cargo xtask wait [--hours N] [COMMAND]         # wait for it to answer
 files from its tag and waits for the Kindle; there the release installs
 itself (`kindil install`, src/install.rs) and rolls back, launcher files
 and all, unless it is the version running, with its Wi-Fi joined, and stays
-so for a minute. `run` starts a script with `kindil lifeline` beside it,
+so for a minute. `run` starts a script with `kindil-lifeline` beside it,
 which brings kindil and Wi-Fi back when the script ends or at the deadline.
 A lifeline needs the Kindle awake: tests that keep it asleep or dozing need
 someone nearby to press the power button, or must end on their own first.

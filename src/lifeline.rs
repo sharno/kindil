@@ -9,9 +9,20 @@
 //!
 //! It only acts while the Kindle is awake: no help for an experiment that
 //! keeps it asleep or dozing.
+//!
+//! It is kindil's own binary, run as `kindil-lifeline` (a link beside it,
+//! which `cargo xtask run` makes), so it never takes itself for kindil: it
+//! leaves out its own process and ends kindil by pid, never `killall`. An
+//! experiment's `killall kindil` still finds it (busybox also matches the
+//! binary a process runs, links resolved), so it ignores the signals that
+//! end a process politely; only KILL takes it down.
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, SystemTime};
+
+/// The name kindil answers to as the lifeline: `kindil-lifeline DEADLINE PID`.
+pub const NAME: &str = "kindil-lifeline";
 
 const START: &str = "/mnt/us/extensions/kindil/bin/start.sh";
 /// kindil stopping fully: its session restores Amazon's UI on the way out.
@@ -34,18 +45,36 @@ fn signal(pid: i32, signal: i32) {
     unsafe { libc::kill(pid, signal) };
 }
 
-/// kindil's processes, by name.
+/// kindil's processes, by name: never this one, which is kindil's binary too.
 fn kindil_pids() -> Vec<i32> {
-    std::fs::read_dir("/proc")
+    app_pids(
+        Path::new("/proc"),
+        i32::try_from(std::process::id()).unwrap_or(0),
+    )
+}
+
+/// The processes under `proc` named kindil (not its hook, nor a lifeline),
+/// but `own`.
+fn app_pids(proc: &Path, own: i32) -> Vec<i32> {
+    let mut pids: Vec<i32> = std::fs::read_dir(proc)
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|entry| {
             let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
             let comm = std::fs::read_to_string(entry.path().join("comm")).ok()?;
-            (comm.trim() == "kindil").then_some(pid)
+            (comm.trim() == "kindil" && pid != own).then_some(pid)
         })
-        .collect()
+        .collect();
+    pids.sort_unstable();
+    pids
+}
+
+/// Asks every kindil process to end, as `killall kindil` would, but by pid.
+fn stop_kindil() {
+    for pid in kindil_pids() {
+        signal(pid, libc::SIGTERM);
+    }
 }
 
 /// A connection to the outside world within `tries` attempts, 3 s apart.
@@ -62,15 +91,45 @@ fn online(tries: u32) -> bool {
     })
 }
 
+/// The signals the lifeline ignores, which an exec'd child would inherit
+/// ignored: its children get them back.
+const POLITE: [i32; 3] = [libc::SIGTERM, libc::SIGHUP, libc::SIGINT];
+
 fn run(program: &str, args: &[&str]) {
-    let _ = Command::new(program)
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+        .stderr(std::process::Stdio::null());
+    // SAFETY: signal(2) is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            for sig in POLITE {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+            Ok(())
+        });
+    }
+    let _ = command.status();
+}
+
+/// `kindil-lifeline DEADLINE PID`'s arguments.
+pub fn parse(args: &[String]) -> Option<(Duration, i32)> {
+    match args {
+        [deadline, pid] => Some((
+            Duration::from_secs(deadline.parse().ok()?),
+            pid.parse().ok().filter(|&pid: &i32| pid > 0)?,
+        )),
+        _ => None,
+    }
 }
 
 pub fn lifeline(deadline: Duration, test: i32) {
+    for sig in POLITE {
+        // SAFETY: signal(2) with SIG_IGN.
+        unsafe { libc::signal(sig, libc::SIG_IGN) };
+    }
     log(&format!(
         "test {test}, deadline in {} s",
         deadline.as_secs()
@@ -96,14 +155,14 @@ pub fn lifeline(deadline: Duration, test: i32) {
     }
     if !kindil_pids().is_empty() {
         log("offline: restarting kindil");
-        run("killall", &["kindil"]);
+        stop_kindil();
         std::thread::sleep(SETTLE);
         run(START, &[]);
         if online(40) {
             return log("online after restarting kindil");
         }
         log("STILL OFFLINE: stopping kindil; Amazon's UI and wifid take over");
-        run("killall", &["kindil"]);
+        stop_kindil();
         std::thread::sleep(SETTLE);
     } else {
         log("offline, no kindil: starting wifid afresh");
@@ -116,5 +175,43 @@ pub fn lifeline(deadline: Duration, test: i32) {
         log("online with Amazon's wifid");
     } else {
         log("offline even with wifid");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn process(proc: &Path, pid: i32, comm: &str) {
+        let dir = proc.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("comm"), format!("{comm}\n")).unwrap();
+    }
+
+    #[test]
+    fn kindil_is_its_app_processes_never_the_lifeline_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let proc = dir.path();
+        process(proc, 10, "kindil");
+        process(proc, 11, "kindil");
+        process(proc, 12, "kindil-dhcp");
+        process(proc, 13, NAME);
+        process(proc, 14, "sh");
+        std::fs::create_dir_all(proc.join("self")).unwrap();
+        // Run as `kindil lifeline` (before the link), its comm is kindil.
+        assert_eq!(app_pids(proc, 11), [10]);
+        assert_eq!(app_pids(proc, 13), [10, 11]);
+    }
+
+    #[test]
+    fn reads_its_arguments() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            parse(&args(&["600", "42"])),
+            Some((Duration::from_secs(600), 42))
+        );
+        assert_eq!(parse(&args(&["600"])), None);
+        assert_eq!(parse(&args(&["x", "42"])), None);
+        assert_eq!(parse(&args(&["600", "0"])), None);
     }
 }

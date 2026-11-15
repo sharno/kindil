@@ -239,7 +239,8 @@ fn walk(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 
 /// Starts `script` on the Kindle with `args`, and kindil's lifeline beside it
 /// (src/lifeline.rs), which brings kindil and Wi-Fi back when it ends or at
-/// `deadline` seconds.
+/// `deadline` seconds. The lifeline runs as `kindil-lifeline`, a link to
+/// kindil's binary, so neither it nor the experiment takes it for kindil.
 pub fn run_on_device(script: &Path, deadline: u64, args: &[String]) -> anyhow::Result<()> {
     ensure!(script.is_file(), "no script {}", script.display());
     let device = Device::from_env()?;
@@ -254,7 +255,8 @@ pub fn run_on_device(script: &Path, deadline: u64, args: &[String]) -> anyhow::R
         "{}",
         device.run(&format!(
             "cd /var/local/kindil; sh /var/local/kindil/{name} {} </dev/null >/dev/null 2>&1 & pid=$!; \
-             setsid /var/local/kindil/kindil lifeline {deadline} $pid </dev/null \
+             ln -sf kindil /var/local/kindil/kindil-lifeline; \
+             setsid /var/local/kindil/kindil-lifeline {deadline} $pid </dev/null \
              >>/var/local/kindil/lifeline.log 2>&1 & \
              echo \"started {name} as $pid, lifeline at {deadline} s\"",
             quoted.join(" ")
