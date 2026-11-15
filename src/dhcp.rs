@@ -15,6 +15,36 @@ pub const NAME: &str = "kindil-dhcp";
 const RESOLV: &str = "/var/run/resolv.conf";
 /// Enough to clear any default routes an earlier lease left.
 const MAX_OLD_ROUTES: usize = 8;
+/// When the hook last took a lease (bound or renew), on [`monotonic`]'s
+/// clock: kindil's own Wi-Fi (src/station.rs) counts a join only once a
+/// lease came after it, which no DHCP exchange gets without the keys.
+pub const LEASE_STAMP: &str = "/var/run/kindil-lease";
+
+/// CLOCK_MONOTONIC, the same in kindil and in its hook.
+pub fn monotonic() -> std::time::Duration {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime fills the timespec it is given.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    std::time::Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+}
+
+/// The stamp's text: nanoseconds.
+pub fn stamp(at: std::time::Duration) -> String {
+    format!("{}\n", at.as_nanos())
+}
+
+pub fn parse_stamp(text: &str) -> Option<std::time::Duration> {
+    let nanos: u64 = text.trim().parse().ok()?;
+    Some(std::time::Duration::from_nanos(nanos))
+}
+
+/// When the hook last took a lease.
+pub fn leased() -> Option<std::time::Duration> {
+    parse_stamp(&std::fs::read_to_string(LEASE_STAMP).ok()?)
+}
 
 /// What a hook run does.
 #[derive(Debug, PartialEq, Eq)]
@@ -104,6 +134,12 @@ pub fn hook(event: &str) {
             let _ = std::fs::rename(&part, RESOLV);
         }
     }
+    if matches!(event, "bound" | "renew") {
+        let part = format!("{LEASE_STAMP}.new");
+        if std::fs::write(&part, stamp(monotonic())).is_ok() {
+            let _ = std::fs::rename(&part, LEASE_STAMP);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +207,14 @@ mod tests {
             plan.resolv.as_deref(),
             Some("nameserver 192.168.1.1\nnameserver 9.9.9.9\n")
         );
+    }
+
+    #[test]
+    fn the_lease_stamp_round_trips() {
+        let at = std::time::Duration::new(12_345, 678_901_234);
+        assert_eq!(parse_stamp(&stamp(at)), Some(at));
+        assert_eq!(parse_stamp("junk"), None);
+        assert!(monotonic() <= monotonic());
     }
 
     #[test]

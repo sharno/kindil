@@ -9,13 +9,19 @@
 //! The driver forgets that the PMK is offloaded after every connect, so the
 //! PMK is sent again before every connect.
 //!
+//! A join counts only once udhcpc took a lease after it ([`Dhcp`]): with
+//! the handshake in the firmware, a wrong password can still associate for
+//! a few seconds, but no DHCP exchange gets through without the keys.
+//!
 //! This module is the logic, over a [`Driver`]: which saved network to join
-//! from a scan, the ioctl sequence, and [`keep`], the loop that joins, watches
-//! the access point and joins again, with a growing pause between failures.
-//! src/net.rs runs it beside udhcpc, under its lifecycle lock, and falls back
-//! to wpa_supplicant for the rest of the run when [`keep`] gives up: no
-//! association within [`FALLBACK_AFTER`] on a network in range, a saved
-//! network kindil can't join this way, or the driver failing.
+//! from a scan, the ioctl sequence, and [`keep`], the loop that joins, proves
+//! it with a lease, watches the access point and joins again, with a growing
+//! pause between failures. It also does Settings' scans, between joins, so a
+//! scan never lands in a connect. src/net.rs runs it beside udhcpc, under its
+//! lifecycle lock, and falls back to wpa_supplicant for the rest of the run
+//! when [`keep`] gives up: no join with a lease within [`FALLBACK_AFTER`] on a
+//! network in range, a saved network kindil can't join this way, or the
+//! driver failing.
 use crate::host::Signal;
 use crate::wext::{self, Akm, Bss, Cipher, Driver};
 use crate::wifi::{Credentials, Network, Security};
@@ -27,7 +33,7 @@ use std::time::Duration;
 pub const SWITCH: &str = "/var/local/kindil/wifi";
 /// One try at joining.
 pub const ASSOC_WAIT: Duration = Duration::from_secs(10);
-/// Trying this long on a network in range without a lasting association
+/// Trying this long on a network in range without a join with a lease
 /// gives up on kindil's own Wi-Fi for the run.
 pub const FALLBACK_AFTER: Duration = Duration::from_secs(30);
 /// How often the access point is checked while associated.
@@ -35,9 +41,9 @@ pub const WATCH: Duration = Duration::from_secs(3);
 /// After losing the access point, the firmware keeps trying to rejoin it by
 /// itself (any disconnect but the host's own); it gets this long.
 pub const REJOIN_GRACE: Duration = Duration::from_secs(10);
-/// An association has to hold this long to count: a wrong password can
-/// associate and then fail the handshake.
-pub const STABLE: Duration = Duration::from_secs(3);
+/// After associating, a lease has to come within this long for the join
+/// to count: a wrong password can associate and then fail the handshake.
+pub const LEASE_WAIT: Duration = Duration::from_secs(15);
 /// The driver's scan of every channel takes about two seconds.
 pub const SCAN_WAIT: Duration = Duration::from_secs(3);
 /// "essid off" sends a disconnect; give it a moment before the new profile.
@@ -303,9 +309,13 @@ pub fn disconnect(driver: &impl Driver) -> Result<(), DriverError> {
     driver.set_essid(None).map_err(at("SIOCSIWESSID off"))
 }
 
-/// A fresh scan.
+/// A fresh scan. Never while a connect is pending: unless associated,
+/// "essid off" first stops the firmware chasing a network.
 pub fn scan(driver: &impl Driver, sleep: &dyn Fn(Duration)) -> Result<Vec<Bss>, DriverError> {
     driver.set_up().map_err(at("SIOCSIFFLAGS up"))?;
+    if driver.bssid().map_err(at("SIOCGIWAP"))?.is_none() {
+        driver.set_essid(None).map_err(at("SIOCSIWESSID off"))?;
+    }
     driver.trigger_scan().map_err(at("SIOCSIWSCAN"))?;
     sleep(SCAN_WAIT);
     let stream = driver.scan_results().map_err(at("SIOCGIWSCAN"))?;
@@ -335,34 +345,85 @@ pub fn networks(seen: &[Bss]) -> Vec<Network> {
     networks
 }
 
-/// Joins `target` now, for Settings: Ok(true) once associated with it for
-/// [`STABLE`], Ok(false) if not within `limit`.
+/// The address: kindil's udhcpc and its hook (src/dhcp.rs). A lease taken
+/// after a join proves the join: no DHCP exchange gets through without the
+/// keys, while a wrong password can still associate for a few seconds
+/// before the access point gives up on the handshake.
+pub trait Dhcp {
+    /// A lease for `ssid`, now: the same network's renewed, another
+    /// network's taken afresh (the old one released first).
+    fn ask(&self, ssid: &str);
+    /// When the hook last took a lease, on the caller's clock; `None`
+    /// without one (no address on the interface).
+    fn leased(&self) -> Option<Duration>;
+}
+
+/// How a join for Settings went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Joined {
+    Yes,
+    /// No association: a wrong password, or out of range.
+    NotAssociated,
+    /// Associated, but no lease within [`LEASE_WAIT`]: most likely a wrong
+    /// password. Left again.
+    NoLease,
+}
+
+/// Waits for a lease taken after `since` while still associated: Ok(true)
+/// with one within [`LEASE_WAIT`], Ok(false) without, or once the access
+/// point drops it.
+pub fn prove(
+    driver: &impl Driver,
+    dhcp: &dyn Dhcp,
+    ssid: &str,
+    now: &dyn Fn() -> Duration,
+    sleep: &dyn Fn(Duration),
+) -> Result<bool, DriverError> {
+    let since = now();
+    dhcp.ask(ssid);
+    loop {
+        if dhcp.leased().is_some_and(|at| at >= since) {
+            return Ok(true);
+        }
+        if now() - since >= LEASE_WAIT || driver.bssid().map_err(at("SIOCGIWAP"))?.is_none() {
+            return Ok(false);
+        }
+        sleep(POLL);
+    }
+}
+
+/// Joins `target` now, for Settings: associated within `limit`, then a
+/// lease within [`LEASE_WAIT`].
 pub fn join(
     driver: &impl Driver,
+    dhcp: &dyn Dhcp,
     target: &Target,
     limit: Duration,
     now: &dyn Fn() -> Duration,
     sleep: &dyn Fn(Duration),
-) -> Result<bool, DriverError> {
+) -> Result<Joined, DriverError> {
     let started = now();
     connect(driver, target, sleep)?;
-    let mut since = None;
-    while now() - started < limit {
+    loop {
         let on = match driver.bssid().map_err(at("SIOCGIWAP"))? {
             Some(_) => driver.essid().map_err(at("SIOCGIWESSID"))? == target.ssid().as_bytes(),
             None => false,
         };
         if on {
-            let since = *since.get_or_insert(now());
-            if now() - since >= STABLE {
-                return Ok(true);
-            }
-        } else {
-            since = None;
+            break;
+        }
+        if now() - started >= limit {
+            disconnect(driver)?;
+            return Ok(Joined::NotAssociated);
         }
         sleep(POLL);
     }
-    Ok(false)
+    if prove(driver, dhcp, target.ssid(), now, sleep)? {
+        Ok(Joined::Yes)
+    } else {
+        disconnect(driver)?;
+        Ok(Joined::NoLease)
+    }
 }
 
 /// The pause before the next try: doubling from 2 s to a minute.
@@ -389,28 +450,33 @@ impl Backoff {
     }
 }
 
-/// Why [`keep`] should look again now.
+/// Why [`keep`] should act now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kick {
     /// The saved networks changed: still on one of them?
     Saved,
     /// Back from a suspend: join again (the PMK again too).
     Resumed,
+    /// Settings wants a scan: done between joins, never during one.
+    Scan,
 }
 
 /// What [`keep`] runs in: src/net.rs's stack, or the tests' fake.
-pub trait Context {
+pub trait Context: Dhcp {
     type D: Driver;
-    /// Monotonic time.
+    /// Monotonic time, the clock [`Dhcp::leased`] answers on.
     fn now(&self) -> Duration;
     fn sleep(&self, pause: Duration);
-    /// Waits up to `pause`, or until kicked; takes the kick.
+    /// Waits up to `pause`, or until kicked; takes the kick. A scan is
+    /// handed out before a rejoin.
     fn wait(&self, pause: Duration) -> Option<Kick>;
     /// `f` with the driver and the saved networks, under the lifecycle
     /// lock, while this keeper's stack is still the one wanted.
     fn with<R>(&self, f: impl FnOnce(&Self::D, &[Credentials]) -> R) -> Option<R>;
-    /// Associated after not being: renew the address.
+    /// Joined, with a lease, after not being.
     fn joined(&self, ssid: &str);
+    /// The scan Settings asked for.
+    fn scanned(&self, result: Result<Vec<Bss>, String>);
     /// Gives up on kindil's own Wi-Fi for the run.
     fn fall_back(&self, why: &str);
 }
@@ -478,11 +544,13 @@ struct Keeper {
     strikes: u32,
     /// The network last joined, for straight back after a suspend.
     last: Option<Target>,
+    /// Joined with a lease, and not lost since.
     associated: bool,
 }
 
 /// Joins the best saved network and keeps it joined, until the stack stops
 /// ([`Context::with`] gives `None`) or it gives up ([`Context::fall_back`]).
+/// Settings' scans are done here too, between joins.
 pub fn keep<X: Context>(cx: &X) {
     let mut keeper = Keeper::default();
     let mut state = State::Attempt(None);
@@ -496,16 +564,13 @@ impl Keeper {
         match state {
             State::Attempt(kick) => self.attempt(cx, kick),
             State::Watch => {
-                if let Some(kick) = cx.wait(WATCH) {
+                if let Some(kick) = self.pause(cx, WATCH)? {
                     return Some(State::Attempt(Some(kick)));
                 }
                 match cx.with(|d, _| d.bssid())? {
                     Err(error) => self.strike(cx, at("SIOCGIWAP")(error), State::Watch),
                     Ok(Some(_)) => {
-                        // Held: a lasting association.
                         self.strikes = 0;
-                        self.backoff.reset();
-                        self.failing_since = None;
                         Some(State::Watch)
                     }
                     Ok(None) => {
@@ -517,10 +582,10 @@ impl Keeper {
                 }
             }
             State::Lost => match self.wait_associated(cx, REJOIN_GRACE)? {
-                Ok(true) => {
-                    self.on_associated(cx, "the same network");
-                    Some(State::Watch)
-                }
+                Ok(true) => match cx.with(|d, _| d.essid())? {
+                    Ok(ssid) => self.proven(cx, &String::from_utf8_lossy(&ssid), None),
+                    Err(error) => self.strike(cx, at("SIOCGIWESSID")(error), State::Attempt(None)),
+                },
                 Ok(false) => Some(State::Attempt(None)),
                 Err(error) => self.strike(cx, error, State::Attempt(None)),
             },
@@ -538,7 +603,7 @@ impl Keeper {
         };
         self.strikes = 0;
         match tried {
-            Attempted::Nothing => Some(State::Attempt(cx.wait(IDLE))),
+            Attempted::Nothing => Some(State::Attempt(self.pause(cx, IDLE)?)),
             Attempted::Unsupported { ssid, why } => {
                 cx.fall_back(&format!("can't join {ssid}: {why}"));
                 None
@@ -551,40 +616,106 @@ impl Keeper {
                 {
                     self.last = None;
                 }
-                self.on_associated(cx, &String::from_utf8_lossy(&ssid));
-                Some(State::Watch)
+                if self.associated {
+                    // Proven already: still on it.
+                    return Some(State::Watch);
+                }
+                self.proven(cx, &String::from_utf8_lossy(&ssid), None)
             }
             Attempted::Connecting { target, in_range } => {
                 self.associated = false;
                 if in_range {
-                    // Cleared only by an association that holds.
+                    // Cleared only by a join with a lease.
                     self.failing_since.get_or_insert(cx.now());
                     if let Some(why) = self.overdue(cx, &target) {
                         cx.fall_back(&why);
                         return None;
                     }
                 }
-                match self.wait_associated(cx, ASSOC_WAIT)? {
-                    Err(error) => self.strike(cx, error, State::Attempt(None)),
-                    Ok(true) => {
-                        self.on_associated(cx, target.ssid());
-                        self.last = Some(target);
-                        Some(State::Watch)
-                    }
+                let joined = match self.wait_associated(cx, ASSOC_WAIT)? {
+                    Err(error) => return self.strike(cx, error, State::Attempt(None)),
                     Ok(false) => {
-                        if let Some(why) = self.overdue(cx, &target).filter(|_| in_range) {
-                            cx.fall_back(&why);
-                            return None;
+                        // Stop the firmware chasing it while pausing.
+                        if let Err(error) = cx.with(|d, _| disconnect(d))? {
+                            return self.strike(cx, error, State::Attempt(None));
                         }
-                        let pause = self.backoff.pause();
-                        eprintln!(
-                            "kindil: Wi-Fi: {} not joined; trying again in {pause:?}",
-                            target.ssid()
-                        );
-                        Some(State::Attempt(cx.wait(pause)))
+                        false
                     }
+                    Ok(true) => match self.prove(cx, target.ssid())? {
+                        Err(error) => return self.strike(cx, error, State::Attempt(None)),
+                        Ok(leased) => {
+                            if !leased {
+                                eprintln!(
+                                    "kindil: Wi-Fi: associated with {} but no address within {} s (a wrong password?)",
+                                    target.ssid(),
+                                    LEASE_WAIT.as_secs()
+                                );
+                                if let Err(error) = cx.with(|d, _| disconnect(d))? {
+                                    return self.strike(cx, error, State::Attempt(None));
+                                }
+                            }
+                            leased
+                        }
+                    },
+                };
+                if joined {
+                    let ssid = target.ssid().to_owned();
+                    return self.proven(cx, &ssid, Some(target));
                 }
+                if let Some(why) = self.overdue(cx, &target).filter(|_| in_range) {
+                    cx.fall_back(&why);
+                    return None;
+                }
+                let pause = self.backoff.pause();
+                eprintln!(
+                    "kindil: Wi-Fi: {} not joined; trying again in {pause:?}",
+                    target.ssid()
+                );
+                Some(State::Attempt(self.pause(cx, pause)?))
             }
+        }
+    }
+
+    /// Associated with `ssid` (without a lease yet unless `target` says it
+    /// was proven): proves it if needed, then watches it.
+    fn proven<X: Context>(&mut self, cx: &X, ssid: &str, target: Option<Target>) -> Option<State> {
+        if target.is_none() {
+            match self.prove(cx, ssid)? {
+                Err(error) => return self.strike(cx, error, State::Attempt(None)),
+                Ok(false) => return Some(State::Attempt(None)),
+                Ok(true) => {}
+            }
+        }
+        if let Some(target) = target {
+            self.last = Some(target);
+        }
+        self.backoff.reset();
+        self.failing_since = None;
+        if !self.associated {
+            eprintln!("kindil: Wi-Fi: joined {ssid}");
+            cx.joined(ssid);
+        }
+        self.associated = true;
+        Some(State::Watch)
+    }
+
+    fn prove<X: Context>(&mut self, cx: &X, ssid: &str) -> Option<Result<bool, DriverError>> {
+        let since = cx.now();
+        cx.ask(ssid);
+        loop {
+            if cx.leased().is_some_and(|at| at >= since) {
+                return Some(Ok(true));
+            }
+            if cx.now() - since >= LEASE_WAIT {
+                return Some(Ok(false));
+            }
+            match cx.with(|d, _| d.bssid())? {
+                Err(error) => return Some(Err(at("SIOCGIWAP")(error))),
+                // Dropped: the handshake failed.
+                Ok(None) => return Some(Ok(false)),
+                Ok(Some(_)) => {}
+            }
+            cx.sleep(POLL);
         }
     }
 
@@ -593,19 +724,11 @@ impl Keeper {
         let since = self.failing_since?;
         (cx.now() - since >= FALLBACK_AFTER).then(|| {
             format!(
-                "no lasting association with {} within {} s",
+                "no join with an address on {} within {} s",
                 target.ssid(),
                 FALLBACK_AFTER.as_secs()
             )
         })
-    }
-
-    fn on_associated<X: Context>(&mut self, cx: &X, ssid: &str) {
-        if !self.associated {
-            eprintln!("kindil: Wi-Fi: joined {ssid}");
-            cx.joined(ssid);
-        }
-        self.associated = true;
     }
 
     /// Polls until associated or `limit` passes.
@@ -628,6 +751,35 @@ impl Keeper {
         }
     }
 
+    /// Waits up to `pause`, doing the scans Settings asks for meanwhile;
+    /// a rejoin kick ends it early. `None`: stopped.
+    fn pause<X: Context>(&mut self, cx: &X, pause: Duration) -> Option<Option<Kick>> {
+        let end = cx.now() + pause;
+        loop {
+            match cx.wait(end.saturating_sub(cx.now())) {
+                Some(Kick::Scan) => {
+                    let result = cx.with(|d, _| scan(d, &|p| cx.sleep(p)))?;
+                    match result {
+                        Ok(seen) => {
+                            self.strikes = 0;
+                            cx.scanned(Ok(seen));
+                        }
+                        Err(error) => {
+                            cx.scanned(Err(error.to_string()));
+                            self.strikes += 1;
+                            eprintln!("kindil: Wi-Fi: {error}");
+                            if self.strikes >= STRIKES {
+                                cx.fall_back(&format!("the Wi-Fi driver keeps failing ({error})"));
+                                return None;
+                            }
+                        }
+                    }
+                }
+                other => return Some(other),
+            }
+        }
+    }
+
     /// A driver error: a pause and on, or giving up after [`STRIKES`].
     fn strike<X: Context>(&mut self, cx: &X, error: DriverError, next: State) -> Option<State> {
         self.strikes += 1;
@@ -636,7 +788,8 @@ impl Keeper {
             cx.fall_back(&format!("the Wi-Fi driver keeps failing ({error})"));
             return None;
         }
-        Some(match cx.wait(self.backoff.pause()) {
+        let pause = self.backoff.pause();
+        Some(match self.pause(cx, pause)? {
             Some(kick) => State::Attempt(Some(kick)),
             None => next,
         })
@@ -753,6 +906,9 @@ pub mod fake {
             Ok(())
         }
         fn trigger_scan(&self) -> io::Result<()> {
+            if !self.essid.borrow().is_empty() && self.associated.borrow().is_none() {
+                self.calls.borrow_mut().push("SCAN DURING A CONNECT".into());
+            }
             self.call("scan".into())
         }
         fn scan_results(&self) -> io::Result<Vec<u8>> {
@@ -866,8 +1022,14 @@ pub mod fake {
         pub until: Duration,
         pub events: RefCell<VecDeque<(Duration, Event)>>,
         pending: Cell<Option<Kick>>,
+        pending_scan: Cell<bool>,
         pub joins: RefCell<Vec<(Duration, String)>>,
         pub fell_back: RefCell<Option<(Duration, String)>>,
+        /// Networks whose DHCP answers (with the right keys), and how fast.
+        pub dhcp: RefCell<Vec<(Vec<u8>, Duration)>>,
+        pub asked: RefCell<Vec<String>>,
+        lease_at: Cell<Option<Duration>>,
+        pub scans: RefCell<Vec<(Duration, Result<usize, String>)>>,
     }
 
     impl FakeContext {
@@ -879,9 +1041,22 @@ pub mod fake {
                 until,
                 events: RefCell::default(),
                 pending: Cell::new(None),
+                pending_scan: Cell::new(false),
                 joins: RefCell::default(),
                 fell_back: RefCell::default(),
+                dhcp: RefCell::default(),
+                asked: RefCell::default(),
+                lease_at: Cell::new(None),
+                scans: RefCell::default(),
             }
+        }
+
+        /// The kick `wait` hands out next: a scan first.
+        fn take_kick(&self) -> Option<Kick> {
+            if self.pending_scan.replace(false) {
+                return Some(Kick::Scan);
+            }
+            self.pending.take()
         }
 
         pub fn at(&self, time: Duration, event: Event) {
@@ -901,6 +1076,7 @@ pub mod fake {
                     }
                 };
                 match due {
+                    Some((_, Event::Kick(Kick::Scan))) => self.pending_scan.set(true),
                     Some((_, Event::Kick(kick))) => self.pending.set(Some(kick)),
                     Some((_, Event::Do(change))) => {
                         change(&self.driver, &mut self.saved.borrow_mut())
@@ -927,7 +1103,7 @@ pub mod fake {
         fn wait(&self, pause: Duration) -> Option<Kick> {
             let end = self.clock.get() + pause;
             while self.clock.get() < end {
-                if let Some(kick) = self.pending.take() {
+                if let Some(kick) = self.take_kick() {
                     return Some(kick);
                 }
                 let next_event = self.events.borrow().front().map(|(t, _)| *t);
@@ -937,7 +1113,7 @@ pub mod fake {
                 };
                 self.advance(step);
             }
-            self.pending.take()
+            self.take_kick()
         }
         fn with<R>(&self, f: impl FnOnce(&FakeDriver, &[Credentials]) -> R) -> Option<R> {
             self.fire();
@@ -952,8 +1128,34 @@ pub mod fake {
                 .borrow_mut()
                 .push((self.clock.get(), ssid.to_owned()));
         }
+        fn scanned(&self, result: Result<Vec<Bss>, String>) {
+            self.scans
+                .borrow_mut()
+                .push((self.clock.get(), result.map(|seen| seen.len())));
+        }
         fn fall_back(&self, why: &str) {
             *self.fell_back.borrow_mut() = Some((self.clock.get(), why.to_owned()));
+        }
+    }
+
+    impl Dhcp for FakeContext {
+        /// A lease comes if associated with a network whose DHCP answers.
+        fn ask(&self, ssid: &str) {
+            self.asked.borrow_mut().push(ssid.to_owned());
+            let essid = self.driver.essid.borrow().clone();
+            let associated = self.driver.associated.borrow().is_some();
+            let delay = self
+                .dhcp
+                .borrow()
+                .iter()
+                .find(|(name, _)| *name == essid)
+                .map(|(_, delay)| *delay);
+            if let Some(delay) = delay.filter(|_| associated) {
+                self.lease_at.set(Some(self.clock.get() + delay));
+            }
+        }
+        fn leased(&self) -> Option<Duration> {
+            self.lease_at.get().filter(|at| *at <= self.clock.get())
         }
     }
 }
@@ -1180,21 +1382,70 @@ mod tests {
         assert_eq!(list[2].security, Security::Open);
     }
 
-    #[test]
-    fn joining_for_settings_waits_for_a_lasting_association() {
+    /// DHCP that answers `after` an ask, if it answers at all.
+    struct TestDhcp<'a> {
+        clock: &'a std::cell::Cell<Duration>,
+        after: Option<Duration>,
+        at: std::cell::Cell<Option<Duration>>,
+    }
+
+    impl Dhcp for TestDhcp<'_> {
+        fn ask(&self, _: &str) {
+            self.at
+                .set(self.after.map(|after| self.clock.get() + after));
+        }
+        fn leased(&self) -> Option<Duration> {
+            self.at.get().filter(|at| *at <= self.clock.get())
+        }
+    }
+
+    fn settings_join(
+        associates: Option<u32>,
+        dhcp: Option<Duration>,
+    ) -> (Joined, Vec<String>, Duration) {
         let clock = std::cell::Cell::new(Duration::ZERO);
         let now = || clock.get();
         let sleep = |p| clock.set(clock.get() + p);
         let driver = FakeDriver::new();
-        driver.joinable.borrow_mut().push((b"Home".to_vec(), 2));
+        if let Some(polls) = associates {
+            driver.joinable.borrow_mut().push((b"Home".to_vec(), polls));
+        }
+        let dhcp = TestDhcp {
+            clock: &clock,
+            after: dhcp,
+            at: std::cell::Cell::new(None),
+        };
         let target = Target::blind(&wpa("Home"));
-        assert!(join(&driver, &target, secs(30), &now, &sleep).unwrap());
-        assert!(clock.get() >= STABLE);
-        // A wrong password: never associates.
-        clock.set(Duration::ZERO);
-        let driver = FakeDriver::new();
-        assert!(!join(&driver, &target, secs(30), &now, &sleep).unwrap());
-        assert!(clock.get() >= secs(30));
+        let joined = join(&driver, &dhcp, &target, secs(30), &now, &sleep).unwrap();
+        (joined, driver.actions(), clock.get())
+    }
+
+    #[test]
+    fn a_settings_join_counts_with_a_lease() {
+        let (joined, actions, took) = settings_join(Some(2), Some(secs(1)));
+        assert_eq!(joined, Joined::Yes);
+        assert_eq!(actions.last().unwrap(), "essid Home");
+        assert!(took < secs(3), "{took:?}");
+    }
+
+    #[test]
+    fn associated_without_a_lease_is_a_wrong_password_and_left() {
+        let (joined, actions, took) = settings_join(Some(2), None);
+        assert_eq!(joined, Joined::NoLease);
+        assert_eq!(actions.last().unwrap(), "essid off", "{actions:?}");
+        assert!(actions.iter().any(|c| c.starts_with("disassociate")));
+        assert!(
+            took >= LEASE_WAIT && took < LEASE_WAIT + secs(3),
+            "{took:?}"
+        );
+    }
+
+    #[test]
+    fn never_associating_is_reported_as_such() {
+        let (joined, actions, took) = settings_join(None, Some(secs(1)));
+        assert_eq!(joined, Joined::NotAssociated);
+        assert_eq!(actions.last().unwrap(), "essid off");
+        assert!(took >= secs(30));
     }
 
     #[test]
@@ -1206,15 +1457,31 @@ mod tests {
         assert_eq!(backoff.pause(), secs(2));
     }
 
+    /// `ssid` joins after `polls` and its DHCP answers in a second.
+    fn joins(cx: &FakeContext, ssid: &str, polls: u32) {
+        cx.driver
+            .joinable
+            .borrow_mut()
+            .push((ssid.as_bytes().to_vec(), polls));
+        cx.dhcp
+            .borrow_mut()
+            .push((ssid.as_bytes().to_vec(), secs(1)));
+    }
+
     fn home_in_range(cx: &FakeContext, polls: u32) {
         cx.driver
             .aps
             .borrow_mut()
             .push(wpa2(1, "Home", -50, Cipher::Ccmp));
+        joins(cx, "Home", polls);
+    }
+
+    fn overlaps(cx: &FakeContext) -> bool {
         cx.driver
-            .joinable
-            .borrow_mut()
-            .push((b"Home".to_vec(), polls));
+            .calls
+            .borrow()
+            .iter()
+            .any(|c| c == "SCAN DURING A CONNECT")
     }
 
     #[test]
@@ -1282,7 +1549,7 @@ mod tests {
             .aps
             .borrow_mut()
             .push(wpa2(2, "Phone", -70, Cipher::Ccmp));
-        cx.driver.joinable.borrow_mut().push((b"Phone".to_vec(), 1));
+        joins(&cx, "Phone", 1);
         cx.at(
             secs(20),
             Event::Do(Box::new(|_, saved| {
@@ -1353,10 +1620,7 @@ mod tests {
     #[test]
     fn a_hidden_network_joins_blind() {
         let cx = FakeContext::new(vec![wpa("Hidden")], secs(60));
-        cx.driver
-            .joinable
-            .borrow_mut()
-            .push((b"Hidden".to_vec(), 1));
+        joins(&cx, "Hidden", 1);
         keep(&cx);
         assert_eq!(cx.joins.borrow().len(), 1);
     }
@@ -1415,6 +1679,111 @@ mod tests {
         let joins = cx.joins.borrow();
         assert_eq!(joins.len(), 1);
         assert!(joins[0].0 >= secs(100) && joins[0].0 < secs(110));
+        assert!(cx.fell_back.borrow().is_none());
+    }
+
+    #[test]
+    fn associated_without_a_lease_never_counts_and_falls_back() {
+        let cx = FakeContext::new(vec![wpa("Home")], secs(600));
+        cx.driver
+            .aps
+            .borrow_mut()
+            .push(wpa2(1, "Home", -50, Cipher::Ccmp));
+        // Associates every time; no DHCP gets through (wrong keys).
+        cx.driver.joinable.borrow_mut().push((b"Home".to_vec(), 1));
+        keep(&cx);
+        assert!(cx.joins.borrow().is_empty());
+        assert!(!cx.asked.borrow().is_empty());
+        assert!(cx.asked.borrow().iter().all(|s| s == "Home"));
+        let (when, why) = cx.fell_back.borrow().clone().unwrap();
+        assert!(why.contains("Home"), "{why}");
+        assert!(when >= FALLBACK_AFTER && when < secs(90), "{when:?}");
+        // Each failed proof left the network again.
+        assert!(cx
+            .driver
+            .actions()
+            .iter()
+            .any(|c| c.starts_with("disassociate")));
+    }
+
+    #[test]
+    fn a_lease_after_association_counts() {
+        let cx = FakeContext::new(vec![wpa("Home")], secs(60));
+        home_in_range(&cx, 1);
+        keep(&cx);
+        let joins = cx.joins.borrow();
+        assert_eq!(joins.len(), 1);
+        // Scan 3 s, settle 0.5 s, a poll, then the lease a second after asking.
+        assert!(
+            joins[0].0 >= secs(4) && joins[0].0 < secs(6),
+            "{:?}",
+            joins[0].0
+        );
+        assert_eq!(*cx.asked.borrow(), ["Home"]);
+    }
+
+    #[test]
+    fn a_scan_asked_for_during_a_connect_waits_for_it() {
+        let cx = FakeContext::new(vec![wpa("Home")], secs(60));
+        // Slow to associate: 5 s after the connect.
+        home_in_range(&cx, 20);
+        cx.at(secs(5), Event::Kick(Kick::Scan));
+        keep(&cx);
+        assert!(!overlaps(&cx), "{:?}", cx.driver.calls.borrow());
+        let joined = cx.joins.borrow()[0].0;
+        let scans = cx.scans.borrow();
+        assert_eq!(scans.len(), 1);
+        let (when, found) = scans[0].clone();
+        assert!(
+            when > joined && when <= joined + SCAN_WAIT + secs(1),
+            "{when:?} {joined:?}"
+        );
+        assert_eq!(found, Ok(1));
+    }
+
+    #[test]
+    fn a_scan_while_watching_is_done_at_once_and_keeps_the_link() {
+        let cx = FakeContext::new(vec![wpa("Home")], secs(60));
+        home_in_range(&cx, 1);
+        cx.at(secs(20), Event::Kick(Kick::Scan));
+        keep(&cx);
+        let (when, _) = cx.scans.borrow()[0].clone();
+        assert!(when >= secs(20) && when <= secs(20) + SCAN_WAIT, "{when:?}");
+        assert_eq!(cx.joins.borrow().len(), 1);
+        assert_eq!(cx.driver.pmks.get(), 1);
+        assert!(!overlaps(&cx));
+    }
+
+    #[test]
+    fn a_scan_between_failed_tries_finds_no_connect_pending() {
+        // Out of range: blind tries that fail, scans asked for meanwhile.
+        let cx = FakeContext::new(vec![wpa("Home")], secs(120));
+        for t in [12, 30, 45, 70] {
+            cx.at(secs(t), Event::Kick(Kick::Scan));
+        }
+        keep(&cx);
+        assert_eq!(cx.scans.borrow().len(), 4);
+        assert!(!overlaps(&cx), "{:?}", cx.driver.calls.borrow());
+    }
+
+    #[test]
+    fn a_failing_scan_answers_with_the_error() {
+        let cx = FakeContext::new(vec![wpa("Home")], secs(60));
+        home_in_range(&cx, 1);
+        cx.at(
+            secs(20),
+            Event::Do(Box::new(|d, _| {
+                *d.failing.borrow_mut() = Some(("scan results", libc::EIO))
+            })),
+        );
+        cx.at(secs(20), Event::Kick(Kick::Scan));
+        cx.at(
+            secs(25),
+            Event::Do(Box::new(|d, _| *d.failing.borrow_mut() = None)),
+        );
+        keep(&cx);
+        let (_, result) = cx.scans.borrow()[0].clone();
+        assert!(result.unwrap_err().contains("SIOCGIWSCAN"));
         assert!(cx.fell_back.borrow().is_none());
     }
 

@@ -26,7 +26,12 @@ driver's profile under the keeper.
   preferred saved network in range, and joins with "essid off", the WPA2
   profile (SIOCSIWAUTH), the PMK (SIOCSIWENCODEEXT, alg 4) and the ESSID. The
   firmware does the 4-way handshake. udhcpc and the kindil-dhcp hook are the
-  same as before. It checks the access point (SIOCGIWAP) every 3 s; on a loss
+  same as before; a join counts only once a lease comes after it (within
+  15 s of associating: the hook stamps `/var/run/kindil-lease`), since a
+  wrong password can associate for a few seconds but gets no DHCP through.
+  Joining another network releases the old lease first (SIGUSR2), the same
+  network renews it (SIGUSR1). Settings' scans are done by the keeper
+  between joins, never during one. It checks the access point (SIOCGIWAP) every 3 s; on a loss
   it gives the firmware 10 s to rejoin by itself, then joins again (PMK
   again), with pauses doubling from 2 s to a minute between failed tries.
   After a suspend it joins the same network again straight away.
@@ -34,8 +39,8 @@ driver's profile under the keeper.
   TKIP-only pairwise, WEP, WPA3-only and 802.1X networks. A saved network
   like that in range makes it fall back (next point); joining one in
   Settings fails with the reason.
-- **The fallback:** no lasting association (3 s) within 30 s on a saved
-  network in range, a refused saved network in range, or 3 driver errors in
+- **The fallback:** no join with a lease within 30 s on a saved network
+  in range (associating without an address counts as failing), a refused saved network in range, or 3 driver errors in
   a row: it logs `kindil's own Wi-Fi gives up (...)`, disassociates, turns
   the ESSID off and starts wpa_supplicant with the saved networks for the
   rest of this run (until kindil restarts). A saved network out of sight
@@ -84,18 +89,18 @@ sleep 25
 2. **Scan list.** Settings → Wi-Fi → the network list. Expect the networks
    around (as with wpa_supplicant), strongest first, the lock on protected
    ones, no hidden (empty) names. The link stays up during the scan (watch
-   `/proc/net/wireless` and a ping in another shell).
+   `/proc/net/wireless` and a ping in another shell). Scanning right after
+   switching Wi-Fi on waits for the join to finish (up to about 30 s).
 3. **Off and on.** Switch Wi-Fi off in Settings: `ifconfig wlan0` down, no
    udhcpc, the log has no errors; `/var/local/kindil/wifi-off` exists. On
    again: `joined NAME` within about 10 s, DHCP again, internet.
 4. **Joining in Settings.** With a second network available (a phone's
    hotspot, WPA2): join it from the list with its password. Expect it to
-   join within 30 s and be saved. Then with a wrong password: expect
-   "couldn't join ...: check the password" after about 30 s, nothing saved,
-   and the keeper back on the first network. (This is the least certain
-   part: if a wrong password associates for more than 3 s before failing
-   the handshake, the join is reported as a success. Check
-   `/var/local/kindil/networks.toml` after it.) Forget the hotspot
+   join within 30 s, with an address, and be saved. Then with a wrong
+   password: expect "couldn't join ...: check the password" (with "joined,
+   but got no address" if it associated) within about 45 s, nothing saved
+   in `/var/local/kindil/networks.toml`, and the keeper back on the first
+   network with a lease. Forget the hotspot
    afterwards; if it was the joined one, the keeper moves to the other
    network within about 5 s.
 5. **Suspend and resume.** Set Sleep when idle to Doze, leave it untouched
@@ -123,8 +128,9 @@ sleep 25
    few seconds without a link); note the time.
 8. **The fallback.** With a saved network in range whose password is wrong
    (save the hotspot, then change its password on the phone): restart kindil
-   with only that network in range. Expect the "gives up (no lasting
-   association with ... within 30 s)" line about 30-40 s after the start,
+   with only that network in range. Expect `associated with ... but no
+   address within 15 s` if it associates, then the "gives up (no join with
+   an address on ... within 30 s)" line within about a minute of the start,
    then wpa_supplicant running (`pidof wpa_supplicant`) and the usual
    wpa_supplicant behaviour for the rest of the run.
 9. **Switch off.** `rm /var/local/kindil/wifi`, restart kindil. Expect no
