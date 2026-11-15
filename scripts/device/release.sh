@@ -31,9 +31,10 @@ done
 
 KEY="$(sed -n 's/^const PUBLIC_KEY: &str = "\(.*\)";$/\1/p' "$ROOT/src/update.rs")"
 [[ -n "$KEY" ]] || die "no PUBLIC_KEY in src/update.rs"
-minisign() {
-	if command -v minisign >/dev/null; then
-		command minisign "$@"
+# minisign as installed, or from nixpkgs.
+run_minisign() {
+	if type -P minisign >/dev/null; then
+		minisign "$@"
 	else
 		nix shell nixpkgs#minisign -c minisign "$@"
 	fi
@@ -46,7 +47,7 @@ trap 'rm -rf "$WORK"' EXIT
 fetch() {
 	mkdir -p "$2"
 	gh release download "v$1" --repo "$REPO" -D "$2" -p kindil -p kindil.minisig
-	minisign -Vm "$2/kindil" -x "$2/kindil.minisig" -P "$KEY" >/dev/null ||
+	run_minisign -Vm "$2/kindil" -x "$2/kindil.minisig" -P "$KEY" >/dev/null ||
 		die "v$1: bad signature"
 	grep -q "trusted comment: kindil v$1$" "$2/kindil.minisig" ||
 		die "v$1: the signature is for another version"
@@ -54,6 +55,9 @@ fetch() {
 
 fetch "$version" "$WORK/new"
 mkdir -p "$WORK/stage"
+# Releases are tagged on GitHub: fetch the tag if this clone lacks it.
+git -C "$ROOT" rev-parse -q --verify "refs/tags/v$version" >/dev/null ||
+	git -C "$ROOT" fetch -q origin "refs/tags/v$version:refs/tags/v$version"
 git -C "$ROOT" archive "v$version" kindle/extensions | tar -x -C "$WORK/stage"
 install -m755 "$WORK/new/kindil" "$WORK/stage/kindle/extensions/kindil/bin/kindil"
 COPYFILE_DISABLE=1 tar -C "$WORK/stage/kindle" --no-xattrs -czf "$WORK/bundle.tgz" extensions
