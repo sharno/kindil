@@ -5,7 +5,7 @@ default-members = ["."]
 
 [package]
 name = "kindil"
-version = "0.9.4"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.92"
 description = "A single-process Rust shell for the first-generation Amazon Kindle Paperwhite"
