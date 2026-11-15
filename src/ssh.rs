@@ -466,14 +466,13 @@ mod tests {
     fn a_stale_kindil_sshd_is_ended() {
         let dir = tempfile::tempdir().unwrap();
         let sleep = dir.path().join(NAME);
-        std::fs::copy(
-            ["/bin/sleep", "/usr/bin/sleep"]
-                .into_iter()
-                .find(|p| Path::new(p).exists())
-                .unwrap_or("/run/current-system/sw/bin/sleep"),
-            &sleep,
-        )
-        .unwrap();
+        // From PATH: the Nix build sandbox has no /bin/sleep.
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let found = std::env::split_paths(&path)
+            .map(|dir| dir.join("sleep"))
+            .find(|candidate| candidate.is_file())
+            .expect("sleep on PATH");
+        std::fs::copy(found, &sleep).unwrap();
         let mut stale = Command::new(&sleep).arg("30").spawn().unwrap();
         let file = dir.path().join("pid");
         write_new(&file, stale.id().to_string().as_bytes(), 0o644).unwrap();
