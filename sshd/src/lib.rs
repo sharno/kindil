@@ -28,15 +28,22 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 
 /// Sessions' PATH: the Kindle's usual one, sbin (upstart's tools) included.
 pub const PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 /// The only user: everything runs as root, the server's own user.
 pub const USER: &str = "root";
-/// Bytes typed or piped into a session's program but not yet read by it.
-/// Past this, the connection waits for the program.
-const INPUT_BACKLOG: usize = 8 << 20;
+/// Bytes typed or piped into a session's program but not yet read by it,
+/// and the messages they came in. Past this, the connection waits for the
+/// program, for at most `Settings::input_wait`: then the channel's program
+/// is ended.
+const INPUT_BACKLOG: usize = 2 << 20;
+const INPUT_MESSAGES: usize = 256;
+/// Session channels one connection may have open.
+const CHANNELS: usize = 4;
+/// How long a channel's programs get between SIGTERM and SIGKILL.
+const GRACE: Duration = Duration::from_secs(2);
 /// Output read from a program at a time.
 const CHUNK: usize = 32 << 10;
 /// How long a shell's last output may take to come through its terminal
@@ -68,6 +75,9 @@ pub struct Settings {
     /// at most `admission_burst`.
     pub admissions_per_second: f64,
     pub admission_burst: f64,
+    /// How long the connection waits for a program to take its input
+    /// before the program is ended.
+    pub input_wait: Duration,
 }
 
 impl Settings {
@@ -82,6 +92,7 @@ impl Settings {
             login_time: Duration::from_secs(30),
             admissions_per_second: 2.0,
             admission_burst: 6.0,
+            input_wait: Duration::from_secs(60),
         }
     }
 
@@ -425,31 +436,72 @@ struct Chan {
     master: Option<Arc<pty::Master>>,
     input: Option<Input>,
     started: bool,
-    /// Dropped with the channel (closed, or the connection gone): the tasks
-    /// serving it stop.
-    _open: Option<oneshot::Sender<()>>,
+    /// Dropped with the channel (closed, or the connection gone), or when
+    /// its program stops taking input: every task serving it stops, and a
+    /// program still running is ended, with its process group.
+    _open: Option<watch::Sender<()>>,
 }
 
-/// The way into a program's stdin (or its terminal), with room for at most
-/// [`INPUT_BACKLOG`] bytes it hasn't read yet.
+impl Chan {
+    /// Ends what the channel runs, as if the client had closed it.
+    fn cancel(&mut self) {
+        self._open = None;
+        self.input = None;
+        self.master = None;
+    }
+}
+
+/// Resolves once `open`'s sender is gone.
+async fn cancelled(mut open: watch::Receiver<()>) {
+    while open.changed().await.is_ok() {}
+}
+
+/// Queued input waiting for a program: at most [`INPUT_BACKLOG`] bytes in
+/// at most [`INPUT_MESSAGES`] messages.
+type Queued = (Bytes, OwnedSemaphorePermit);
+
+/// The way into a program's stdin (or its terminal).
 #[derive(Clone)]
 struct Input {
-    queue: mpsc::UnboundedSender<(Bytes, OwnedSemaphorePermit)>,
+    queue: mpsc::Sender<Queued>,
     room: Arc<Semaphore>,
+    wait: Duration,
 }
 
 impl Input {
-    fn new() -> (Self, mpsc::UnboundedReceiver<(Bytes, OwnedSemaphorePermit)>) {
-        let (queue, receiver) = mpsc::unbounded_channel();
+    fn new(wait: Duration) -> (Self, mpsc::Receiver<Queued>, Arc<Semaphore>) {
+        let (queue, receiver) = mpsc::channel(INPUT_MESSAGES);
         let room = Arc::new(Semaphore::new(INPUT_BACKLOG));
-        (Self { queue, room }, receiver)
+        (
+            Self {
+                queue,
+                room: room.clone(),
+                wait,
+            },
+            receiver,
+            room,
+        )
     }
 
-    async fn send(&self, data: &[u8]) {
-        let n = data.len().min(INPUT_BACKLOG) as u32;
-        if let Ok(permit) = self.room.clone().acquire_many_owned(n).await {
-            let _ = self.queue.send((Bytes::copy_from_slice(data), permit));
+    /// Queues `data`, waiting for room. Once the program no longer reads
+    /// its input, the rest is dropped, as other servers do; false only if
+    /// it took none for its wait.
+    async fn send(&self, data: &[u8]) -> bool {
+        if data.is_empty() {
+            return true;
         }
+        let n = data.len().min(INPUT_BACKLOG) as u32;
+        let queued = async {
+            // Closed: the program stopped taking input.
+            let Ok(permit) = self.room.clone().acquire_many_owned(n).await else {
+                return;
+            };
+            let _ = self
+                .queue
+                .send((Bytes::copy_from_slice(data), permit))
+                .await;
+        };
+        tokio::time::timeout(self.wait, queued).await.is_ok()
     }
 }
 
@@ -465,7 +517,8 @@ impl Connection {
     }
 
     /// Starts the channel's program: `command` by the shell, or the shell
-    /// itself (a login shell), on its terminal if it asked for one.
+    /// itself (a login shell), on its terminal if it asked for one. Either
+    /// way it leads a session (and process group) of its own.
     fn start(&mut self, id: ChannelId, command: Option<&[u8]>, handle: Handle) -> io::Result<()> {
         let settings = self.settings.clone();
         let chan = self.channels.entry(id).or_default();
@@ -494,24 +547,35 @@ impl Connection {
             .env("LOGNAME", USER)
             .env("SHELL", &settings.shell)
             .current_dir(home);
-        let (open, closed) = oneshot::channel();
-        let (input, received) = Input::new();
+        let (open, closed) = watch::channel(());
+        let (input, received, room) = Input::new(settings.input_wait);
         if let Some((term, size)) = chan.pty.clone() {
             let (master, slave) = pty::open(size)?;
             cmd.env("TERM", term);
             pty::attach(&mut cmd, slave)?;
             let child = tokio::process::Command::from(cmd).spawn()?;
             let master = Arc::new(master);
-            tokio::spawn(type_into(master.clone(), received));
+            let typing = type_into(master.clone(), received, room);
+            tokio::spawn(until(cancelled(closed.clone()), typing));
             tokio::spawn(run_on_terminal(handle, id, child, master.clone(), closed));
             chan.master = Some(master);
         } else {
             cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            // SAFETY: only setsid(2), async-signal-safe, between fork and exec.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
             let mut child = tokio::process::Command::from(cmd).spawn()?;
             if let Some(stdin) = child.stdin.take() {
-                tokio::spawn(pipe_into(stdin, received));
+                let piping = pipe_into(stdin, received, room);
+                tokio::spawn(until(cancelled(closed.clone()), piping));
             }
             tokio::spawn(run_on_pipes(handle, id, child, closed));
         }
@@ -522,29 +586,44 @@ impl Connection {
     }
 }
 
+/// Runs `work` until `stop` resolves.
+async fn until(
+    stop: impl std::future::Future<Output = ()>,
+    work: impl std::future::Future<Output = ()>,
+) {
+    tokio::select! {
+        () = stop => {}
+        () = work => {}
+    }
+}
+
 /// Feeds what the client sends into a program's stdin, closed (EOF) once
-/// the client says it is done.
+/// the client says it is done. Once it can't, no more is queued.
 async fn pipe_into(
     mut stdin: tokio::process::ChildStdin,
-    mut received: mpsc::UnboundedReceiver<(Bytes, OwnedSemaphorePermit)>,
+    mut received: mpsc::Receiver<Queued>,
+    room: Arc<Semaphore>,
 ) {
     while let Some((data, _room)) = received.recv().await {
         if stdin.write_all(&data).await.is_err() {
-            return;
+            break;
         }
     }
+    room.close();
 }
 
 /// Types what the client sends into a terminal.
 async fn type_into(
     master: Arc<pty::Master>,
-    mut received: mpsc::UnboundedReceiver<(Bytes, OwnedSemaphorePermit)>,
+    mut received: mpsc::Receiver<Queued>,
+    room: Arc<Semaphore>,
 ) {
     while let Some((data, _room)) = received.recv().await {
         if master.write_all(&data).await.is_err() {
-            return;
+            break;
         }
     }
+    room.close();
 }
 
 /// Sends what `reader` gives as the channel's data (`ext` 1: its stderr)
@@ -573,27 +652,50 @@ async fn pump(
     }
 }
 
+/// Ends a channel's program and everything in its process group: SIGHUP
+/// and SIGTERM, then SIGKILL for whatever is left after [`GRACE`]; reaped.
+async fn end_group(child: &mut tokio::process::Child, group: i32) {
+    let signal = |signal| {
+        // SAFETY: kill(2) on the process group this channel started; its
+        // leader's pid can't be reused while the group has members.
+        unsafe { libc::kill(-group, signal) };
+    };
+    signal(libc::SIGHUP);
+    signal(libc::SIGTERM);
+    let _ = tokio::time::timeout(GRACE, child.wait()).await;
+    signal(libc::SIGKILL);
+    let _ = child.wait().await;
+}
+
 async fn run_on_pipes(
     handle: Handle,
     id: ChannelId,
     mut child: tokio::process::Child,
-    closed: oneshot::Receiver<()>,
+    closed: watch::Receiver<()>,
 ) {
+    let Some(group) = child.id().map(|pid| pid as i32) else {
+        return;
+    };
     let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-    let work = async {
-        let (_, _, status) = tokio::join!(
-            pump(stdout, &handle, id, None),
-            pump(stderr, &handle, id, Some(1)),
-            child.wait()
-        );
-        status
+    let status = {
+        let work = async {
+            let (_, _, status) = tokio::join!(
+                pump(stdout, &handle, id, None),
+                pump(stderr, &handle, id, Some(1)),
+                child.wait()
+            );
+            status
+        };
+        tokio::select! {
+            status = work => Some(status),
+            // The channel or the connection is gone first.
+            () = cancelled(closed) => None,
+        }
     };
-    let status = tokio::select! {
-        status = work => status,
-        // The channel or the connection is gone: its pipes close.
-        _ = closed => return,
-    };
-    finish(&handle, id, status).await;
+    match status {
+        Some(status) => finish(&handle, id, status).await,
+        None => end_group(&mut child, group).await,
+    }
 }
 
 async fn run_on_terminal(
@@ -601,19 +703,23 @@ async fn run_on_terminal(
     id: ChannelId,
     mut child: tokio::process::Child,
     master: Arc<pty::Master>,
-    mut closed: oneshot::Receiver<()>,
+    closed: watch::Receiver<()>,
 ) {
+    let Some(group) = child.id().map(|pid| pid as i32) else {
+        return;
+    };
     let mut buf = vec![0; CHUNK];
+    let mut gone = std::pin::pin!(cancelled(closed));
     let status = loop {
         tokio::select! {
             read = master.read(&mut buf) => match read {
                 Ok(n) if n > 0 => {
                     if handle.data(id, Bytes::copy_from_slice(&buf[..n])).await.is_err() {
-                        return;
+                        break None;
                     }
                 }
                 // Every slave side closed: the shell is ending.
-                _ => break child.wait().await,
+                _ => break Some(child.wait().await),
             },
             status = child.wait() => {
                 // What it wrote last may still be on its way through the
@@ -627,14 +733,19 @@ async fn run_on_terminal(
                         _ => break,
                     }
                 }
-                break status;
+                break Some(status);
             }
-            // Gone: the terminal closes (the last master with the channel's),
-            // which hangs up on the shell.
-            _ = &mut closed => return,
+            () = &mut gone => break None,
         }
     };
-    finish(&handle, id, status).await;
+    match status {
+        Some(status) => finish(&handle, id, status).await,
+        None => {
+            // The terminal goes too (the last master), hanging up on it.
+            drop(master);
+            end_group(&mut child, group).await;
+        }
+    }
 }
 
 /// The program's exit status (128 + the signal that killed it), then EOF
@@ -696,9 +807,11 @@ impl russh::server::Handler for Connection {
         _: &mut Session,
     ) -> Result<(), Self::Error> {
         // Its messages come through this handler; the channel object, unread,
-        // goes.
-        self.channels.insert(channel.id(), Chan::default());
-        reply.accept().await;
+        // goes. Past CHANNELS, the reply, dropped, refuses it.
+        if self.channels.len() < CHANNELS {
+            self.channels.insert(channel.id(), Chan::default());
+            reply.accept().await;
+        }
         Ok(())
     }
 
@@ -726,11 +839,20 @@ impl russh::server::Handler for Connection {
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        _: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
         let input = self.channels.get(&channel).and_then(|c| c.input.clone());
         if let Some(input) = input {
-            input.send(data).await;
+            if !input.send(data).await {
+                // It hasn't read for a minute while the client keeps
+                // sending: rather than hold up the connection (its other
+                // channels, its close), the program goes.
+                if let Some(chan) = self.channels.get_mut(&channel) {
+                    noise(format_args!("{}: a program took no input; ended", self.peer));
+                    chan.cancel();
+                    session.close(channel)?;
+                }
+            }
         }
         Ok(())
     }
