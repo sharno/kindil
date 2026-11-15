@@ -25,6 +25,10 @@ use std::path::PathBuf;
 /// phd), apps, archive, power management helpers, dynamic config, updates,
 /// crash dumps and sync. Stopped while kindil runs; Amazon's UI needs them
 /// all back.
+/// kindil's SSH server's port (src/ssh.rs's PORT): its firewall rule goes
+/// on the way back to Amazon's UI.
+pub const SSH_PORT: u16 = 2222;
+
 pub const SERVICES: [&str; 11] = [
     "cmd",
     "appmgrd",
