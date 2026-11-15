@@ -145,9 +145,9 @@ rm -f "$T/upstart"
 # kindil runs Wi-Fi itself; these name no live process.
 fake "$T/ext/kindil" 1.0.0 "echo 999998 >$T/udhcpc.pid; echo 999999 >$T/wpa.pid; exit 0"
 run
-expect "leaving after kindil ran Wi-Fi resets Amazon's Wi-Fi jobs for wifid" \
-  "$(tr '\n' ',' <"$T/upstart" | cut -d, -f1-3)$([ -f "$T/wpa.pid" ] && echo ' pid left')" \
-  "stop wifis,stop wifim,start wifid"
+expect "leaving after kindil ran Wi-Fi gives wifid a fresh supplicant, the driver loaded" \
+  "$(tr '\n' ',' <"$T/upstart" | cut -d, -f1-2)$([ -f "$T/wpa.pid" ] && echo ' pid left')" \
+  "stop wifis,start wifid"
 
 reset
 rm -f "$T/runs"

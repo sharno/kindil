@@ -6,8 +6,8 @@
 //! hook as its children, and loads its saved networks (src/networks.rs),
 //! none on a first run until one is joined. A child that exits without being
 //! told is started again, wpa_supplicant with the networks loaded again,
-//! with a growing pause if it keeps dying. Off unloads the driver, which
-//! powers the chip down, and is remembered. Amazon's wifid only runs outside
+//! with a growing pause if it keeps dying. Off stops them and takes the
+//! interface down, and is remembered; the driver is never unloaded. Amazon's wifid only runs outside
 //! kindil: bin/session.sh starts it for Amazon's UI.
 use crate::host::Power;
 use crate::wifi::{self, Credentials, Link};
@@ -258,8 +258,8 @@ impl Net {
         Ok(())
     }
 
-    /// kindil's stack down and the chip powered off; never fails halfway
-    /// into a state On can't recover from.
+    /// kindil's stack down; never fails halfway into a state On can't
+    /// recover from.
     fn stop(&self) {
         // Its children now exit for good.
         self.generation.fetch_add(1, Ordering::SeqCst);
@@ -273,8 +273,10 @@ impl Net {
                 .stderr(std::process::Stdio::null())
                 .status();
         };
+        // The driver stays: unloading ar6003 can hang for good (Amazon wraps
+        // it in a reboot-on-hang guard), which hung kindil's Wi-Fi with it.
+        // Down, the interface is idle, and a suspend powers the chip off.
         quiet(Command::new("/sbin/ifconfig").args([INTERFACE, "down"]));
-        quiet(Command::new("/sbin/rmmod").arg("ar6003"));
     }
 }
 

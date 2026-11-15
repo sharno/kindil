@@ -57,8 +57,8 @@ and a reboot always returns the Kindle to stock.
     in it, saved in `/var/local/kindil/networks.toml` (plain text, readable
     by root only; a network is saved once it has joined). It loads the
     driver, runs its own wpa_supplicant (upstream 2.12, built by the flake)
-    and DHCP as its children, starting one again if it exits, and Off
-    unloads the driver; it remembers Off. Back online about a second after
+    and DHCP as its children, starting one again if it exits; Off stops
+    them, and is remembered. Back online about a second after
     a nap. None of Amazon's Wi-Fi services run while kindil does; on a
     first run it starts with no networks, ready to join one.
   - **USB drive mode**: plugging into a computer shows a USB screen while the

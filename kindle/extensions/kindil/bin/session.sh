@@ -49,8 +49,8 @@ restore() {
 running() { status "$1" 2>/dev/null | grep -q start/; }
 
 # kindil ran Wi-Fi itself (src/net.rs): its DHCP client and wpa_supplicant
-# go, and wifid starts Amazon's driver and supplicant jobs afresh (stopping
-# wifim unloads the driver kindil may have loaded or unloaded itself).
+# go, and wifid starts Amazon's supplicant afresh. The driver stays loaded:
+# unloading it can hang, and wifid's driver job is fine with it loaded.
 KINDIL_WIFI="/var/run/kindil-udhcpc.pid /var/run/kindil-wpa.pid"
 wifi_back() {
   ran=""
@@ -63,7 +63,6 @@ wifi_back() {
   done
   if [ -n "$ran" ] && ! running wifid; then
     stop wifis
-    stop wifim
   fi
   running wifid || start wifid
 }

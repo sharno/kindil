@@ -134,11 +134,13 @@ impl Display {
 
     /// Blocks until the dashboard frame after `shown` has been drawn and the
     /// panel has finished it (`shown` None: any frame after `drawn`). False
-    /// at `deadline`.
+    /// at `deadline`. Logs how long each step took.
     fn wait_drawn(&self, shown: Option<u64>, drawn: u64, deadline: Instant) -> bool {
         let Some(presented) = &self.presented else {
             return false;
         };
+        let since = Instant::now();
+        let ms = || since.elapsed().as_millis();
         let left = || deadline.saturating_duration_since(Instant::now());
         let drawn = match shown {
             None => drawn,
@@ -154,13 +156,19 @@ impl Display {
                 frames.1
             }
         };
+        let rendered = ms();
         while presented.frames.load(Ordering::Acquire) <= drawn {
             if left().is_zero() {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+        let sent = ms();
         (presented.wait_idle)();
+        eprintln!(
+            "kindil: doze redraw: dashboard rendered at {rendered} ms, drawn and sent at {sent} ms, panel done at {} ms",
+            ms()
+        );
         true
     }
 
