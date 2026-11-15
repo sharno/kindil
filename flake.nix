@@ -18,6 +18,7 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
+        "aarch64-darwin"
       ];
       forSystems = nixpkgs.lib.genAttrs systems;
       perSystem =
@@ -153,18 +154,24 @@
           checks = {
             host = host;
           };
-          devShells.default = pkgs.mkShell {
-            packages = [
-              rust
-              linker
-              pkgs.qemu
-              pkgs.binutils
-              pkgs.pkg-config
-              pkgs.shellcheck
-            ];
-            CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER = "${linker}/bin/armv7l-unknown-linux-gnueabihf-gcc";
-            CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUNNER = "${pkgs.qemu}/bin/qemu-arm";
-          };
+          devShells.default = pkgs.mkShell (
+            {
+              packages = [
+                rust
+                linker
+                pkgs.binutils
+                pkgs.pkg-config
+                pkgs.shellcheck
+              ]
+              # qemu-arm, user-mode emulation, is Linux only: macOS's qemu
+              # has system emulators alone, so ARM tests run on Linux.
+              ++ pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.qemu;
+              CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER = "${linker}/bin/armv7l-unknown-linux-gnueabihf-gcc";
+            }
+            // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+              CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUNNER = "${pkgs.qemu}/bin/qemu-arm";
+            }
+          );
           formatter = pkgs.nixfmt-tree;
         };
     in
