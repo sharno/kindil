@@ -26,6 +26,58 @@ const WINDOW: u64 = 300;
 const STOP_ROUNDS: u32 = 12;
 const STOP_EVERY: Duration = Duration::from_secs(5);
 
+/// Room left free on the system storage beyond a new copy: Amazon's
+/// settings and logs live there too.
+const MARGIN: u64 = 2 * 1024 * 1024;
+
+/// What the copy asks of the system storage; the tests play it.
+trait Storage {
+    /// Bytes free for new files on the file system holding `dir`, if known.
+    fn free(&self, dir: &Path) -> Option<u64>;
+    /// Whether a process runs the file `file` describes, under any name:
+    /// unlinking it then frees nothing until that process exits.
+    fn in_use(&self, file: &std::fs::Metadata) -> bool;
+}
+
+/// The PW1's.
+struct System;
+
+impl Storage for System {
+    fn free(&self, dir: &Path) -> Option<u64> {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        // SAFETY: statvfs(2) with a valid path and a zeroed out-struct.
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(dir.as_ptr(), &mut stat) } != 0 {
+            return None;
+        }
+        // As df says: without the blocks kept for root.
+        #[allow(clippy::useless_conversion)]
+        Some(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))
+    }
+
+    /// By /proc/PID/exe, which stat follows to the very file a process
+    /// runs, links resolved and even once unlinked: a lifeline run as
+    /// `kindil-lifeline`, a crashed kindil not yet gone.
+    fn in_use(&self, file: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.parse::<u32>().is_ok())
+            })
+            .any(|entry| {
+                std::fs::metadata(entry.path().join("exe"))
+                    .is_ok_and(|exe| exe.dev() == file.dev() && exe.ino() == file.ino())
+            })
+    }
+}
+
 struct Files {
     /// The copy that runs, on the system storage: in USB drive mode the
     /// computer gets /mnt/us while kindil keeps running.
@@ -42,10 +94,15 @@ struct Files {
     trial: PathBuf,
     installed: PathBuf,
     previous: PathBuf,
+    storage: Box<dyn Storage>,
 }
 
 impl Files {
     fn new(paths: &Paths) -> Self {
+        Self::with(paths, Box::new(System))
+    }
+
+    fn with(paths: &Paths, storage: Box<dyn Storage>) -> Self {
         Self {
             bin: paths.run.join("kindil"),
             from: paths.run.join("kindil.from"),
@@ -54,52 +111,100 @@ impl Files {
             trial: paths.ext.join("kindil.trying"),
             installed: paths.ext.join("kindil"),
             previous: paths.ext.join("kindil.previous"),
+            storage,
         }
     }
 
-    /// Copies the binary to run: a staged update gets one trial run;
-    /// otherwise `slot`, the current binary or the previous one.
-    fn pick(&self, slot: &Path) {
-        self.choose(slot);
+    /// The binary to run: a staged update gets one trial run; otherwise
+    /// `slot`, the current binary or the previous one. Copied to the system
+    /// storage; if it can't be, `slot` runs where it is.
+    fn pick(&self, slot: &Path) -> PathBuf {
+        let picked = self.choose(slot);
         // A copy kept as current may be as Amazon's UI left it.
         narrow(&self.bin);
+        picked
     }
 
-    fn choose(&self, slot: &Path) {
+    fn choose(&self, slot: &Path) -> PathBuf {
         if self.next.is_file() && std::fs::rename(&self.next, &self.trial).is_ok() {
-            if self.copy(&self.trial).is_ok() && std::fs::write(&self.trying, b"").is_ok() {
-                log("trying the update");
-                return;
+            match self.copy(&self.trial) {
+                Ok(()) if std::fs::write(&self.trying, b"").is_ok() => {
+                    log("trying the update");
+                    return self.bin.clone();
+                }
+                Ok(()) => {}
+                Err(error) => log(&format!("copying the update: {error}; dropping it")),
             }
             let _ = std::fs::remove_file(&self.trial);
         }
         if slot.is_file() && !self.current(slot) {
             if let Err(error) = self.copy(slot) {
                 log(&format!("copying {}: {error}", slot.display()));
+                // Never no kindil at all: Amazon's UI would stay.
+                if executable(slot) {
+                    log("running it from the user storage: USB drive mode can't take the storage while it runs");
+                    return slot.to_owned();
+                }
             }
         }
+        self.bin.clone()
     }
 
     /// Comparing the 16 MB binaries takes over 10 s at boot. Instead the copy
-    /// records its source and has the source's modification time, set before
-    /// the record is written: the same source with the same time means the
-    /// copy is current.
+    /// records its source and has the source's size and modification time,
+    /// set before the record is written: the same source with the same size
+    /// and time means the copy is current.
+    ///
+    /// The time in FAT's 2 s steps: the user storage (vfat under fsp) keeps
+    /// a file's time to the second while the kernel holds its inode, but
+    /// on disk only in even seconds, so once the inode is dropped (Amazon's
+    /// UI starting takes the memory) a source written at an odd second
+    /// reads a second earlier than the copy made from it.
     fn current(&self, source: &Path) -> bool {
         std::fs::read_to_string(&self.from).is_ok_and(|from| Path::new(from.trim()) == source)
-            && mtime(source).is_some()
-            && mtime(source) == mtime(&self.bin)
+            && stamp(source).is_some()
+            && stamp(source) == stamp(&self.bin)
+    }
+
+    /// Whether the system storage holds a copy of `source` with MARGIN to
+    /// spare once the old copy goes: its space counts only if unlinking it
+    /// frees it, i.e. nothing else runs it (a lifeline linked to it, say)
+    /// and no other link names it.
+    fn room(&self, source: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let need = std::fs::metadata(source)?.len().saturating_add(MARGIN);
+        let Some(free) = self.bin.parent().and_then(|dir| self.storage.free(dir)) else {
+            // Unknown: try, as before.
+            return Ok(());
+        };
+        let freed = match std::fs::symlink_metadata(&self.bin) {
+            Ok(old) if old.is_file() && old.nlink() == 1 && !self.storage.in_use(&old) => old.len(),
+            _ => 0,
+        };
+        if free.saturating_add(freed) >= need {
+            return Ok(());
+        }
+        let mb = |bytes: u64| bytes / (1024 * 1024);
+        Err(std::io::Error::other(format!(
+            "no room: {} MB free, {} more once the old copy goes, {} MB needed",
+            mb(free),
+            mb(freed),
+            mb(need)
+        )))
     }
 
     /// In place, never beside: /var/local is 64 MB, mostly Amazon's, with
     /// room for one copy of kindil, not two. The old copy is unlinked first
-    /// (its space frees once nothing runs it) and the new one written fresh.
-    /// Unlinking, not truncating, also keeps this clear of ETXTBSY, which
-    /// the earlier write-beside-and-rename avoided: nothing runs the old
-    /// copy by then anyway, since kindil has exited and its Wi-Fi children
-    /// (whose udhcpc runs the hook from it) are ended before every pick.
+    /// (its space frees once nothing runs it) and the new one written fresh,
+    /// unless the room it frees, if any, isn't enough: then nothing is
+    /// touched. Unlinking, not truncating, also keeps this clear of ETXTBSY,
+    /// which the earlier write-beside-and-rename avoided: kindil has exited
+    /// and its Wi-Fi children (whose udhcpc runs the hook from it) are ended
+    /// before every pick.
     /// The record of the source comes last, so a copy cut short (a full
     /// disk, a power cut) never counts as current; a failed one is removed.
     fn copy(&self, source: &Path) -> std::io::Result<()> {
+        self.room(source)?;
         let _ = std::fs::remove_file(&self.from);
         // Left by older launchers, which copied beside.
         let _ = std::fs::remove_file(self.bin.with_extension("part"));
@@ -137,10 +242,16 @@ impl Files {
     }
 }
 
-/// In whole seconds: the user storage keeps 2 s, the system storage 1 s.
-fn mtime(path: &Path) -> Option<u64> {
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    Some(modified.duration_since(UNIX_EPOCH).ok()?.as_secs())
+/// Size, and modification time in FAT's 2 s steps (see [`Files::current`]).
+fn stamp(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let secs = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some((meta.len(), secs / 2))
 }
 
 /// Amazon's UI, which ran until now, left what root runs here the
@@ -253,9 +364,9 @@ pub fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
     os.kill_orphaned_watchers();
     end_children(paths, os);
     let slot = files.installed.clone();
-    files.pick(&slot);
-    if !executable(&files.bin) {
-        log(&format!("missing {}", files.bin.display()));
+    let bin = files.pick(&slot);
+    if !executable(&bin) {
+        log(&format!("missing {}", bin.display()));
         return ExitCode::FAILURE;
     }
     let usb = UsbDrive::read(paths, os);
@@ -307,7 +418,7 @@ pub fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
             os.lipc_set("com.lab126.blanket", "unload", "splash");
         }
         os.clear_screen();
-        run(paths, os, &files, slot);
+        run(paths, os, &files, slot, bin);
         drop(done);
         if let Ok(stopper) = stopper {
             let _ = stopper.join();
@@ -339,8 +450,8 @@ fn stop_services(os: &dyn Os, done: &mpsc::Receiver<()>, rounds: u32, usb_drive:
     }
 }
 
-/// Runs kindil until it exits for good.
-fn run(paths: &Paths, os: &dyn Os, files: &Files, mut slot: PathBuf) {
+/// Runs kindil, `bin` first, until it exits for good.
+fn run(paths: &Paths, os: &dyn Os, files: &Files, mut slot: PathBuf, mut bin: PathBuf) {
     let config = paths.config.to_string_lossy().into_owned();
     let args: Vec<&str> = if paths.config.is_file() {
         vec!["--config", &config, "kindle"]
@@ -349,8 +460,8 @@ fn run(paths: &Paths, os: &dyn Os, files: &Files, mut slot: PathBuf) {
     };
     let mut crashes: Vec<u64> = Vec::new();
     loop {
-        log(&os.version(&files.bin).unwrap_or_else(|| "kindil ?".into()));
-        let status = os.run(&files.bin, &args);
+        log(&os.version(&bin).unwrap_or_else(|| "kindil ?".into()));
+        let status = os.run(&bin, &args);
         log(&format!("kindil exited ({status})"));
         if files.trying.exists() {
             // The trial ended before kindil kept it: back to the previous
@@ -386,7 +497,7 @@ fn run(paths: &Paths, os: &dyn Os, files: &Files, mut slot: PathBuf) {
             }
         }
         end_children(paths, os);
-        files.pick(&slot);
+        bin = files.pick(&slot);
     }
 }
 
@@ -715,32 +826,144 @@ mod tests {
         let env = Env::new();
         env.fake(&env.ext("kindil"), "1.0.0", "exit 0");
         env.session(&Fake::default());
-        // Same time, different content: only a copy would bring the content
-        // back.
+        // Same size and time, different content: only a copy would bring
+        // the content back.
         let bin = env.paths.run.join("kindil");
         let modified = std::fs::metadata(&bin).unwrap().modified().unwrap();
-        std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&bin)
+        let other = std::fs::read_to_string(&bin)
             .unwrap()
-            .set_modified(modified)
-            .unwrap();
+            .replace("1.0.0", "9.9.9");
+        std::fs::write(&bin, other).unwrap();
+        set_time(&bin, modified);
         env.session(&Fake::default());
-        assert_eq!(
-            std::fs::read_to_string(&bin).unwrap(),
-            "#!/bin/sh\nexit 0\n"
-        );
+        assert_eq!(env.running(), "kindil 9.9.9");
         env.fake(&env.ext("kindil"), "1.1.0", "exit 0");
         let later = std::time::SystemTime::now() + Duration::from_secs(3600);
-        std::fs::File::options()
-            .write(true)
-            .open(env.ext("kindil"))
-            .unwrap()
-            .set_modified(later)
-            .unwrap();
+        set_time(&env.ext("kindil"), later);
         env.session(&Fake::default());
         assert_eq!(env.running(), "kindil 1.1.0");
+        // Same time, another size: copied too.
+        env.fake(&env.ext("kindil"), "1.1.10", "exit 0");
+        set_time(&env.ext("kindil"), later);
+        env.session(&Fake::default());
+        assert_eq!(env.running(), "kindil 1.1.10");
+    }
+
+    fn set_time(path: &Path, time: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    fn inode(path: &Path) -> u64 {
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap())
+    }
+
+    /// 2026-11-15 15:40: the copy made at 15:34 from a source written at an
+    /// odd second (as the kernel's inode had it) wasn't current once the
+    /// source read as FAT keeps it on disk, a second earlier, and was
+    /// copied again.
+    #[test]
+    fn a_source_whose_time_fat_rounds_to_even_seconds_isnt_copied_again() {
+        let env = Env::new();
+        let source = env.ext("kindil");
+        env.fake(&source, "1.0.0", "exit 0");
+        let odd = UNIX_EPOCH + Duration::from_secs(1_794_771_277);
+        set_time(&source, odd);
+        let files = Files::new(&env.paths);
+        assert_eq!(files.pick(&source), files.bin);
+        let copied = inode(&files.bin);
+        // The kernel drops the user storage's inode and reads it again.
+        set_time(&source, odd - Duration::from_secs(1));
+        assert!(files.current(&source));
+        assert_eq!(files.pick(&source), files.bin);
+        assert_eq!(inode(&files.bin), copied, "not written again");
+        // A source two seconds on is another one.
+        set_time(&source, odd + Duration::from_secs(1));
+        assert!(!files.current(&source));
+    }
+
+    /// The system storage as tight as on 2026-11-15: `free` bytes, and the
+    /// old copy run by a lifeline or not.
+    struct Tight {
+        free: u64,
+        in_use: bool,
+    }
+
+    impl Storage for Tight {
+        fn free(&self, _: &Path) -> Option<u64> {
+            Some(self.free)
+        }
+        fn in_use(&self, _: &std::fs::Metadata) -> bool {
+            self.in_use
+        }
+    }
+
+    #[test]
+    fn with_no_room_for_a_copy_the_old_one_stays_and_the_installed_one_runs_where_it_is() {
+        let env = Env::new();
+        let source = env.ext("kindil");
+        env.fake(&source, "1.0.0", "exit 0");
+        Files::new(&env.paths).pick(&source);
+        env.fake(&source, "1.1.0", "exit 0");
+        set_time(
+            &source,
+            std::time::SystemTime::now() + Duration::from_secs(3600),
+        );
+        let size = std::fs::metadata(&source).unwrap().len();
+        // Only the old copy's space would make room, and a lifeline runs it.
+        let tight = |in_use| {
+            Files::with(
+                &env.paths,
+                Box::new(Tight {
+                    free: MARGIN + size - 1,
+                    in_use,
+                }),
+            )
+        };
+        let files = tight(true);
+        let old = inode(&files.bin);
+        assert_eq!(files.pick(&source), source);
+        assert_eq!(inode(&files.bin), old, "the old copy untouched");
+        assert!(files.from.exists());
+        assert_eq!(env.running(), "kindil 1.0.0");
+        // Once nothing runs it, unlinking it makes the room.
+        let files = tight(false);
+        assert_eq!(files.pick(&source), files.bin);
+        assert_eq!(env.running(), "kindil 1.1.0");
+    }
+
+    #[test]
+    fn a_failed_copy_runs_the_installed_binary_where_it_is() {
+        let env = Env::new();
+        // Neither unlinked nor written over: the copy fails.
+        std::fs::create_dir(env.paths.run.join("kindil")).unwrap();
+        let ran = env.t().join("ran");
+        env.fake(
+            &env.ext("kindil"),
+            "1.0.0",
+            &format!("echo \"$0\" >{}; exit 0", ran.display()),
+        );
+        let os = kual();
+        assert_eq!(env.session(&os), ExitCode::SUCCESS);
+        assert_eq!(
+            std::fs::read_to_string(&ran).unwrap().trim(),
+            env.ext("kindil").display().to_string()
+        );
+        assert!(os.running("lab126_gui"), "and Amazon's UI back after");
+    }
+
+    #[test]
+    fn with_neither_a_copy_nor_a_runnable_installed_binary_nothing_is_stopped() {
+        let env = Env::new();
+        std::fs::create_dir(env.paths.run.join("kindil")).unwrap();
+        std::fs::write(env.ext("kindil"), "not runnable").unwrap();
+        let os = kual();
+        assert_eq!(env.session(&os), ExitCode::FAILURE);
+        assert_eq!(os.upstart(), "");
     }
 
     fn mode(path: &Path) -> u32 {

@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const TARGET: &str = "armv7-unknown-linux-musleabihf";
+/// kindil's installed binary on the Kindle's user storage.
+const INSTALLED: &str = "/mnt/us/extensions/kindil/bin/kindil";
 
 fn run(command: &mut Command) -> anyhow::Result<()> {
     let status = command
@@ -259,6 +261,14 @@ fn walk(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 /// (src/lifeline.rs), which brings kindil and Wi-Fi back when it ends or at
 /// `deadline` seconds. The lifeline runs as `kindil-lifeline`, a link to
 /// kindil's binary, so neither it nor the experiment takes it for kindil.
+///
+/// The link names the installed binary on the user storage, not the copy
+/// on /var/local that kindil runs: a lifeline running the copy kept its
+/// inode, so the launcher's next copy found no room (2026-11-15). The
+/// lifeline therefore holds the user storage while it runs: USB drive mode
+/// can't take the storage until it ends (with the copy it could, and the
+/// lifeline lived through it). An install or deploy may still replace the
+/// binary: both move a new file into place, and the lifeline keeps the old.
 pub fn run_on_device(script: &Path, deadline: u64, args: &[String]) -> anyhow::Result<()> {
     ensure!(script.is_file(), "no script {}", script.display());
     let device = Device::from_env()?;
@@ -273,7 +283,7 @@ pub fn run_on_device(script: &Path, deadline: u64, args: &[String]) -> anyhow::R
         "{}",
         device.run_once(&format!(
             "cd /var/local/kindil; sh /var/local/kindil/{name} {} </dev/null >/dev/null 2>&1 & pid=$!; \
-             ln -sf kindil /var/local/kindil/kindil-lifeline; \
+             ln -sf {INSTALLED} /var/local/kindil/kindil-lifeline; \
              setsid /var/local/kindil/kindil-lifeline {deadline} $pid </dev/null \
              >>/var/local/kindil/lifeline.log 2>&1 & \
              echo \"started {name} as $pid, lifeline at {deadline} s\"",
