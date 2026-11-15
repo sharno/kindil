@@ -145,7 +145,7 @@ pub fn test_arm() -> anyhow::Result<()> {
             "CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUNNER",
             "qemu-arm",
         )
-        .args(["test", "--locked", "--target", TARGET]))
+        .args(["test", "--locked", "--workspace", "--target", TARGET]))
 }
 
 pub fn sim() -> anyhow::Result<()> {
