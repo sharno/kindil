@@ -11,9 +11,6 @@ fn main() {
         "wpa_supplicant",
         "nix build .#wpa-supplicant-device",
     );
-    // Its SSH server: dropbear, dropbearkey and scp (the flake's
-    // dropbear-device).
-    embed("KINDIL_DROPBEAR", "dropbear", "nix build .#dropbear-device");
     // Its launcher (launcher/, built for the Kindle first).
     embed(
         "KINDIL_LAUNCHER",

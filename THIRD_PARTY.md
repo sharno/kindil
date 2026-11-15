@@ -13,7 +13,6 @@ a replacement for the full transitive license inventory when distributing builds
 | clap | https://github.com/clap-rs/clap — MIT OR Apache-2.0 | Command line |
 | rbook | https://github.com/DevinSterling/rbook — Apache-2.0 | EPUB parsing/reading order |
 | html2text | https://github.com/jugglerchris/rust-html2text — MIT | XHTML-to-text conversion |
-| Dropbear | https://matt.ucc.asn.au/dropbear/dropbear.html, nixpkgs' pinned version — MIT-style (with libtomcrypt/libtommath, public domain) | kindil's SSH server, embedded in the device binary; built by the flake's `dropbear-device` with one patch (see flake.nix) |
 | IBM Plex Sans Arabic | see `crates/miqat/assets/fonts/OFL.txt` — SIL OFL 1.1 | All typography: Miqat, the shell and the reader |
 
 kindil runs on Amazon's stock OS and uses its services (wifid, powerd, the

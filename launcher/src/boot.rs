@@ -162,7 +162,7 @@ mod tests {
                 flag: t.join("BOOT"),
                 skip: t.join("SKIP"),
                 charger: t.join("charging"),
-                child_pids: vec![],
+                wifi_pids: vec![],
                 pid_file: t.join("pid"),
                 boot_id: t.join("boot_id"),
             };

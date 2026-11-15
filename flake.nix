@@ -96,81 +96,6 @@
             dontFixup = true;
             meta.license = pkgs.lib.licenses.bsd3;
           };
-          # kindil's own SSH server (src/ssh.rs): nixpkgs' pinned upstream
-          # Dropbear, built with the same Zig cross compiler into one static
-          # dropbearmulti holding dropbear, dropbearkey and scp (`cargo xtask`
-          # copies with `scp -O`, which runs scp on the Kindle). Keys only: no
-          # passwords, PAM, zlib, login records, sftp, X11 or agent forwarding.
-          dropbear = pkgs.stdenv.mkDerivation {
-            pname = "dropbear-device";
-            inherit (pkgs.dropbear) version src;
-            nativeBuildInputs = [ pkgs.zig ];
-            # PATH for sessions; dropbear sets it for root regardless of its
-            # own environment. The first directory is src/ssh.rs's BIN (its
-            # tests check it is here), so scp is this one.
-            localOptions = ''
-              #define DEFAULT_PATH "/var/local/kindil/ssh/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-              #define DEFAULT_ROOT_PATH DEFAULT_PATH
-              #define DROPBEAR_PIDFILE "/var/run/kindil-dropbear.pid"
-              #define DROPBEAR_SVR_PASSWORD_AUTH 0
-              #define DROPBEAR_SVR_AGENTFWD 0
-              #define DROPBEAR_X11FWD 0
-              #define DROPBEAR_SFTPSERVER 0
-              #define DO_MOTD 0
-              #define DROPBEAR_REEXEC 0
-              #define INETD_MODE 0
-              #define DROPBEAR_SVR_LOCALSTREAMFWD 0
-              #define DROPBEAR_SVR_REMOTESTREAMFWD 0
-              /* Ed25519 and RSA keys; Curve25519 and sntrup761 key exchange. */
-              #define DROPBEAR_ECDSA 0
-              #define DROPBEAR_ECDH 0
-              #define DROPBEAR_SK_KEYS 0
-              #define DROPBEAR_MLKEM768 0
-            '';
-            passAsFile = [ "localOptions" ];
-            # kindil keeps authorized_keys in its own root-only directory,
-            # whose parents on the Kindle (/var, /var/local, /var/local/kindil)
-            # are group-writable: Dropbear walks up to / and would refuse it.
-            # Check the file's own directory only. Those parents already hold
-            # the kindil binary that runs as root, so this opens nothing new.
-            postPatch = ''
-              substituteInPlace src/svr-authpubkey.c \
-                --replace-fail \
-                  'if (strcmp(path, ses.authstate.pw_dir) == 0 || strcmp(path, "/") == 0) {' \
-                  'if (1) {'
-            '';
-            configurePhase = ''
-              runHook preConfigure
-              export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
-              export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
-              cp "$localOptionsPath" localoptions.h
-              # The PW1's 2.6.31 kernel has no getrandom(): /dev/urandom only.
-              export ac_cv_func_getrandom=no
-              ./configure --host=arm-linux-musleabihf \
-                CC="${linker}/bin/armv7l-unknown-linux-gnueabihf-gcc" \
-                AR="${pkgs.zig}/bin/zig ar" RANLIB="${pkgs.zig}/bin/zig ranlib" \
-                CFLAGS="-Os" \
-                --enable-static --disable-zlib --disable-pam \
-                --disable-lastlog --disable-utmp --disable-utmpx \
-                --disable-wtmp --disable-wtmpx \
-                --disable-pututline --disable-pututxline
-              runHook postConfigure
-            '';
-            buildPhase = ''
-              runHook preBuild
-              make -j"$NIX_BUILD_CORES" MULTI=1 STATIC=1 \
-                PROGRAMS="dropbear dropbearkey scp" \
-                LDFLAGS="-static -s"
-              runHook postBuild
-            '';
-            installPhase = ''
-              mkdir -p $out/bin
-              install -m755 dropbearmulti $out/bin/
-            '';
-            dontStrip = true;
-            dontFixup = true;
-            meta.license = pkgs.lib.licenses.mit;
-          };
           common = {
             pname = "kindil";
             version = "0.4.0";
@@ -197,7 +122,6 @@
               RUSTFLAGS = "-C linker=${linker}/bin/armv7l-unknown-linux-gnueabihf-gcc -C target-feature=+crt-static -C link-self-contained=no";
               CC_armv7_unknown_linux_musleabihf = "${linker}/bin/armv7l-unknown-linux-gnueabihf-gcc";
               KINDIL_WPA_SUPPLICANT = "${wpaSupplicant}/bin/wpa_supplicant";
-              KINDIL_DROPBEAR = "${dropbear}/bin/dropbearmulti";
               preBuild = ''
                 # Nix's sandbox HOME is intentionally unwritable. Zig needs a
                 # writable cache for its musl/CRT artifacts as well as ring C.
@@ -222,7 +146,6 @@
             kindil-device = device;
             armv7-linker = linker;
             wpa-supplicant-device = wpaSupplicant;
-            dropbear-device = dropbear;
           };
           checks = {
             host = host;
