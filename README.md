@@ -34,6 +34,11 @@ and a reboot always returns the Kindle to stock.
   and each section a page that fits on screen (a page swap is one e-ink
   refresh; scrolling redraws on every move):
   - **Display**: home screen, front light, a "clean screen" flash.
+  - **Prayer times**: the calculation method and the Asr school, each choice
+    with today's times for the configured location so it can be matched to
+    a mosque's timetable (the one page that scrolls: twelve methods). The
+    choice is written into `miqat.toml`'s `[prayer]` in place, comments and
+    all, and the dashboard redraws with it.
   - **Wi-Fi**: on/off with network status, scan and join, and the saved
     networks, each with Forget.
   - **Remote access**: SSH server and SSH-at-boot switches, Syncthing.
@@ -319,6 +324,7 @@ someone nearby to press the power button, or must end on their own first.
 | `system.rs` | Sleep, wake and USB drive mode as a state machine |
 | `drive.rs`, `usb.rs` | USB drive mode run by kindil: the state machine and sequences, and the device under them |
 | `reader.rs`, `files.rs`, `prefs.rs` | Books, Trash, persisted choices |
+| `prayer.rs` | Settings → Prayer times: the methods and Asr schools with today's times, edited into `miqat.toml` |
 | `ghosting.rs` | When to flash the panel |
 | `launcher.rs` | Writes out the launcher kindil carries, once it has run two minutes |
 | `vendor/slint-backend-kindle` | Display/touch backend, patched for full refresh |

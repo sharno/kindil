@@ -143,6 +143,7 @@ pub fn screens(app: &App, window: &MinimalSoftwareWindow, dir: &Path) -> anyhow:
     shot("settings")?;
     [
         (Page::Display, "settings-display"),
+        (Page::Prayer, "settings-prayer"),
         (Page::Wifi, "settings-wifi"),
         (Page::Remote, "settings-remote"),
         (Page::Power, "settings-power"),
@@ -154,6 +155,12 @@ pub fn screens(app: &App, window: &MinimalSoftwareWindow, dir: &Path) -> anyhow:
         k.invoke_go(page);
         shot(name)
     })?;
+
+    // The Asr choices, below the methods.
+    k.invoke_go(Page::Prayer);
+    drag(window, 380.0, 860.0, 160.0);
+    drag(window, 380.0, 860.0, 160.0);
+    shot("settings-prayer-asr")?;
 
     k.invoke_go(Page::Networks);
     k.invoke_scan_networks();

@@ -2978,6 +2978,7 @@ dependencies = [
  "tempfile",
  "textwrap",
  "toml",
+ "toml_edit",
  "ureq",
  "zip",
 ]

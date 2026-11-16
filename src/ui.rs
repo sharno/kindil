@@ -7,6 +7,7 @@ use crate::drain::{Drain, Gauge};
 use crate::files::{FileName, Files, Trashed};
 use crate::ghosting::{Ghosting, Refresh, Update};
 use crate::host::{BootStart, Brightness, DeviceInfo, Host, OwnSsh, Power, Ssh, SshKey, Wifi};
+use crate::prayer::{self, Setting};
 use crate::prefs::Store;
 use crate::reader::{self, Book, Layout, Reader};
 use crate::sync::Service;
@@ -235,6 +236,8 @@ enum Tick {
     Draw(Option<u64>),
     /// Fetch what is due, then render.
     Fetch,
+    /// Read Miqat's file again, as a fresh start would, then render.
+    Reload,
 }
 
 /// UI-thread state. Borrowed briefly inside one callback, never across a
@@ -526,6 +529,37 @@ impl App {
     }
 }
 
+fn show_prayer(ui: &AppWindow, page: Result<prayer::Page, String>) {
+    let k = ui.global::<Kindil>();
+    let choices = |choices: Vec<prayer::Choice>| {
+        model(
+            choices
+                .into_iter()
+                .map(|c| PrayerChoice {
+                    title: c.label.into(),
+                    times: c.times.into(),
+                })
+                .collect(),
+        )
+    };
+    let index = |i: usize| i32::try_from(i).unwrap_or(-1);
+    match page {
+        Ok(page) => {
+            k.set_prayer_error("".into());
+            k.set_prayer_summary(page.summary.into());
+            k.set_prayer_method(index(page.method));
+            k.set_prayer_methods(choices(page.methods));
+            k.set_asr_school(index(page.school));
+            k.set_asr_schools(choices(page.schools));
+        }
+        Err(error) => {
+            k.set_prayer_error(error.into());
+            k.set_prayer_methods(model(Vec::new()));
+            k.set_asr_schools(model(Vec::new()));
+        }
+    }
+}
+
 fn show_updates(ui: &AppWindow, state: &Mutex<Updates>, updates: Updates) {
     let (status, button, enabled) = view::updates(&updates, Version::current());
     let k = ui.global::<Kindil>();
@@ -591,6 +625,8 @@ fn wire(window: &AppWindow, ctx: &Ctx) {
     on!(on_power_off => power_off());
     on!(on_choose_auto_sleep => choose_auto_sleep(index));
     on!(on_update => update());
+    on!(on_choose_prayer_method => choose_prayer_method(index));
+    on!(on_choose_asr_school => choose_asr_school(index));
 }
 
 fn arm_clock(timer: Rc<slint::Timer>, ctx: Ctx) {
@@ -680,8 +716,13 @@ impl Ctx {
         }
         match page {
             Page::Library => self.reload_library(),
-            Page::Settings
-            | Page::Display
+            Page::Settings => {
+                self.refresh_status();
+                self.show_sync();
+                self.show_prayer();
+            }
+            Page::Prayer => self.show_prayer(),
+            Page::Display
             | Page::Wifi
             | Page::Remote
             | Page::Power
@@ -1601,6 +1642,64 @@ impl Ctx {
         let _ = slint::quit_event_loop();
     }
 
+    // ── prayer times ──
+
+    /// Reads Miqat's file for the Prayer times page and its index row.
+    fn show_prayer(&self) {
+        let path = self.config.miqat_config.clone();
+        let now = (self.now)();
+        self.background(
+            move |_| prayer::load(&path, now),
+            |ui, page| show_prayer(ui, page.map_err(|e| format!("{e:#}"))),
+        );
+    }
+
+    fn choose_prayer_method(&self, index: i32) {
+        let method = usize::try_from(index)
+            .ok()
+            .and_then(|i| prayer::METHODS.get(i));
+        if let Some(method) = method {
+            self.choose_prayer(Setting::Method(method.method));
+        }
+    }
+
+    fn choose_asr_school(&self, index: i32) {
+        let school = usize::try_from(index)
+            .ok()
+            .and_then(|i| prayer::SCHOOLS.get(i));
+        if let Some(school) = school {
+            self.choose_prayer(Setting::Asr(school.madhab));
+        }
+    }
+
+    /// Writes the choice into Miqat's file, shows the file as it now is, and
+    /// has the dashboard read it again.
+    fn choose_prayer(&self, setting: Setting) {
+        let path = self.config.miqat_config.clone();
+        let now = (self.now)();
+        let ticks = match &self.state.borrow().miqat {
+            Worker::Started(ticks) => Some(ticks.clone()),
+            Worker::Idle => None,
+        };
+        self.background(
+            move |_| prayer::save(&path, setting).and_then(|()| prayer::load(&path, now)),
+            move |ui, page| match page {
+                Ok(page) => {
+                    show_prayer(ui, Ok(page));
+                    // An idle dashboard reads the file when it starts.
+                    if let Some(ticks) = ticks {
+                        let _ = ticks.send(Tick::Reload);
+                    }
+                }
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    notify(ui, &format!("Prayer times not saved: {error}"));
+                    ui.global::<Kindil>().set_prayer_error(error.into());
+                }
+            },
+        );
+    }
+
     // ── dashboard ──
 
     fn start_miqat(&self) {
@@ -1619,6 +1718,39 @@ impl Ctx {
     }
 }
 
+/// Whether fetched weather and radar still fit after the file changed: the
+/// same place, units and map.
+fn same_sources(old: &miqat::config::Config, new: &miqat::config::Config) -> bool {
+    let (a, b) = (&old.location, &new.location);
+    a.latitude == b.latitude
+        && a.longitude == b.longitude
+        && a.timezone == b.timezone
+        && old.radar.zoom == new.radar.zoom
+        && old.weather.temperature_unit == new.weather.temperature_unit
+        && old.weather.wind_unit == new.weather.wind_unit
+}
+
+/// Miqat's file; until it reads, the error is on screen and only a
+/// [`Tick::Reload`] tries again. None once kindil has stopped asking.
+fn load_miqat(
+    path: &std::path::Path,
+    weak: &slint::Weak<AppWindow>,
+    ticks: &mpsc::Receiver<Tick>,
+) -> Option<miqat::config::Config> {
+    loop {
+        match miqat::config::Config::load(path) {
+            Ok(config) => return Some(config),
+            Err(error) => {
+                let message = format!("Prayer dashboard needs {}: {error}", path.display());
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.global::<Kindil>().set_miqat_error(message.into())
+                });
+            }
+        }
+        while ticks.recv().ok()? != Tick::Reload {}
+    }
+}
+
 /// Owns Miqat's cached weather and radar sources; renders on each minute.
 fn miqat_worker(
     path: &std::path::Path,
@@ -1626,20 +1758,16 @@ fn miqat_worker(
     display: &Display,
     ticks: &mpsc::Receiver<Tick>,
 ) {
-    let config = match miqat::config::Config::load(path) {
-        Ok(config) => config,
-        Err(error) => {
-            let message = format!("Prayer dashboard needs {}: {error}", path.display());
-            let _ = weak.upgrade_in_event_loop(move |ui| {
-                ui.global::<Kindil>().set_miqat_error(message.into())
-            });
-            return;
-        }
+    let Some(mut config) = load_miqat(path, weak, ticks) else {
+        return;
     };
-    let renderer = miqat::render::Renderer::new(config.display.contrast);
+    let mut renderer = miqat::render::Renderer::new(config.display.contrast);
     let mut sources = miqat::sources::Sources::new(&config);
-    let show = |sources: &miqat::sources::Sources, wake: Option<u64>| {
-        let frame = crate::dashboards::render(&renderer, &config, Utc::now(), sources)
+    let show = |config: &miqat::config::Config,
+                renderer: &miqat::render::Renderer,
+                sources: &miqat::sources::Sources,
+                wake: Option<u64>| {
+        let frame = crate::dashboards::render(renderer, config, Utc::now(), sources)
             .map(pixels)
             .map_err(|e| e.to_string());
         let display = display.clone();
@@ -1656,7 +1784,7 @@ fn miqat_worker(
         })
     };
     // First paint before any network, so a slow fetch never leaves it blank.
-    if show(&sources, None).is_err() {
+    if show(&config, &renderer, &sources, None).is_err() {
         return;
     }
     let mut tick = Tick::Fetch;
@@ -1667,8 +1795,24 @@ fn miqat_worker(
                 None
             }
             Tick::Draw(wake) => wake,
+            // A file that no longer reads keeps the dashboard as it was.
+            Tick::Reload => match miqat::config::Config::load(path) {
+                Ok(fresh) => {
+                    if !same_sources(&config, &fresh) {
+                        sources = miqat::sources::Sources::new(&fresh);
+                        sources.refresh(&fresh, Utc::now());
+                    }
+                    renderer = miqat::render::Renderer::new(fresh.display.contrast);
+                    config = fresh;
+                    None
+                }
+                Err(error) => {
+                    eprintln!("kindil: reloading {}: {error:#}", path.display());
+                    None
+                }
+            },
         };
-        if show(&sources, wake).is_err() {
+        if show(&config, &renderer, &sources, wake).is_err() {
             return;
         }
         tick = match ticks.recv_timeout(until_next_minute(Utc::now())) {
@@ -1761,6 +1905,21 @@ mod tests {
         };
         assert!(!no_panel.wait_drawn(None, 0, Instant::now() + Duration::from_secs(5)));
     }
+    #[test]
+    fn a_new_prayer_method_keeps_the_fetched_weather_and_radar() {
+        let config: miqat::config::Config =
+            toml::from_str(include_str!("../examples/miqat.toml")).unwrap();
+        let method = config.prayer.method;
+        let mut other = config.clone();
+        other.prayer.madhab = miqat::config::Madhab::Hanafi;
+        assert!(same_sources(&config, &other));
+        let elsewhere: miqat::config::Config =
+            toml::from_str(&include_str!("../examples/miqat.toml").replace("52.3676", "21.4225"))
+                .unwrap();
+        assert_eq!(elsewhere.prayer.method, method);
+        assert!(!same_sources(&config, &elsewhere));
+    }
+
     #[test]
     fn clock_ticks_on_the_minute() {
         let now = DateTime::from_timestamp(1_794_398_400 + 45, 250_000_000).unwrap();

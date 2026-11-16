@@ -12,7 +12,7 @@ import "../crates/miqat/assets/fonts/IBMPlexSansArabic-SemiBold.ttf";
 import "../crates/miqat/assets/fonts/IBMPlexSansArabic-Bold.ttf";
 
 /// Settings is an index; display through about are its sections.
-export enum Page { dashboard, library, reader, settings, display, wifi, remote, power, updates, about, networks }
+export enum Page { dashboard, library, reader, settings, display, prayer, wifi, remote, power, updates, about, networks }
 export enum DashboardKind { miqat, clock }
 /// A setting's switch. `unavailable` covers "not installed" and "no hardware".
 export enum Switch { off, on, unavailable }
@@ -38,6 +38,13 @@ export struct NetworkItem {
     ssid: string,
     detail: string,
     bars: int,
+}
+
+/// A prayer-time choice and today's times with it.
+export struct PrayerChoice {
+    title: string,
+    /// "Fajr 04:59 · Isha 17:56", or "Asr 14:12".
+    times: string,
 }
 
 export struct Fact {
@@ -73,7 +80,7 @@ global Theme {
 export global Kindil {
     in-out property <Page> page: Page.dashboard;
     /// The Settings index or one of the pages under it.
-    out property <bool> in-settings: page == Page.settings || page == Page.display || page == Page.wifi
+    out property <bool> in-settings: page == Page.settings || page == Page.display || page == Page.prayer || page == Page.wifi
         || page == Page.remote || page == Page.power || page == Page.updates || page == Page.about
         || page == Page.networks;
     in-out property <DashboardKind> dashboard: DashboardKind.miqat;
@@ -186,6 +193,17 @@ export global Kindil {
     in property <[string]> sleep-choices;
     in property <int> auto-sleep: 0;
     callback choose-auto-sleep(int);
+    /// Prayer times: the calculation methods and Asr schools with today's
+    /// times, the chosen ones' indices, and what the index row says.
+    in property <[PrayerChoice]> prayer-methods;
+    in property <int> prayer-method: -1;
+    in property <[PrayerChoice]> asr-schools;
+    in property <int> asr-school: -1;
+    in property <string> prayer-summary;
+    /// Why miqat.toml can't be read or written; empty when it can.
+    in property <string> prayer-error;
+    callback choose-prayer-method(int);
+    callback choose-asr-school(int);
 
     public function go(target: Page) {
         page = target;
@@ -1423,6 +1441,12 @@ component SettingsPage {
                 target: Page.display;
             }
             Divider { }
+            SectionRow {
+                title: "Prayer times";
+                summary: Kindil.prayer-error != "" ? "Can't read miqat.toml" : Kindil.prayer-summary;
+                target: Page.prayer;
+            }
+            Divider { }
             SectionRow { title: "Wi-Fi"; summary: Kindil.wifi-detail; target: Page.wifi; }
             Divider { }
             SectionRow {
@@ -1485,6 +1509,93 @@ component DisplaySettings inherits SectionPage {
             VerticalLayout {
                 alignment: center;
                 Button { text: "Refresh"; clicked => { Kindil.clean-screen(); } }
+            }
+        }
+    }
+}
+
+/// One of several choices: the whole row is the target, the ring on the
+/// right is filled for the chosen one.
+component ChoiceRow {
+    in property <string> title;
+    in property <string> detail;
+    in property <bool> selected;
+    callback clicked();
+    min-height: 84px;
+    HorizontalLayout {
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 16px;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: root.title;
+                font-size: 23px;
+                font-weight: root.selected ? 700 : 600;
+                color: Theme.ink;
+                wrap: word-wrap;
+            }
+            Text { text: root.detail; font-size: 19px; color: Theme.ink-2; }
+        }
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 40px;
+                height: 40px;
+                border-radius: self.height / 2;
+                border-width: 3px;
+                border-color: Theme.ink;
+                if root.selected: Rectangle {
+                    width: 20px;
+                    height: 20px;
+                    border-radius: self.height / 2;
+                    background: Theme.ink;
+                }
+            }
+        }
+    }
+    TouchArea { clicked => { root.clicked(); } }
+}
+
+component PrayerSettings inherits SectionPage {
+    title: "Prayer times";
+    if Kindil.prayer-error != "": Group {
+        Text {
+            text: Kindil.prayer-error;
+            font-size: 20px;
+            color: Theme.ink;
+            wrap: word-wrap;
+        }
+    }
+    if Kindil.prayer-methods.length > 0: Group {
+        title: "CALCULATION METHOD";
+        Text {
+            text: "Today's Fajr and Isha here with each. Pick your mosque's timetable.";
+            font-size: 17px;
+            color: Theme.ink-3;
+            wrap: word-wrap;
+        }
+        for choice[i] in Kindil.prayer-methods: VerticalLayout {
+            if i > 0: Divider { }
+            ChoiceRow {
+                title: choice.title;
+                detail: choice.times;
+                selected: i == Kindil.prayer-method;
+                clicked => { Kindil.choose-prayer-method(i); }
+            }
+        }
+    }
+    if Kindil.asr-schools.length > 0: Group {
+        title: "ASR";
+        for choice[i] in Kindil.asr-schools: VerticalLayout {
+            if i > 0: Divider { }
+            ChoiceRow {
+                title: choice.title;
+                detail: choice.times;
+                selected: i == Kindil.asr-school;
+                clicked => { Kindil.choose-asr-school(i); }
             }
         }
     }
@@ -2019,6 +2130,7 @@ export component AppWindow inherits Window {
             if Kindil.page == Page.reader: ReaderPage { width: parent.width; height: parent.height; }
             if Kindil.page == Page.settings: SettingsPage { width: parent.width; height: parent.height; }
             if Kindil.page == Page.display: DisplaySettings { width: parent.width; height: parent.height; }
+            if Kindil.page == Page.prayer: PrayerSettings { width: parent.width; height: parent.height; }
             if Kindil.page == Page.wifi: WifiSettings { width: parent.width; height: parent.height; }
             if Kindil.page == Page.remote: RemoteSettings { width: parent.width; height: parent.height; }
             if Kindil.page == Page.power: PowerSettings { width: parent.width; height: parent.height; }

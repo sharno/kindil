@@ -75,8 +75,11 @@ impl Fixture {
             "A real book\nقنديل\n".repeat(400),
         )
         .unwrap();
+        let miqat_config = dir.path().join("miqat.toml");
+        std::fs::copy("examples/miqat.toml", &miqat_config).unwrap();
         let config = Config {
             books,
+            miqat_config,
             prefs: dir.path().join("prefs.toml"),
             ..Config::parse("dashboard = \"clock\"").unwrap()
         };
@@ -366,6 +369,59 @@ fn rename_with_the_touch_keyboard_then_trash_and_undo() {
 }
 
 #[test]
+fn prayer_times_choices_are_written_into_miqats_file() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    let path = f.dir.path().join("miqat.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    f.tap(SETTINGS_TAB, TAB_Y);
+    assert_eq!(
+        f.k().get_prayer_summary(),
+        "Muslim World League · Standard Asr"
+    );
+    f.tap(380.0, 300.0); // Prayer times row
+    assert_eq!(f.k().get_page(), Page::Prayer);
+    assert_eq!(f.k().get_prayer_error(), "");
+    assert_eq!(f.k().get_prayer_methods().row_count(), 12);
+    assert_eq!(f.k().get_prayer_method(), 0);
+    let karachi = f.k().get_prayer_methods().row_data(3).unwrap();
+    assert_eq!(karachi.title, "Karachi (University of Islamic Sciences)");
+    assert!(karachi.times.starts_with("Fajr "), "{}", karachi.times);
+    assert!(karachi.times.contains(" · Isha "), "{}", karachi.times);
+
+    f.tap(380.0, 540.0); // Karachi
+    assert_eq!(f.k().get_prayer_method(), 3);
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        saved,
+        original.replace("method = \"muslim_world_league\"", "method = \"karachi\""),
+        "only the method changes; comments and other keys stay"
+    );
+    f.k().invoke_choose_asr_school(1);
+    assert_eq!(f.k().get_asr_school(), 1);
+    assert_eq!(
+        f.k().get_prayer_summary(),
+        "Karachi (University of Islamic Sciences) · Hanafi Asr"
+    );
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("madhab = \"hanafi\""), "{saved}");
+    assert!(saved.contains("# shafi | hanafi (later Asr)"), "{saved}");
+
+    // A broken file is shown, and never written.
+    let broken = saved.replace("[radar]", "[radar");
+    std::fs::write(&path, &broken).unwrap();
+    f.k().invoke_go(Page::Prayer);
+    assert!(f.k().get_prayer_error().contains("miqat.toml"));
+    assert_eq!(f.k().get_prayer_methods().row_count(), 0);
+    f.k().invoke_choose_prayer_method(0);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+    assert!(f.k().get_notice().starts_with("Prayer times not saved"));
+    std::fs::remove_file(&path).unwrap();
+    f.k().invoke_go(Page::Settings);
+    f.k().invoke_choose_prayer_method(0);
+    assert!(!path.exists());
+}
+
+#[test]
 fn settings_switch_the_simulated_device() {
     let f = Fixture::new(Arc::new(Simulated::default()));
     f.tap(SETTINGS_TAB, TAB_Y);
@@ -381,7 +437,7 @@ fn settings_switch_the_simulated_device() {
     assert!((f.k().get_brightness() - 70).abs() <= SLACK);
     f.tap(40.0, 112.0); // back
     assert_eq!(f.k().get_page(), Page::Settings);
-    f.tap(380.0, 400.0); // Remote access row
+    f.tap(380.0, 500.0); // Remote access row
     assert_eq!(f.k().get_page(), Page::Remote);
     assert_eq!(f.k().get_ssh(), Switch::On);
     f.tap(380.0, 210.0); // SSH server row
@@ -672,7 +728,7 @@ fn join_a_network_and_type_arabic() {
     let host = Arc::new(Recording::default());
     let f = Fixture::new(host.clone());
     f.tap(SETTINGS_TAB, TAB_Y);
-    f.tap(380.0, 300.0); // Wi-Fi row
+    f.tap(380.0, 400.0); // Wi-Fi row
     assert_eq!(f.k().get_page(), Page::Wifi);
     f.tap(380.0, 300.0); // Choose a network
     assert_eq!(f.k().get_page(), Page::Networks);
@@ -731,7 +787,7 @@ fn a_joined_network_is_saved_and_can_be_forgotten() {
         .invoke_join_network("Home".into(), "correct horse".into());
     f.app.refresh_now();
     f.tap(SETTINGS_TAB, TAB_Y);
-    f.tap(380.0, 300.0); // Wi-Fi row
+    f.tap(380.0, 400.0); // Wi-Fi row
     assert_eq!(f.k().get_page(), Page::Wifi);
     let saved: Vec<String> = f
         .k()

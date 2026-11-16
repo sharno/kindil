@@ -19,6 +19,7 @@ pub mod networks;
 pub mod perms;
 pub mod pmk;
 pub mod power;
+pub mod prayer;
 pub mod prefs;
 pub mod preview;
 pub mod reader;
