@@ -99,7 +99,17 @@ fn gauge_battery() -> anyhow::Result<Battery> {
 }
 
 fn plugged() -> anyhow::Result<bool> {
-    Ok(std::fs::read_to_string(CHARGER_CONNECTED)?.trim() == "1")
+    plugged_from(std::fs::read_to_string(CHARGER_CONNECTED))
+}
+
+/// The charger driver makes `connected` only while a charger is plugged
+/// in: no file means on battery, not an error.
+fn plugged_from(read: std::io::Result<String>) -> anyhow::Result<bool> {
+    match read {
+        Ok(text) => Ok(text.trim() == "1"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// powerd's charging temperature range, kept by kindil: pauses the charger
@@ -633,6 +643,15 @@ fn remove_if_present(path: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn no_connected_file_means_on_battery() {
+        use std::io::{Error, ErrorKind};
+        assert!(!plugged_from(Err(Error::from(ErrorKind::NotFound))).unwrap());
+        assert!(plugged_from(Ok("1\n".into())).unwrap());
+        assert!(!plugged_from(Ok("0\n".into())).unwrap());
+        assert!(plugged_from(Err(Error::from(ErrorKind::PermissionDenied))).is_err());
+    }
     use super::*;
 
     #[test]
