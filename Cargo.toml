@@ -33,6 +33,8 @@ base64 = "0.23"
 tar = "0.4"
 flate2 = "1.1"
 toml = "1.2"
+# Settings → Prayer times edits miqat.toml in place, comments and all.
+toml_edit = "0.25"
 textwrap = { version = "0.16", default-features = false }
 rbook = { version = "0.7.12", default-features = false }
 zip = { version = "9.0.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
