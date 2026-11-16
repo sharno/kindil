@@ -187,7 +187,12 @@ const _: () = assert!(std::mem::size_of::<UpdateRequestZelda>() == 88);
 const _: () = assert!(std::mem::size_of::<UpdateRequestMtk>() == 96);
 
 // Blocks until the EPDC has finished applying the update with a given marker.
+// _IOWR('F', 0x2F, struct mxcfb_update_marker_data): PW2 and later kernels.
 pub(super) const MXCFB_WAIT_FOR_UPDATE_COMPLETE: libc::c_ulong = 0xc008_462f;
+// _IOW('F', 0x2F, __u32): the marker alone, the Kindle Touch and PW1's 2.6.31
+// mxc_epdc_fb. Its ioctl switch doesn't know the struct form above, so that
+// one fails there every time.
+pub(super) const MXCFB_WAIT_FOR_UPDATE_COMPLETE_U32: libc::c_ulong = 0x4004_462f;
 
 #[repr(C)]
 #[derive(Default)]

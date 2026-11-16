@@ -13,8 +13,8 @@ use crate::prefs::Store;
 use crate::reader::{self, Book, Layout, Reader};
 use crate::sync::Service;
 use crate::system::{
-    AutoSleep, Effect, Event as DeviceEvent, Idle, Mode, Step, Touches, Window, DRIVE_SETTLE,
-    FETCH_AFTER, MIN_NAP, PANEL_SETTLE,
+    AutoSleep, DozeLedger, Effect, Event as DeviceEvent, Idle, Mode, Settle, Step, Touches, Window,
+    DRIVE_SETTLE, MIN_NAP, PANEL_SETTLE, PANEL_UPDATE,
 };
 use crate::update::{self, Check, Release, Updates, Version};
 use crate::view;
@@ -57,9 +57,9 @@ pub enum Execution {
 pub struct Presented {
     /// Frames drawn, each counted once sent to the panel.
     pub frames: Arc<AtomicU64>,
-    /// Blocks until the panel has finished its last update; false if it
+    /// Blocks until the panel has finished its last update; an error if it
     /// can't tell.
-    pub wait_idle: fn() -> bool,
+    pub wait_idle: fn() -> std::io::Result<()>,
 }
 
 pub struct Options {
@@ -82,6 +82,22 @@ struct Display {
     ghosting: Arc<Mutex<Ghosting>>,
     presented: Option<Presented>,
     dashboard: Arc<DashboardFrames>,
+    /// Set while dozing: the dashboard worker's own minute clock then draws
+    /// and fetches nothing; doze wakes ask for what is due.
+    dozing: Arc<AtomicBool>,
+    /// Whether the panel's inability to say an update finished was logged.
+    panel_error_logged: Arc<AtomicBool>,
+}
+
+/// How a wait for a doze wake's redraw ended.
+#[derive(Debug)]
+enum Drawn {
+    /// On the panel, and the panel finished it.
+    Done,
+    /// Sent to the panel, which can't say when it finishes.
+    Sent(std::io::Error),
+    /// Not on the panel by the deadline.
+    NotSeen,
 }
 
 /// The last dashboard frame handed to the window: the doze wake it was drawn
@@ -91,6 +107,9 @@ struct Display {
 struct DashboardFrames {
     shown: Mutex<Shown>,
     changed: Condvar,
+    /// The next prayer as of the last frame: how often a dozing dashboard
+    /// needs drawing ([`crate::system::next_redraw`]).
+    next_prayer: Mutex<Option<DateTime<Utc>>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -139,14 +158,12 @@ impl Display {
 
     /// Blocks until the dashboard frame drawn for `wake` is on the panel and
     /// the panel has finished it (`wake` None: any panel frame after
-    /// `drawn`). False at `deadline`, or if the panel can't say it finished.
-    /// Logs how long each step took.
-    fn wait_drawn(&self, wake: Option<u64>, drawn: u64, deadline: Instant) -> bool {
+    /// `drawn`); [`Drawn::Sent`] if the panel can't say it finished,
+    /// [`Drawn::NotSeen`] at `deadline`.
+    fn wait_drawn(&self, wake: Option<u64>, drawn: u64, deadline: Instant) -> Drawn {
         let Some(presented) = &self.presented else {
-            return false;
+            return Drawn::NotSeen;
         };
-        let since = Instant::now();
-        let ms = || since.elapsed().as_millis();
         let left = || deadline.saturating_duration_since(Instant::now());
         let drawn = match wake {
             None => drawn,
@@ -159,30 +176,25 @@ impl Display {
                     })
                     .unwrap_or_else(|e| e.into_inner());
                 if timeout.timed_out() {
-                    return false;
+                    return Drawn::NotSeen;
                 }
                 shown.frames
             }
         };
-        let rendered = ms();
         while presented.frames.load(Ordering::Acquire) <= drawn {
             if left().is_zero() {
-                return false;
+                return Drawn::NotSeen;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        let sent = ms();
-        if !(presented.wait_idle)() {
-            eprintln!(
-                "kindil: doze redraw: the panel can't say it finished; napping at the ceiling"
-            );
-            return false;
+        match (presented.wait_idle)() {
+            Ok(()) => Drawn::Done,
+            Err(error) => Drawn::Sent(error),
         }
-        eprintln!(
-            "kindil: doze redraw: dashboard rendered at {rendered} ms, drawn and sent at {sent} ms, panel done at {} ms",
-            ms()
-        );
-        true
+    }
+
+    fn is_dozing(&self) -> bool {
+        self.dozing.load(Ordering::Relaxed)
     }
 
     fn updated(&self, ui: &AppWindow, update: Update) {
@@ -235,8 +247,8 @@ enum Tick {
     /// Render the minute now; no network, which may still be down after a nap.
     /// A doze wake's draw carries the wake, which its frame reports back.
     Draw(Option<u64>),
-    /// Fetch what is due, then render.
-    Fetch,
+    /// Fetch what is due, then render; an online doze wake's carries the wake.
+    Fetch(Option<u64>),
     /// Read Miqat's file again, as a fresh start would, then render.
     Reload,
 }
@@ -252,7 +264,8 @@ struct State {
     miqat: Worker,
     system: Mode,
     idle: Idle,
-    /// When dozing last stayed up for the network.
+    /// When dozing last measured the battery, and went online if it has a
+    /// dashboard to fetch for.
     online: Option<DateTime<Utc>>,
 }
 
@@ -297,6 +310,8 @@ struct Ctx {
     timers: Rc<RefCell<Vec<DeviceEvent>>>,
     /// The doze wake whose redraw is awaited.
     draw_wake: Arc<DrawWake>,
+    /// Where this doze's time went; shared with the threads that end wakes.
+    ledger: Arc<Mutex<DozeLedger>>,
     now: fn() -> DateTime<Utc>,
     /// The clock's and status bar's zone: kindil.toml's, until Settings →
     /// Location changes it.
@@ -449,6 +464,8 @@ impl App {
                 ghosting: Arc::new(Mutex::new(Ghosting::default())),
                 presented: options.presented,
                 dashboard: Arc::default(),
+                dozing: Arc::default(),
+                panel_error_logged: Arc::default(),
             },
             config: Rc::new(options.config),
             execution: options.execution,
@@ -463,6 +480,7 @@ impl App {
             doze_gauge: Arc::default(),
             timers: Rc::default(),
             draw_wake: Arc::default(),
+            ledger: Arc::new(Mutex::new(DozeLedger::new((options.now)(), None))),
             timezone: Arc::new(Mutex::new(timezone)),
             finding: Arc::default(),
         };
@@ -691,9 +709,13 @@ fn arm_clock(timer: Rc<slint::Timer>, ctx: Ctx) {
         slint::TimerMode::SingleShot,
         until_next_minute((ctx.now)()),
         move || {
-            ctx.tick_clock();
-            ctx.refresh_status();
-            ctx.check_idle();
+            // While dozing, each wake reads what it needs; this clock only
+            // runs on the little time the device is up.
+            if !ctx.display.is_dozing() {
+                ctx.tick_clock();
+                ctx.refresh_status();
+                ctx.check_idle();
+            }
             arm_clock(next.clone(), ctx.clone());
         },
     );
@@ -1302,9 +1324,43 @@ impl Ctx {
             Err(ignored) => eprintln!("kindil: {event:?} ignored: {ignored:?}"),
             Ok(Step { next, effects }) => {
                 self.state.borrow_mut().system = next;
+                self.dozing_changed(
+                    matches!(mode, Mode::Dozing(_)),
+                    matches!(next, Mode::Dozing(_)),
+                );
                 effects.into_iter().for_each(|effect| self.apply(effect));
             }
         }
+    }
+
+    /// A doze starts a ledger of its own, and logs it when it ends.
+    fn dozing_changed(&self, was: bool, is: bool) {
+        self.display.dozing.store(is, Ordering::Relaxed);
+        let now = (self.now)();
+        match (was, is) {
+            (false, true) => {
+                let mut ledger = DozeLedger::new(now, None);
+                // Wi-Fi is up until the first nap parks it.
+                ledger.wifi_on(now);
+                *lock(&self.ledger) = ledger;
+                let ledger = self.ledger.clone();
+                self.background(
+                    |host| host.info().charge,
+                    move |_, charge| lock(&ledger).set_gauge(charge),
+                );
+            }
+            (true, false) => self.log_ledger(now),
+            (false, false) | (true, true) => {}
+        }
+    }
+
+    /// Logs the doze ledger with the gauge now, and starts the next one.
+    fn log_ledger(&self, now: DateTime<Utc>) {
+        let ledger = self.ledger.clone();
+        self.background(
+            |host| host.info().charge,
+            move |_, charge| eprintln!("kindil: {}", lock(&ledger).close(now, charge)),
+        );
     }
 
     /// Runs slow device work off the UI thread and feeds its outcome back as an event.
@@ -1355,13 +1411,96 @@ impl Ctx {
         );
     }
 
-    fn reconnect_wifi(&self) {
+    /// Brings Wi-Fi back after a suspend or a parked doze; `then` runs on
+    /// the UI thread with the outcome.
+    fn reconnect_wifi(&self, then: impl FnOnce(Result<(), ()>) + Send + 'static) {
         self.background(
             |host| host.reconnect_wifi(),
-            |_, result| {
-                if let Err(error) = result {
-                    eprintln!("kindil: reconnect Wi-Fi: {error}");
+            move |_, result| {
+                then(result.map_err(|error| eprintln!("kindil: reconnect Wi-Fi: {error}")));
+            },
+        );
+    }
+
+    /// The next prayer, while the prayer dashboard is on screen.
+    fn next_prayer(&self) -> Option<DateTime<Utc>> {
+        let ui = self.ui()?;
+        (ui.global::<Kindil>().get_dashboard() == DashboardKind::Miqat
+            && matches!(self.state.borrow().miqat, Worker::Started(_)))
+        .then(|| *lock(&self.display.dashboard.next_prayer))
+        .flatten()
+    }
+
+    /// Back from a nap: draw what is due, go online if a fetch is due, and
+    /// nap again as soon as the panel has the frame.
+    fn redraw_doze(&self) {
+        let now = (self.now)();
+        let dashboard = matches!(self.state.borrow().miqat, Worker::Started(_));
+        // Every half hour of wall time: the battery's draw, and the weather.
+        let (half_hour, window) = {
+            let mut state = self.state.borrow_mut();
+            let last = state.online;
+            let half_hour = Window::after_nap(last, now, true) == Window::Online;
+            if half_hour {
+                state.online = Some(now);
+            }
+            (half_hour, Window::after_nap(last, now, dashboard))
+        };
+        // Before the redraw starts: this wake, and the panel frames drawn so
+        // far; its dashboard frame is tagged with the wake.
+        let wake = self.draw_wake.begin();
+        let drawn = self.display.frames();
+        let due = {
+            let mut ledger = lock(&self.ledger);
+            ledger.woke(now, Instant::now(), window);
+            ledger.due(now)
+        };
+        if due {
+            self.log_ledger(now);
+        }
+        self.tick_clock();
+        self.refresh_battery();
+        if half_hour {
+            self.measure_doze(now);
+        }
+        match window {
+            Window::Draw => self.tick_miqat(Tick::Draw(Some(wake))),
+            Window::Online => {
+                // The minute now; the fetched frame once Wi-Fi is back.
+                self.tick_miqat(Tick::Draw(None));
+                lock(&self.ledger).wifi_on(now);
+                let ticks = self.miqat_ticks();
+                self.reconnect_wifi(move |result| {
+                    // Without Wi-Fi a fetch only fails: draw, and nap.
+                    if let Some(ticks) = ticks {
+                        let _ = ticks.send(match result {
+                            Ok(()) => Tick::Fetch(Some(wake)),
+                            Err(()) => Tick::Draw(Some(wake)),
+                        });
+                    }
+                });
+            }
+        }
+        self.settle_wake(wake, window, dashboard, drawn);
+    }
+
+    /// The battery after a doze wake: only the gauge, not the whole status.
+    fn refresh_battery(&self) {
+        let deliver = self.deliver();
+        let ledger = self.ledger.clone();
+        self.background(
+            |host| host.info(),
+            move |ui, info| {
+                let k = ui.global::<Kindil>();
+                let (level, label) = view::battery(info.battery);
+                k.set_battery_level(level);
+                k.set_battery_label(label.into());
+                let empty = crate::system::battery_event(info.battery);
+                k.set_battery_empty(empty.is_some());
+                if let Some(current) = info.current {
+                    lock(&ledger).current_at_wake(current);
                 }
+                empty.into_iter().for_each(&deliver);
             },
         );
     }
@@ -1386,64 +1525,60 @@ impl Ctx {
             }),
             Effect::AwaitPanel => self.after(PANEL_SETTLE, DeviceEvent::PanelSettled),
             Effect::AwaitDrive(since) => self.after(DRIVE_SETTLE, DeviceEvent::DriveSettled(since)),
-            Effect::Suspend => self.device_later(|host| match host.suspend() {
-                Ok(()) => DeviceEvent::Resumed,
-                Err(error) => {
-                    eprintln!("kindil: suspend: {error}");
-                    DeviceEvent::SuspendFailed
+            // Parked first: wpa_supplicant would join again after the resume.
+            Effect::Suspend => self.device_later(|host| {
+                host.park_wifi();
+                match host.suspend() {
+                    Ok(()) => DeviceEvent::Resumed,
+                    Err(error) => {
+                        eprintln!("kindil: suspend: {error}");
+                        DeviceEvent::SuspendFailed
+                    }
                 }
             }),
             Effect::Nap => {
-                // On the minute, plus a second so the clock has turned.
-                let nap = until_next_minute((self.now)()) + Duration::from_secs(1);
+                let now = (self.now)();
+                // On the redraw's minute, plus a second so the clock has turned.
+                let nap = (crate::system::next_redraw(now, self.next_prayer()) - now)
+                    .to_std()
+                    .unwrap_or_default()
+                    + Duration::from_secs(1);
+                {
+                    let mut ledger = lock(&self.ledger);
+                    ledger.napping(now, Instant::now());
+                }
                 if nap < MIN_NAP {
                     self.after(nap, DeviceEvent::Resumed);
                 } else {
-                    self.device_later(move |host| match host.nap(nap) {
-                        Ok(()) => DeviceEvent::Resumed,
-                        Err(error) => {
-                            eprintln!("kindil: nap: {error}");
-                            DeviceEvent::SuspendFailed
+                    lock(&self.ledger).wifi_off(now);
+                    self.device_later(move |host| {
+                        // Down until a fetch is due: nothing joins after the resume.
+                        host.park_wifi();
+                        match host.nap(nap) {
+                            Ok(()) => DeviceEvent::Resumed,
+                            Err(error) => {
+                                eprintln!("kindil: nap: {error}");
+                                DeviceEvent::SuspendFailed
+                            }
                         }
                     });
                 }
             }
-            Effect::Redraw => {
-                let now = (self.now)();
-                let window = {
-                    let mut state = self.state.borrow_mut();
-                    let window = Window::after_nap(state.online, now);
-                    if window == Window::Online {
-                        state.online = Some(now);
-                    }
-                    window
-                };
-                // Before the redraw starts: this wake, and the panel frames
-                // drawn so far; its dashboard frame is tagged with the wake.
-                let wake = self.draw_wake.begin();
-                let dashboard = matches!(self.state.borrow().miqat, Worker::Started(_));
-                let drawn = self.display.frames();
-                self.catch_up(Tick::Draw(Some(wake)));
-                if window == Window::Online {
-                    self.measure_doze(now);
-                    self.reconnect_wifi();
-                    let ctx = self.clone();
-                    self.later(FETCH_AFTER, move || ctx.tick_miqat(Tick::Fetch));
-                }
-                self.settle_wake(wake, window, dashboard, drawn);
-            }
+            Effect::Redraw => self.redraw_doze(),
             Effect::Rouse => {
                 // Out of doze: its wake ends, and its timer with it.
                 self.draw_wake.begin();
                 // Awake time would count against the doze.
                 *lock(&self.doze_gauge) = None;
-                self.catch_up(Tick::Fetch);
+                // The fetch follows Wi-Fi's reconnect (or the dashboard's
+                // own minute clock, if Wi-Fi never went down).
+                self.catch_up(Tick::Draw(None));
                 self.state.borrow_mut().idle = Idle::new(self.touches.count(), Instant::now());
             }
             Effect::Wake => {
                 self.draw_wake.begin();
                 self.show_system(&ui, System::App);
-                self.catch_up(Tick::Fetch);
+                self.catch_up(Tick::Draw(None));
                 self.state.borrow_mut().idle = Idle::new(self.touches.count(), Instant::now());
             }
             Effect::RestoreLight(level) => self.background(
@@ -1454,7 +1589,14 @@ impl Ctx {
                     }
                 },
             ),
-            Effect::Reconnect => self.reconnect_wifi(),
+            Effect::Reconnect => {
+                let ticks = self.miqat_ticks();
+                self.reconnect_wifi(move |result| {
+                    if let (Ok(()), Some(ticks)) = (result, ticks) {
+                        let _ = ticks.send(Tick::Fetch(None));
+                    }
+                });
+            }
             Effect::ReleaseStorage => self.release_storage(),
             Effect::StorageBack => self.storage_back(),
             Effect::DriveNotice(notice) => {
@@ -1466,44 +1608,58 @@ impl Ctx {
         }
     }
 
-    /// Ends a doze wake: a drawing one as soon as its redraw is on the panel
-    /// (the dashboard's new frame, if it has one), or at the window's length,
-    /// whichever comes first; an online one at its length.
+    /// Ends a doze wake as soon as its redraw is on the panel (the
+    /// dashboard's frame for this wake, if it has one): when the panel says
+    /// it finished, or [`PANEL_UPDATE`] after sending when it can't say; at
+    /// the window's ceiling if the frame never shows.
     fn settle_wake(&self, wake: u64, window: Window, dashboard: bool, drawn: u64) {
-        let length = window.length();
+        let ceiling = window.ceiling();
         let Execution::Background = self.execution else {
-            return self.after(length, DeviceEvent::PanelSettled);
+            return self.after(ceiling, DeviceEvent::PanelSettled);
         };
         let dashboard = dashboard.then_some(wake);
         let since = Instant::now();
         let claim = {
             let draw_wake = self.draw_wake.clone();
+            let ledger = self.ledger.clone();
             let deliver = Arc::new(self.deliver());
-            move || {
+            move |settle: Settle| {
                 let won = draw_wake.claim(wake);
                 if won {
+                    lock(&ledger).settled(settle);
                     deliver(DeviceEvent::PanelSettled);
                 }
                 won
             }
         };
-        let early = window == Window::Draw && self.display.presented.is_some();
-        if early {
+        if self.display.presented.is_some() {
             let display = self.display.clone();
             let claim = claim.clone();
-            let deadline = since + length;
-            std::thread::spawn(move || {
-                if display.wait_drawn(dashboard, drawn, deadline) && claim() {
-                    eprintln!(
-                        "kindil: redraw on the panel in {} ms",
-                        since.elapsed().as_millis()
-                    );
-                }
-            });
+            let deadline = since + ceiling;
+            std::thread::spawn(
+                move || match display.wait_drawn(dashboard, drawn, deadline) {
+                    Drawn::Done => {
+                        claim(Settle::Done);
+                    }
+                    Drawn::Sent(error) => {
+                        if !display.panel_error_logged.swap(true, Ordering::Relaxed) {
+                            eprintln!(
+                                "kindil: doze redraw: the panel can't say when an update finished \
+                             ({error}); napping {PANEL_UPDATE:?} after sending instead"
+                            );
+                        }
+                        std::thread::sleep(PANEL_UPDATE);
+                        claim(Settle::Timed);
+                    }
+                    Drawn::NotSeen => {}
+                },
+            );
         }
-        slint::Timer::single_shot(length, move || {
-            if claim() && early {
-                eprintln!("kindil: redraw not seen on the panel; napping at {length:?}");
+        slint::Timer::single_shot(ceiling, move || {
+            if claim(Settle::NotSeen) {
+                eprintln!(
+                    "kindil: doze redraw not seen on the panel; napping at the {ceiling:?} ceiling"
+                );
             }
         });
     }
@@ -1527,6 +1683,14 @@ impl Ctx {
         self.tick_miqat(tick);
     }
 
+    /// The dashboard worker's ticks, for a thread to send on.
+    fn miqat_ticks(&self) -> Option<mpsc::Sender<Tick>> {
+        match &self.state.borrow().miqat {
+            Worker::Started(ticks) => Some(ticks.clone()),
+            Worker::Idle => None,
+        }
+    }
+
     fn tick_miqat(&self, tick: Tick) {
         if let Worker::Started(ticks) = &self.state.borrow().miqat {
             // A stopped worker has reported its error on screen already.
@@ -1534,19 +1698,14 @@ impl Ctx {
         }
     }
 
-    /// Runs `work` on the UI thread after `delay`; never under
-    /// [`Execution::Inline`], which has no timers to run it.
-    fn later(&self, delay: Duration, work: impl FnOnce() + 'static) {
-        match self.execution {
-            Execution::Inline => {}
-            Execution::Background => slint::Timer::single_shot(delay, work),
-        }
-    }
-
     fn check_idle(&self) {
         let now = Instant::now();
         let due = {
             let mut state = self.state.borrow_mut();
+            // Asleep or dozing already: nothing more to fall into.
+            if !matches!(state.system, Mode::Awake { .. }) {
+                return;
+            }
             state.idle = state.idle.observe(self.touches.count(), now);
             state.idle.due(state.store.prefs.auto_sleep, now)
         };
@@ -2028,9 +2187,11 @@ fn miqat_worker(
                 renderer: &miqat::render::Renderer,
                 sources: &miqat::sources::Sources,
                 wake: Option<u64>| {
-        let frame = crate::dashboards::render(renderer, config, Utc::now(), sources)
+        let now = Utc::now();
+        let frame = crate::dashboards::render(renderer, config, now, sources)
             .map(pixels)
             .map_err(|e| e.to_string());
+        *lock(&display.dashboard.next_prayer) = crate::dashboards::next_prayer(config, now);
         let display = display.clone();
         weak.upgrade_in_event_loop(move |ui| {
             let k = ui.global::<Kindil>();
@@ -2048,12 +2209,12 @@ fn miqat_worker(
     if show(&config, &renderer, &sources, None).is_err() {
         return;
     }
-    let mut tick = Tick::Fetch;
+    let mut tick = Tick::Fetch(None);
     loop {
         let wake = match tick {
-            Tick::Fetch => {
+            Tick::Fetch(wake) => {
                 sources.refresh(&config, Utc::now());
-                None
+                wake
             }
             Tick::Draw(wake) => wake,
             // A file that no longer reads keeps the dashboard as it was.
@@ -2076,10 +2237,15 @@ fn miqat_worker(
         if show(&config, &renderer, &sources, wake).is_err() {
             return;
         }
-        tick = match ticks.recv_timeout(until_next_minute(Utc::now())) {
-            Ok(tick) => tick,
-            Err(mpsc::RecvTimeoutError::Timeout) => Tick::Fetch,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        tick = loop {
+            match ticks.recv_timeout(until_next_minute(Utc::now())) {
+                Ok(tick) => break tick,
+                // Dozing, wakes ask for draws and fetches: this clock only
+                // runs while the device is up, and Wi-Fi is parked.
+                Err(mpsc::RecvTimeoutError::Timeout) if display.is_dozing() => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => break Tick::Fetch(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
         };
     }
 }
@@ -2102,18 +2268,20 @@ mod tests {
         assert!(wake.claim(second));
     }
 
-    fn eink() -> (Display, Arc<AtomicU64>) {
-        let frames = Arc::new(AtomicU64::new(0));
-        let display = Display {
+    fn display(frames: Arc<AtomicU64>, wait_idle: fn() -> std::io::Result<()>) -> Display {
+        Display {
             panel: Panel::Lcd,
             ghosting: Arc::default(),
-            presented: Some(Presented {
-                frames: frames.clone(),
-                wait_idle: || true,
-            }),
+            presented: Some(Presented { frames, wait_idle }),
             dashboard: Arc::default(),
-        };
-        (display, frames)
+            dozing: Arc::default(),
+            panel_error_logged: Arc::default(),
+        }
+    }
+
+    fn eink() -> (Display, Arc<AtomicU64>) {
+        let frames = Arc::new(AtomicU64::new(0));
+        (display(frames.clone(), || Ok(())), frames)
     }
 
     #[test]
@@ -2135,36 +2303,40 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         assert!(!waiter.is_finished(), "shown, not yet drawn");
         frames.fetch_add(1, Ordering::Release);
-        assert!(waiter.join().unwrap());
+        assert!(matches!(waiter.join().unwrap(), Drawn::Done));
     }
 
     #[test]
-    fn a_panel_that_cant_say_it_finished_is_not_done() {
-        let frames = Arc::new(AtomicU64::new(1));
-        let display = Display {
-            panel: Panel::Lcd,
-            ghosting: Arc::default(),
-            presented: Some(Presented {
-                frames,
-                wait_idle: || false,
-            }),
-            dashboard: Arc::default(),
-        };
-        assert!(!display.wait_drawn(None, 0, Instant::now() + Duration::from_secs(5)));
+    fn a_panel_that_cant_say_it_finished_has_the_frame_sent() {
+        let display = display(Arc::new(AtomicU64::new(1)), || {
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+        });
+        // Not the ceiling: the frame is with the panel, which only can't
+        // tell when it's done; the wake naps a panel update later.
+        assert!(matches!(
+            display.wait_drawn(None, 0, Instant::now() + Duration::from_secs(5)),
+            Drawn::Sent(_)
+        ));
     }
 
     #[test]
     fn gives_up_at_the_deadline() {
         let (display, _) = eink();
         let soon = Instant::now() + Duration::from_millis(40);
-        assert!(!display.wait_drawn(Some(1), 0, soon));
-        assert!(!display.wait_drawn(None, 0, soon));
+        assert!(matches!(
+            display.wait_drawn(Some(1), 0, soon),
+            Drawn::NotSeen
+        ));
+        assert!(matches!(display.wait_drawn(None, 0, soon), Drawn::NotSeen));
         let (no_panel, _) = eink();
         let no_panel = Display {
             presented: None,
             ..no_panel
         };
-        assert!(!no_panel.wait_drawn(None, 0, Instant::now() + Duration::from_secs(5)));
+        assert!(matches!(
+            no_panel.wait_drawn(None, 0, Instant::now() + Duration::from_secs(5)),
+            Drawn::NotSeen
+        ));
     }
     #[test]
     fn a_new_prayer_method_keeps_the_fetched_weather_and_radar() {

@@ -169,6 +169,9 @@ pub struct DeviceInfo {
     pub memory: Option<Memory>,
     pub storage: Option<Storage>,
     pub uptime: Option<Duration>,
+    /// The fuel gauge's current in mA, negative on battery: its average
+    /// over the last few seconds, so right after a nap mostly the nap's.
+    pub current: Option<i32>,
 }
 
 /// Delivers device events to the UI from any thread.
@@ -182,6 +185,9 @@ pub trait Host: Send + Sync {
     /// After kindil suspends the device: joins again and renews the address.
     /// Blocks for a few seconds: call from a worker thread.
     fn reconnect_wifi(&self) -> anyhow::Result<()>;
+    /// Before a suspend: leaves the network, so nothing joins it again on
+    /// each resume; [`Host::reconnect_wifi`] brings it back. Quick.
+    fn park_wifi(&self) {}
     /// Blocks for a few seconds: call from a worker thread.
     fn scan(&self) -> anyhow::Result<Vec<Network>>;
     /// Joins for this session only; nothing is written to Amazon's Wi-Fi profiles.
@@ -238,6 +244,9 @@ struct SimulatedState {
     brightness: Brightness,
     suspends: u32,
     naps: u32,
+    /// Naps and suspends that found Wi-Fi parked first.
+    parked_naps: u32,
+    parked: bool,
     battery: Battery,
     charge: Option<crate::drain::MilliampHours>,
     wifi: Power,
@@ -320,6 +329,8 @@ impl Default for Simulated {
                 brightness: Brightness::new(40),
                 suspends: 0,
                 naps: 0,
+                parked_naps: 0,
+                parked: false,
                 battery: Battery::Known {
                     percent: 82,
                     charge: crate::battery::Charge::Charging,
@@ -355,6 +366,16 @@ impl Simulated {
     /// How many times the device napped while dozing.
     pub fn naps(&self) -> u32 {
         self.with(|s| s.naps)
+    }
+
+    /// How many naps and suspends found Wi-Fi parked.
+    pub fn parked_naps(&self) -> u32 {
+        self.with(|s| s.parked_naps)
+    }
+
+    /// Whether Wi-Fi is parked now.
+    pub fn parked(&self) -> bool {
+        self.with(|s| s.parked)
     }
 
     /// Offline, place lookups fail as without a network.
@@ -403,7 +424,11 @@ impl Host for Simulated {
         Ok(())
     }
     fn reconnect_wifi(&self) -> anyhow::Result<()> {
+        self.with(|s| s.parked = false);
         Ok(())
+    }
+    fn park_wifi(&self) {
+        self.with(|s| s.parked = true);
     }
     fn scan(&self) -> anyhow::Result<Vec<Network>> {
         use crate::wifi::Security::{Open, Protected};
@@ -489,18 +514,25 @@ impl Host for Simulated {
                 free_bytes: 1_046_000_000,
             }),
             uptime: Some(Duration::from_secs(3 * 3600 + 25 * 60)),
+            current: None,
         }
     }
     /// Tests deliver events themselves.
     fn listen(&self, _: Deliver) {}
     /// Wakes at once, as if the power button were pressed right away.
     fn suspend(&self) -> anyhow::Result<()> {
-        self.with(|s| s.suspends += 1);
+        self.with(|s| {
+            s.suspends += 1;
+            s.parked_naps += u32::from(s.parked);
+        });
         Ok(())
     }
     /// Wakes at once, as if the minute were up.
     fn nap(&self, _: Duration) -> anyhow::Result<()> {
-        self.with(|s| s.naps += 1);
+        self.with(|s| {
+            s.naps += 1;
+            s.parked_naps += u32::from(s.parked);
+        });
         Ok(())
     }
     fn restart(&self) -> anyhow::Result<()> {

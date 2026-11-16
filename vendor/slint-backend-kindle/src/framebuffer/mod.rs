@@ -2,12 +2,34 @@ mod ffi;
 
 use std::cell::Cell;
 use std::ops::Range;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+
+/// The marker the next update carries. Each update gets its own, so a wait
+/// is for that update and not for whichever earlier one shared a fixed
+/// marker; never 0, which the driver takes as "no marker". kindil patch.
+static NEXT_MARKER: AtomicU32 = AtomicU32::new(1);
+/// The marker of the last update sent to the panel.
+static LAST_MARKER: AtomicU32 = AtomicU32::new(0);
+
+fn next_marker() -> u32 {
+    loop {
+        let marker = NEXT_MARKER.fetch_add(1, Ordering::Relaxed);
+        if marker != 0 {
+            LAST_MARKER.store(marker, Ordering::Release);
+            return marker;
+        }
+    }
+}
+
+/// Which wait ioctl answered last: 0 not known yet, 1 the marker alone
+/// (PW1), 2 the marker struct (PW2 and later).
+static WAIT_FORM: AtomicU8 = AtomicU8::new(0);
 
 use ffi::{
     FBIOGET_FSCREENINFO, FBIOGET_VSCREENINFO, FbFixScreeninfo, FbVarScreeninfo, MXCFB_SEND_UPDATE,
     MXCFB_SEND_UPDATE_MTK, MXCFB_SEND_UPDATE_REX, MXCFB_SEND_UPDATE_ZELDA,
-    MXCFB_WAIT_FOR_UPDATE_COMPLETE, TEMP_USE_AMBIENT, UPDATE_MODE_FULL, UPDATE_MODE_PARTIAL,
+    MXCFB_WAIT_FOR_UPDATE_COMPLETE, MXCFB_WAIT_FOR_UPDATE_COMPLETE_U32, TEMP_USE_AMBIENT, UPDATE_MODE_FULL, UPDATE_MODE_PARTIAL,
     UpdateMarkerData, UpdateRect, UpdateRequest, UpdateRequestMtk, UpdateRequestRex,
     UpdateRequestZelda, WAVEFORM_MODE_A2, WAVEFORM_MODE_AUTO, WAVEFORM_MODE_GC16,
 };
@@ -198,14 +220,15 @@ impl Framebuffer {
     /// cache it, so later frames issue exactly one ioctl instead of retrying a
     /// known-failing one every refresh.
     fn send_update(&self, region: UpdateRect, waveform: u32, mode: u32) {
+        let marker = next_marker();
         match self.update_variant.get() {
             Some(variant) => {
-                self.send_update_variant(variant, region, waveform, mode);
+                self.send_update_variant(variant, region, waveform, mode, marker);
             }
             None => {
-                let accepted = UpdateVariant::PROBE_ORDER
-                    .into_iter()
-                    .find(|&variant| self.send_update_variant(variant, region, waveform, mode));
+                let accepted = UpdateVariant::PROBE_ORDER.into_iter().find(|&variant| {
+                    self.send_update_variant(variant, region, waveform, mode, marker)
+                });
                 if accepted.is_none() {
                     log::error!(
                         "EPDC refresh failed: no known MXCFB_SEND_UPDATE variant \
@@ -225,12 +248,13 @@ impl Framebuffer {
         region: UpdateRect,
         waveform: u32,
         mode: u32,
+        marker: u32,
     ) -> bool {
         match variant {
-            UpdateVariant::Legacy => self.send_update_legacy(region, waveform, mode),
-            UpdateVariant::Rex => self.send_update_rex(region, waveform, mode),
-            UpdateVariant::Zelda => self.send_update_zelda(region, waveform, mode),
-            UpdateVariant::Mtk => self.send_update_mtk(region, waveform, mode),
+            UpdateVariant::Legacy => self.send_update_legacy(region, waveform, mode, marker),
+            UpdateVariant::Rex => self.send_update_rex(region, waveform, mode, marker),
+            UpdateVariant::Zelda => self.send_update_zelda(region, waveform, mode, marker),
+            UpdateVariant::Mtk => self.send_update_mtk(region, waveform, mode, marker),
             UpdateVariant::Unsupported => false,
         }
     }
@@ -244,12 +268,18 @@ impl Framebuffer {
 
     /// Issue the legacy `MXCFB_SEND_UPDATE` (72-byte struct). Returns whether the
     /// ioctl succeeded.
-    fn send_update_legacy(&self, region: UpdateRect, waveform: u32, mode: u32) -> bool {
+    fn send_update_legacy(
+        &self,
+        region: UpdateRect,
+        waveform: u32,
+        mode: u32,
+        marker: u32,
+    ) -> bool {
         let update = UpdateRequest {
             update_region: region,
             waveform_mode: waveform,
             update_mode: mode,
-            update_marker: 1,
+            update_marker: marker,
             temperature: TEMP_USE_AMBIENT,
             ..Default::default()
         };
@@ -258,12 +288,18 @@ impl Framebuffer {
 
     /// Issue the modern `MXCFB_SEND_UPDATE_REX` (80-byte struct). Returns whether
     /// the ioctl succeeded.
-    fn send_update_rex(&self, region: UpdateRect, waveform: u32, mode: u32) -> bool {
+    fn send_update_rex(
+        &self,
+        region: UpdateRect,
+        waveform: u32,
+        mode: u32,
+        marker: u32,
+    ) -> bool {
         let update = UpdateRequestRex {
             update_region: region,
             waveform_mode: waveform,
             update_mode: mode,
-            update_marker: 1,
+            update_marker: marker,
             temperature: TEMP_USE_AMBIENT,
             ..Default::default()
         };
@@ -272,12 +308,18 @@ impl Framebuffer {
 
     /// Issue `MXCFB_SEND_UPDATE_MTK` (96-byte struct, MediaTek devices).
     /// Returns whether the ioctl succeeded.
-    fn send_update_mtk(&self, region: UpdateRect, waveform: u32, mode: u32) -> bool {
+    fn send_update_mtk(
+        &self,
+        region: UpdateRect,
+        waveform: u32,
+        mode: u32,
+        marker: u32,
+    ) -> bool {
         let update = UpdateRequestMtk {
             update_region: region,
             waveform_mode: waveform,
             update_mode: mode,
-            update_marker: 1,
+            update_marker: marker,
             temperature: TEMP_USE_AMBIENT,
             ..Default::default()
         };
@@ -286,12 +328,18 @@ impl Framebuffer {
 
     /// Issue `MXCFB_SEND_UPDATE_ZELDA` (88-byte struct, KOA2/KOA3 — Oasis 2/3).
     /// Returns whether the ioctl succeeded.
-    fn send_update_zelda(&self, region: UpdateRect, waveform: u32, mode: u32) -> bool {
+    fn send_update_zelda(
+        &self,
+        region: UpdateRect,
+        waveform: u32,
+        mode: u32,
+        marker: u32,
+    ) -> bool {
         let update = UpdateRequestZelda {
             update_region: region,
             waveform_mode: waveform,
             update_mode: mode,
-            update_marker: 1,
+            update_marker: marker,
             temperature: TEMP_USE_AMBIENT,
             ..Default::default()
         };
@@ -312,22 +360,12 @@ impl Framebuffer {
         );
     }
 
-    /// Block until the EPDC has applied the last update (marker 1).
+    /// Block until the EPDC has applied the last update.
     ///
-    /// Used before suspending to RAM so the panel doesn't latch mid-refresh.
+    /// Used before writing pixels the panel may still be driving.
     /// Best-effort: a failing ioctl is ignored, since this is purely defensive.
     pub(crate) fn wait_for_update_complete(&self) {
-        let mut marker = UpdateMarkerData {
-            update_marker: 1,
-            collision_test: 0,
-        };
-        unsafe {
-            libc::ioctl(
-                self.file.as_raw_fd(),
-                MXCFB_WAIT_FOR_UPDATE_COMPLETE as _,
-                &mut marker as *mut _,
-            );
-        }
+        let _ = wait_marker(self.file.as_raw_fd(), LAST_MARKER.load(Ordering::Acquire));
     }
 
     /// Refresh a rectangle of the panel.
@@ -354,25 +392,87 @@ impl Framebuffer {
     }
 }
 
+/// Waits for the update with `marker`, in whichever form the driver takes:
+/// the marker alone (PW1's 2.6.31 kernel) or the marker struct (later ones).
+/// The form that answered is tried first from then on. The error is the
+/// errno of the form tried last.
+fn wait_marker(fd: RawFd, marker: u32) -> std::io::Result<()> {
+    if marker == 0 {
+        // Nothing sent yet.
+        return Ok(());
+    }
+    let alone = || {
+        let mut value = marker;
+        // SAFETY: a valid fd and a u32 for the ioctl's duration.
+        let done = unsafe {
+            libc::ioctl(
+                fd,
+                MXCFB_WAIT_FOR_UPDATE_COMPLETE_U32 as _,
+                &mut value as *mut u32,
+            )
+        };
+        if done >= 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    let with_struct = || {
+        let mut data = UpdateMarkerData {
+            update_marker: marker,
+            collision_test: 0,
+        };
+        // SAFETY: a valid fd and marker struct for the ioctl's duration.
+        let done = unsafe {
+            libc::ioctl(
+                fd,
+                MXCFB_WAIT_FOR_UPDATE_COMPLETE as _,
+                &mut data as *mut UpdateMarkerData,
+            )
+        };
+        if done >= 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    let (first, second, forms): (&dyn Fn() -> std::io::Result<()>, &dyn Fn() -> _, _) =
+        match WAIT_FORM.load(Ordering::Relaxed) {
+            2 => (&with_struct, &alone, (2, 1)),
+            _ => (&alone, &with_struct, (1, 2)),
+        };
+    let first = match first() {
+        Ok(()) => {
+            WAIT_FORM.store(forms.0, Ordering::Relaxed);
+            return Ok(());
+        }
+        Err(error) => error,
+    };
+    match second() {
+        Ok(()) => {
+            WAIT_FORM.store(forms.1, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(second) => {
+            let (alone, with_struct) = match forms {
+                (1, _) => (first, second),
+                _ => (second, first),
+            };
+            Err(std::io::Error::other(format!(
+                "waiting for update {marker}: marker alone: {alone}; marker struct: {with_struct}"
+            )))
+        }
+    }
+}
+
 /// [`Framebuffer::wait_for_update_complete`] on a descriptor of its own,
-/// for threads other than the event loop's.
-pub(crate) fn wait_for_panel() -> bool {
-    let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/fb0") else {
-        return false;
-    };
-    let mut marker = UpdateMarkerData {
-        update_marker: 1,
-        collision_test: 0,
-    };
-    // SAFETY: a valid fd and marker struct for the ioctl's duration.
-    let done = unsafe {
-        libc::ioctl(
-            file.as_raw_fd(),
-            MXCFB_WAIT_FOR_UPDATE_COMPLETE as _,
-            &mut marker as *mut _,
-        )
-    };
-    done >= 0
+/// for threads other than the event loop's, for the last update sent.
+pub(crate) fn wait_for_panel() -> std::io::Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fb0")?;
+    wait_marker(file.as_raw_fd(), LAST_MARKER.load(Ordering::Acquire))
 }
 
 impl Drop for Framebuffer {

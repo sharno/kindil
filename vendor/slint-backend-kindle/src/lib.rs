@@ -272,8 +272,8 @@ pub fn install(font_data: &[u8]) -> Result<KindleBackend, slint::PlatformError> 
 }
 
 /// Blocks until the e-ink controller has finished the last update sent to
-/// it, from any thread; immediately when none is pending. False if it
-/// couldn't be asked. kindil patch.
-pub fn wait_for_panel() -> bool {
+/// it, from any thread; immediately when none is pending. An error if it
+/// couldn't be asked, with each ioctl form's errno. kindil patch.
+pub fn wait_for_panel() -> std::io::Result<()> {
     framebuffer::wait_for_panel()
 }
