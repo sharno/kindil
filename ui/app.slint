@@ -12,7 +12,7 @@ import "../crates/miqat/assets/fonts/IBMPlexSansArabic-SemiBold.ttf";
 import "../crates/miqat/assets/fonts/IBMPlexSansArabic-Bold.ttf";
 
 /// Settings is an index; display through about are its sections.
-export enum Page { dashboard, library, reader, settings, display, prayer, wifi, remote, power, updates, about, networks }
+export enum Page { dashboard, library, reader, settings, display, prayer, location, place-search, coordinates, wifi, remote, power, updates, about, networks }
 export enum DashboardKind { miqat, clock }
 /// A setting's switch. `unavailable` covers "not installed" and "no hardware".
 export enum Switch { off, on, unavailable }
@@ -45,6 +45,12 @@ export struct PrayerChoice {
     title: string,
     /// "Fajr 04:59 · Isha 17:56", or "Asr 14:12".
     times: string,
+}
+
+/// A place a search found: "Name, Region, Country", its time zone and where.
+export struct PlaceItem {
+    title: string,
+    detail: string,
 }
 
 export struct Fact {
@@ -82,7 +88,9 @@ export global Kindil {
     /// The Settings index or one of the pages under it.
     out property <bool> in-settings: page == Page.settings || page == Page.display || page == Page.prayer || page == Page.wifi
         || page == Page.remote || page == Page.power || page == Page.updates || page == Page.about
-        || page == Page.networks;
+        || page == Page.networks || in-location;
+    /// Settings → Location or one of its pages.
+    out property <bool> in-location: page == Page.location || page == Page.place-search || page == Page.coordinates;
     in-out property <DashboardKind> dashboard: DashboardKind.miqat;
     /// The status row and tab bar over the full-bleed dashboard; other pages always show them.
     in-out property <bool> chrome-visible: false;
@@ -204,6 +212,34 @@ export global Kindil {
     in property <string> prayer-error;
     callback choose-prayer-method(int);
     callback choose-asr-school(int);
+    /// Location: the place in miqat.toml ("Amsterdam, North Holland,
+    /// Netherlands", or its coordinates) and its time zone.
+    in property <string> location-title;
+    in property <string> location-zone;
+    /// Why miqat.toml can't be read; empty when it can.
+    in property <string> location-error;
+    /// What the last search, lookup or check said; empty for nothing.
+    in property <string> location-status;
+    /// A search or lookup is on its way.
+    in property <bool> location-busy;
+    in property <[PlaceItem]> places;
+    in-out property <string> place-query;
+    in-out property <string> typed-latitude;
+    in-out property <string> typed-longitude;
+    in-out property <string> typed-zone;
+    /// Time zones holding what was typed in the zone field.
+    in property <[string]> zone-matches;
+    /// The place waiting for Save, how it was found, and the sheet asking.
+    in-out property <bool> confirm-open;
+    in property <string> confirm-place;
+    in property <string> confirm-note;
+    callback search-places(string);
+    callback choose-place(int);
+    callback locate-by-ip();
+    callback enter-coordinates(string, string, string);
+    callback filter-zones(string);
+    callback save-location();
+    callback cancel-location();
 
     public function go(target: Page) {
         page = target;
@@ -441,6 +477,7 @@ component TextField {
     in property <InputType> input-type: InputType.text;
     out property <bool> focused: input.has-focus;
     callback accepted();
+    callback edited(string);
     forward-focus: input;
     height: 68px;
     Rectangle {
@@ -469,6 +506,7 @@ component TextField {
         color: Theme.ink;
         vertical-alignment: center;
         accepted => { root.accepted(); }
+        edited => { root.edited(self.text); }
     }
 }
 
@@ -1384,8 +1422,9 @@ component SubHeader {
 /// One Settings section: a page with a back arrow, scrolling only if it must.
 component SectionPage {
     in property <string> title;
+    in property <Page> back: Page.settings;
     VerticalLayout {
-        SubHeader { title: root.title; }
+        SubHeader { title: root.title; back: root.back; }
         SwipeScroll {
             vertical-stretch: 1;
             content-height: content.preferred-height;
@@ -1406,7 +1445,7 @@ component SectionRow {
     in property <string> title;
     in property <string> summary;
     in property <Page> target;
-    min-height: 100px;
+    min-height: 92px;
     HorizontalLayout {
         spacing: 16px;
         VerticalLayout {
@@ -1445,6 +1484,13 @@ component SettingsPage {
                 title: "Prayer times";
                 summary: Kindil.prayer-error != "" ? "Can't read miqat.toml" : Kindil.prayer-summary;
                 target: Page.prayer;
+            }
+            Divider { }
+            SectionRow {
+                title: "Location";
+                summary: Kindil.location-error != "" ? "Can't read miqat.toml"
+                    : Kindil.location-title + " · " + Kindil.location-zone;
+                target: Page.location;
             }
             Divider { }
             SectionRow { title: "Wi-Fi"; summary: Kindil.wifi-detail; target: Page.wifi; }
@@ -1597,6 +1643,286 @@ component PrayerSettings inherits SectionPage {
                 selected: i == Kindil.asr-school;
                 clicked => { Kindil.choose-asr-school(i); }
             }
+        }
+    }
+}
+
+/// A row that does something: title, detail, and a chevron or what it is doing.
+component ActionRow {
+    in property <string> title;
+    in property <string> detail;
+    in property <string> trailing: "›";
+    in property <bool> enabled: true;
+    callback clicked();
+    min-height: 92px;
+    HorizontalLayout {
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 16px;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: root.title;
+                font-size: 23px;
+                font-weight: 600;
+                color: root.enabled ? Theme.ink : Theme.dim;
+            }
+            if root.detail != "": Text {
+                text: root.detail;
+                font-size: 18px;
+                color: Theme.ink-2;
+                wrap: word-wrap;
+            }
+        }
+        Text {
+            text: root.trailing;
+            font-size: root.trailing == "›" ? 34px : 19px;
+            color: Theme.ink-2;
+            vertical-alignment: center;
+        }
+    }
+    TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// What the last search, lookup or check said.
+component LocationStatus inherits Text {
+    text: Kindil.location-status;
+    font-size: 20px;
+    color: Theme.ink;
+    wrap: word-wrap;
+}
+
+component LocationSettings inherits SectionPage {
+    title: "Location";
+    Group {
+        title: "NOW";
+        if Kindil.location-error != "": Text {
+            text: Kindil.location-error;
+            font-size: 20px;
+            color: Theme.ink;
+            wrap: word-wrap;
+        }
+        if Kindil.location-error == "": VerticalLayout {
+            padding-top: 8px;
+            padding-bottom: 8px;
+            spacing: 4px;
+            Text {
+                text: Kindil.location-title;
+                font-size: 27px;
+                font-weight: 700;
+                color: Theme.ink;
+                wrap: word-wrap;
+            }
+            Text {
+                text: "Time zone " + Kindil.location-zone;
+                font-size: 20px;
+                color: Theme.ink-2;
+            }
+            Text {
+                text: "Prayer times, weather, the radar map and the clock follow it.";
+                font-size: 17px;
+                color: Theme.ink-3;
+                wrap: word-wrap;
+            }
+        }
+    }
+    Group {
+        title: "CHANGE";
+        ActionRow {
+            title: "Search for a city";
+            detail: "Type its name";
+            clicked => { Kindil.go(Page.place-search); }
+        }
+        Divider { }
+        ActionRow {
+            title: "Use my approximate location";
+            detail: "Asks ipinfo.io once, from your internet address";
+            trailing: Kindil.location-busy ? "Finding…" : "";
+            enabled: !Kindil.location-busy;
+            clicked => { Kindil.locate-by-ip(); }
+        }
+        Divider { }
+        ActionRow {
+            title: "Enter coordinates";
+            detail: "Latitude, longitude and time zone";
+            clicked => { Kindil.go(Page.coordinates); }
+        }
+    }
+    if Kindil.location-status != "": Group {
+        LocationStatus { }
+    }
+}
+
+component PlaceSearchPage {
+    VerticalLayout {
+        SubHeader { title: "Search for a city"; back: Page.location; }
+        HorizontalLayout {
+            padding-left: Theme.gutter;
+            padding-right: Theme.gutter;
+            spacing: 12px;
+            query := TextField {
+                horizontal-stretch: 1;
+                text <=> Kindil.place-query;
+                placeholder: "City name, e.g. Amsterdam";
+                accepted => {
+                    sink.focus();
+                    Kindil.search-places(Kindil.place-query);
+                }
+            }
+            Button {
+                text: Kindil.location-busy ? "Searching…" : "Search";
+                kind: ButtonKind.primary;
+                enabled: !Kindil.location-busy && Kindil.place-query != "";
+                clicked => {
+                    sink.focus();
+                    Kindil.search-places(Kindil.place-query);
+                }
+            }
+        }
+        HorizontalLayout {
+            padding-left: Theme.gutter;
+            padding-right: Theme.gutter;
+            padding-top: 8px;
+            padding-bottom: 8px;
+            min-height: 48px;
+            LocationStatus { font-size: 18px; color: Theme.ink-2; vertical-alignment: center; }
+        }
+        SwipeScroll {
+            vertical-stretch: 1;
+            content-height: rows.preferred-height;
+            rows := VerticalLayout {
+                width: parent.width;
+                alignment: start;
+                for place[i] in Kindil.places: Rectangle {
+                    height: 92px;
+                    TouchArea {
+                        clicked => {
+                            sink.focus();
+                            Kindil.choose-place(i);
+                        }
+                    }
+                    VerticalLayout {
+                        padding-left: Theme.gutter;
+                        padding-right: Theme.gutter;
+                        alignment: center;
+                        spacing: 2px;
+                        Text { text: place.title; font-size: 23px; font-weight: 600; color: Theme.ink; overflow: elide; }
+                        Text { text: place.detail; font-size: 18px; color: Theme.ink-2; overflow: elide; }
+                    }
+                    Divider {
+                        x: Theme.gutter;
+                        y: parent.height - 1px;
+                        width: parent.width - 2 * Theme.gutter;
+                    }
+                }
+            }
+        }
+        sink := FocusScope { height: 0px; }
+    }
+}
+
+component CoordinatesPage inherits SectionPage {
+    title: "Coordinates";
+    back: Page.location;
+    Group {
+        title: "LATITUDE";
+        latitude := TextField {
+            text <=> Kindil.typed-latitude;
+            placeholder: "-85 to 85, north positive: 21.4225";
+            accepted => { longitude.focus(); }
+        }
+    }
+    Group {
+        title: "LONGITUDE";
+        longitude := TextField {
+            text <=> Kindil.typed-longitude;
+            placeholder: "-180 to 180, east positive: 39.8262";
+            accepted => { zone.focus(); }
+        }
+    }
+    Group {
+        title: "TIME ZONE";
+        zone := TextField {
+            text <=> Kindil.typed-zone;
+            placeholder: "Type a city or region: Riyadh";
+            edited(text) => { Kindil.filter-zones(text); }
+            accepted => { sink.focus(); }
+        }
+        for name in Kindil.zone-matches: Rectangle {
+            height: 64px;
+            Text {
+                x: 20px;
+                text: name;
+                font-size: 21px;
+                color: Theme.ink;
+            }
+            Divider { y: parent.height - 1px; }
+            TouchArea {
+                clicked => {
+                    Kindil.typed-zone = name;
+                    Kindil.filter-zones(name);
+                }
+            }
+        }
+    }
+    if Kindil.location-status != "": Group {
+        LocationStatus { }
+    }
+    HorizontalLayout {
+        padding-top: 24px;
+        Button {
+            horizontal-stretch: 1;
+            text: "Use these";
+            kind: ButtonKind.primary;
+            clicked => {
+                sink.focus();
+                Kindil.enter-coordinates(Kindil.typed-latitude, Kindil.typed-longitude, Kindil.typed-zone);
+            }
+        }
+    }
+    sink := FocusScope { height: 0px; }
+}
+
+/// Asks before a found or typed place replaces the one in miqat.toml.
+component LocationSheet inherits Sheet {
+    Caption { text: "USE THIS LOCATION?"; }
+    Text {
+        text: Kindil.confirm-place;
+        font-size: 25px;
+        font-weight: 700;
+        color: Theme.ink;
+        wrap: word-wrap;
+    }
+    if Kindil.confirm-note != "": Text {
+        text: Kindil.confirm-note;
+        font-size: 19px;
+        color: Theme.ink-2;
+        wrap: word-wrap;
+    }
+    Text {
+        text: "Prayer times, weather, the radar map and the clock change to it.";
+        font-size: 17px;
+        color: Theme.ink-3;
+        wrap: word-wrap;
+    }
+    HorizontalLayout {
+        spacing: 12px;
+        Button {
+            text: "Cancel";
+            horizontal-stretch: 1;
+            clicked => { Kindil.cancel-location(); }
+        }
+        Button {
+            text: "Save";
+            kind: ButtonKind.primary;
+            enabled: !Kindil.location-busy;
+            horizontal-stretch: 1;
+            clicked => { Kindil.save-location(); }
         }
     }
 }
@@ -2131,6 +2457,9 @@ export component AppWindow inherits Window {
             if Kindil.page == Page.settings: SettingsPage { width: parent.width; height: parent.height; }
             if Kindil.page == Page.display: DisplaySettings { width: parent.width; height: parent.height; }
             if Kindil.page == Page.prayer: PrayerSettings { width: parent.width; height: parent.height; }
+            if Kindil.page == Page.location: LocationSettings { width: parent.width; height: parent.height; }
+            if Kindil.page == Page.place-search: PlaceSearchPage { width: parent.width; height: parent.height; }
+            if Kindil.page == Page.coordinates: CoordinatesPage { width: parent.width; height: parent.height; }
             if Kindil.page == Page.wifi: WifiSettings { width: parent.width; height: parent.height; }
             if Kindil.page == Page.remote: RemoteSettings { width: parent.width; height: parent.height; }
             if Kindil.page == Page.power: PowerSettings { width: parent.width; height: parent.height; }
@@ -2185,6 +2514,10 @@ export component AppWindow inherits Window {
     }
 
     if Kindil.page == Page.library && Kindil.selected-book >= 0: BookActions {
+        y: root.usable-height - self.height;
+        height: self.preferred-height;
+    }
+    if Kindil.in-location && Kindil.confirm-open: LocationSheet {
         y: root.usable-height - self.height;
         height: self.preferred-height;
     }

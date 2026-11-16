@@ -77,8 +77,10 @@ impl From<Progress> for f32 {
     }
 }
 
+/// Unknown keys are skipped, not refused: a newer kindil may have written
+/// some, and an older one (after a rollback) must keep the rest.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Prefs {
     pub dashboard: Option<Dashboard>,
     pub font: FontSize,
@@ -143,5 +145,21 @@ mod tests {
         assert!(toml::from_str::<Prefs>("font = 99").is_err());
         assert_eq!(Progress::of(5, 10).page(20), 10);
         assert_eq!(FontSize::default().smaller().px(), 22);
+    }
+
+    #[test]
+    fn an_unknown_key_keeps_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.toml");
+        std::fs::write(
+            &path,
+            "dashboard = \"clock\"\nfont = 28\nfrom_a_newer_kindil = true\n\
+             [later]\nkey = 1\n\n[positions]\n\"book.epub\" = 0.5\n",
+        )
+        .unwrap();
+        let prefs = Store::open(&path).prefs;
+        assert_eq!(prefs.dashboard, Some(Dashboard::Clock));
+        assert_eq!(prefs.font.px(), 28);
+        assert_eq!(prefs.positions.get("book.epub"), Some(&Progress(0.5)));
     }
 }

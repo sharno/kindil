@@ -81,6 +81,8 @@ impl Fixture {
             books,
             miqat_config,
             prefs: dir.path().join("prefs.toml"),
+            // Absent until Settings → Location writes the clock's zone.
+            path: dir.path().join("kindil.toml"),
             ..Config::parse("dashboard = \"clock\"").unwrap()
         };
         let window = preview::install().unwrap();
@@ -422,6 +424,219 @@ fn prayer_times_choices_are_written_into_miqats_file() {
 }
 
 #[test]
+fn a_searched_city_is_saved_only_once_confirmed() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    let miqat = f.dir.path().join("miqat.toml");
+    let kindil = f.dir.path().join("kindil.toml");
+    let original = std::fs::read_to_string(&miqat).unwrap();
+    f.tap(SETTINGS_TAB, TAB_Y);
+    assert_eq!(f.k().get_location_title(), "52.37, 4.90");
+    assert_eq!(f.k().get_location_zone(), "Europe/Amsterdam");
+    f.tap(380.0, 384.0); // Location row
+    assert_eq!(f.k().get_page(), Page::Location);
+    assert_eq!(host.lookups(), 0, "nothing is looked up until asked");
+
+    f.k().invoke_go(Page::PlaceSearch);
+    f.k().invoke_search_places("Mecca".into());
+    assert_eq!(f.k().get_places().row_count(), 1);
+    let mecca = f.k().get_places().row_data(0).unwrap();
+    assert_eq!(mecca.title, "Mecca, Saudi Arabia");
+    assert_eq!(mecca.detail, "Asia/Riyadh · 21.43, 39.83");
+    assert_eq!(f.k().get_location_status(), "1 place. Tap it to use it.");
+    f.tap(380.0, 300.0); // the result
+    assert!(f.k().get_confirm_open());
+    assert_eq!(
+        f.k().get_confirm_place(),
+        "Mecca, Saudi Arabia · Asia/Riyadh"
+    );
+    assert_eq!(f.k().get_confirm_note(), "");
+    assert_eq!(std::fs::read_to_string(&miqat).unwrap(), original);
+    assert!(!kindil.exists(), "nothing written before Save");
+
+    // Cancel keeps everything as it was.
+    f.k().invoke_cancel_location();
+    assert!(!f.k().get_confirm_open());
+    f.k().invoke_save_location();
+    assert_eq!(std::fs::read_to_string(&miqat).unwrap(), original);
+
+    let utc_clock = f.k().get_clock();
+    f.k().invoke_choose_place(0);
+    f.k().invoke_save_location();
+    assert!(!f.k().get_confirm_open());
+    assert_eq!(f.k().get_page(), Page::Location);
+    assert_eq!(f.k().get_location_title(), "Mecca, Saudi Arabia");
+    assert_eq!(f.k().get_location_zone(), "Asia/Riyadh");
+    assert_eq!(f.k().get_notice(), "Location saved: Mecca, Saudi Arabia");
+    let saved = std::fs::read_to_string(&miqat).unwrap();
+    assert_eq!(
+        saved,
+        original
+            .replace("latitude = 52.3676", "latitude = 21.4266")
+            .replace("longitude = 4.9041", "longitude = 39.8256")
+            .replace(
+                "timezone = \"Europe/Amsterdam\"   # IANA name",
+                "timezone = \"Asia/Riyadh\"   # IANA name"
+            ),
+        "only [location] changes; comments and other keys stay"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&kindil).unwrap(),
+        "timezone = \"Asia/Riyadh\"\n"
+    );
+    // The clock follows at once: Riyadh is three hours ahead of UTC.
+    assert_ne!(f.k().get_clock(), utc_clock);
+    let riyadh = chrono::DateTime::from_timestamp(1_794_398_430, 0)
+        .unwrap()
+        .with_timezone(&chrono_tz::Asia::Riyadh)
+        .format("%H:%M")
+        .to_string();
+    assert_eq!(f.k().get_clock(), riyadh);
+    f.k().invoke_go(Page::Settings);
+    assert_eq!(f.k().get_location_title(), "Mecca, Saudi Arabia");
+    // The name has its own file; prefs.toml stays as an older kindil reads it.
+    let prefs = std::fs::read_to_string(f.dir.path().join("prefs.toml")).unwrap();
+    assert!(
+        !prefs.contains("place") && !prefs.contains("Mecca"),
+        "{prefs}"
+    );
+    let place = std::fs::read_to_string(f.dir.path().join("place.toml")).unwrap();
+    assert!(place.contains("name = \"Mecca, Saudi Arabia\""), "{place}");
+    // A hand edit of [location] stops the name showing.
+    let edited = saved.replace("latitude = 21.4266", "latitude = 21.5");
+    std::fs::write(&miqat, edited).unwrap();
+    f.k().invoke_go(Page::Settings);
+    assert_eq!(f.k().get_location_title(), "21.50, 39.83");
+}
+
+#[test]
+fn the_internet_address_is_asked_only_on_a_tap_and_confirmed() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    let kindil = f.dir.path().join("kindil.toml");
+    let comments = "# kindil settings.\ndashboard = \"clock\"   # first run\n";
+    std::fs::write(&kindil, comments).unwrap();
+    f.k().invoke_go(Page::Settings);
+    f.k().invoke_go(Page::Location);
+    assert_eq!(host.lookups(), 0);
+    f.tap(380.0, 520.0); // Use my approximate location
+    assert_eq!(host.lookups(), 1);
+    assert!(f.k().get_confirm_open());
+    assert_eq!(
+        f.k().get_confirm_place(),
+        "Amsterdam, North Holland, NL · Europe/Amsterdam"
+    );
+    assert_eq!(f.k().get_confirm_note(), kindil::ui::IP_NOTE);
+    assert!(f.k().get_confirm_note().contains("VPN"));
+    assert_eq!(std::fs::read_to_string(&kindil).unwrap(), comments);
+    f.tap(570.0, 960.0); // Save
+    assert!(!f.k().get_confirm_open());
+    assert_eq!(f.k().get_location_title(), "Amsterdam, North Holland, NL");
+    assert_eq!(
+        std::fs::read_to_string(&kindil).unwrap(),
+        format!("{comments}timezone = \"Europe/Amsterdam\"\n")
+    );
+    assert_eq!(host.lookups(), 1, "and never again by itself");
+}
+
+#[test]
+fn typed_coordinates_are_checked_then_saved() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    let miqat = f.dir.path().join("miqat.toml");
+    let original = std::fs::read_to_string(&miqat).unwrap();
+    f.k().invoke_go(Page::Settings);
+    f.k().invoke_go(Page::Coordinates);
+    assert_eq!(
+        f.k().get_typed_zone(),
+        "Europe/Amsterdam",
+        "starts from the zone in use"
+    );
+    f.k()
+        .invoke_enter_coordinates("89".into(), "0".into(), "UTC".into());
+    assert_eq!(
+        f.k().get_location_status(),
+        "Latitude must be between -85 and 85"
+    );
+    assert!(!f.k().get_confirm_open());
+    f.k()
+        .invoke_enter_coordinates("40.7".into(), "-74".into(), "New Yrok".into());
+    assert!(f.k().get_location_status().contains("Unknown time zone"));
+    f.k().invoke_filter_zones("new york".into());
+    let matches: Vec<String> = f.k().get_zone_matches().iter().map(String::from).collect();
+    assert_eq!(matches, ["America/New_York"]);
+    f.k().invoke_filter_zones("America/New_York".into());
+    assert_eq!(
+        f.k().get_zone_matches().row_count(),
+        0,
+        "an exact zone needs no list"
+    );
+    assert_eq!(std::fs::read_to_string(&miqat).unwrap(), original);
+
+    f.k().invoke_enter_coordinates(
+        "40.7128".into(),
+        "-74.006".into(),
+        "America/New_York".into(),
+    );
+    assert_eq!(f.k().get_location_status(), "");
+    assert_eq!(
+        f.k().get_confirm_place(),
+        "40.71, -74.01 · America/New_York"
+    );
+    f.k().invoke_save_location();
+    assert_eq!(f.k().get_location_title(), "40.71, -74.01");
+    let config = miqat::config::Config::load(&miqat).unwrap();
+    assert_eq!(config.location.latitude.degrees(), 40.7128);
+    assert_eq!(config.location.timezone, chrono_tz::America::New_York);
+}
+
+#[test]
+fn location_errors_are_shown_and_nothing_is_written() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    let miqat = f.dir.path().join("miqat.toml");
+    let kindil = f.dir.path().join("kindil.toml");
+    f.k().invoke_go(Page::PlaceSearch);
+    f.k().invoke_search_places("Qq".into());
+    assert!(f
+        .k()
+        .get_location_status()
+        .starts_with("No places found for “Qq”"));
+    assert_eq!(f.k().get_places().row_count(), 0);
+    f.k().invoke_search_places(" a ".into());
+    assert_eq!(
+        f.k().get_location_status(),
+        "Type at least two letters of the name."
+    );
+
+    host.set_online(false);
+    f.k().invoke_search_places("Amsterdam".into());
+    assert!(f.k().get_location_status().starts_with("Search failed: "));
+    assert!(!f.k().get_location_busy());
+    f.k().invoke_go(Page::Location);
+    f.k().invoke_locate_by_ip();
+    assert!(f
+        .k()
+        .get_location_status()
+        .starts_with("Couldn't find your location: "));
+    assert!(!f.k().get_confirm_open());
+
+    // A file that breaks between the question and Save is left alone.
+    host.set_online(true);
+    f.k().invoke_locate_by_ip();
+    let broken = std::fs::read_to_string(&miqat)
+        .unwrap()
+        .replace("[radar]", "[radar");
+    std::fs::write(&miqat, &broken).unwrap();
+    f.k().invoke_save_location();
+    assert!(f.k().get_location_status().starts_with("Not saved: "));
+    assert!(!f.k().get_confirm_open());
+    assert_eq!(std::fs::read_to_string(&miqat).unwrap(), broken);
+    assert!(!kindil.exists());
+    f.k().invoke_go(Page::Settings);
+    assert!(f.k().get_location_error().contains("miqat.toml"));
+}
+
+#[test]
 fn settings_switch_the_simulated_device() {
     let f = Fixture::new(Arc::new(Simulated::default()));
     f.tap(SETTINGS_TAB, TAB_Y);
@@ -437,7 +652,7 @@ fn settings_switch_the_simulated_device() {
     assert!((f.k().get_brightness() - 70).abs() <= SLACK);
     f.tap(40.0, 112.0); // back
     assert_eq!(f.k().get_page(), Page::Settings);
-    f.tap(380.0, 500.0); // Remote access row
+    f.tap(380.0, 570.0); // Remote access row
     assert_eq!(f.k().get_page(), Page::Remote);
     assert_eq!(f.k().get_ssh(), Switch::On);
     f.tap(380.0, 210.0); // SSH server row
@@ -721,6 +936,12 @@ impl Host for Recording {
     fn commit_update(&self) -> anyhow::Result<kindil::update::Commit> {
         self.device.commit_update()
     }
+    fn search_places(&self, name: &str) -> anyhow::Result<Vec<kindil::location::Place>> {
+        self.device.search_places(name)
+    }
+    fn locate_by_ip(&self) -> anyhow::Result<kindil::location::Place> {
+        self.device.locate_by_ip()
+    }
 }
 
 #[test]
@@ -728,7 +949,7 @@ fn join_a_network_and_type_arabic() {
     let host = Arc::new(Recording::default());
     let f = Fixture::new(host.clone());
     f.tap(SETTINGS_TAB, TAB_Y);
-    f.tap(380.0, 400.0); // Wi-Fi row
+    f.tap(380.0, 480.0); // Wi-Fi row
     assert_eq!(f.k().get_page(), Page::Wifi);
     f.tap(380.0, 300.0); // Choose a network
     assert_eq!(f.k().get_page(), Page::Networks);
@@ -787,7 +1008,7 @@ fn a_joined_network_is_saved_and_can_be_forgotten() {
         .invoke_join_network("Home".into(), "correct horse".into());
     f.app.refresh_now();
     f.tap(SETTINGS_TAB, TAB_Y);
-    f.tap(380.0, 400.0); // Wi-Fi row
+    f.tap(380.0, 480.0); // Wi-Fi row
     assert_eq!(f.k().get_page(), Page::Wifi);
     let saved: Vec<String> = f
         .k()

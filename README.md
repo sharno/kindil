@@ -39,6 +39,12 @@ and a reboot always returns the Kindle to stock.
     a mosque's timetable (the one page that scrolls: twelve methods). The
     choice is written into `miqat.toml`'s `[prayer]` in place, comments and
     all, and the dashboard redraws with it.
+  - **Location**: search for a city (Open-Meteo's geocoder), use the
+    approximate location of the internet address (ipinfo.io, only when
+    tapped), or type coordinates and a time zone. Each asks before saving,
+    then writes `miqat.toml`'s `[location]` and `kindil.toml`'s `timezone`
+    in place (creating `kindil.toml` if needed): the clock follows at once,
+    and the dashboard fetches weather and radar for the new place.
   - **Wi-Fi**: on/off with network status, scan and join, and the saved
     networks, each with Forget.
   - **Remote access**: SSH server and SSH-at-boot switches, Syncthing.
@@ -334,6 +340,7 @@ someone nearby to press the power button, or must end on their own first.
 | `system.rs` | Sleep, wake and USB drive mode as a state machine |
 | `drive.rs`, `usb.rs` | USB drive mode run by kindil: the state machine and sequences, and the device under them |
 | `reader.rs`, `files.rs`, `prefs.rs` | Books, Trash, persisted choices |
+| `location.rs` | Settings → Location: city search, IP lookup, typed coordinates, written into `miqat.toml` and `kindil.toml` |
 | `prayer.rs` | Settings → Prayer times: the methods and Asr schools with today's times, edited into `miqat.toml` |
 | `ghosting.rs` | When to flash the panel |
 | `launcher.rs` | Writes out the launcher kindil carries, once it has run two minutes |

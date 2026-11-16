@@ -14,6 +14,7 @@ pub mod install;
 pub mod kindle;
 pub mod launcher;
 pub mod lifeline;
+pub mod location;
 pub mod net;
 pub mod networks;
 pub mod perms;

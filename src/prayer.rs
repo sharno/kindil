@@ -262,6 +262,12 @@ pub fn edit(text: &str, setting: Setting) -> anyhow::Result<String> {
 }
 
 fn replace(path: &Path, text: &str) -> std::io::Result<()> {
+    let temp = stage(path, text)?;
+    std::fs::rename(&temp, path)
+}
+
+/// Writes `text` beside `path`, on the card, for a rename over it.
+pub(crate) fn stage(path: &Path, text: &str) -> std::io::Result<std::path::PathBuf> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let temp = path.with_extension("toml.tmp");
@@ -274,8 +280,7 @@ fn replace(path: &Path, text: &str) -> std::io::Result<()> {
     file.write_all(text.as_bytes())?;
     // FAT has no journal: the bytes are on the card before the rename.
     file.sync_all()?;
-    drop(file);
-    std::fs::rename(&temp, path)
+    Ok(temp)
 }
 
 #[cfg(test)]
