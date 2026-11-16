@@ -1,3 +1,0 @@
-[submodule "crates/miqat"]
-	path = crates/miqat
-	url = https://github.com/sharno/miqat.git
