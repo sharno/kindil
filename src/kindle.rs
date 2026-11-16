@@ -182,6 +182,15 @@ impl Host for KindleHost {
         }
     }
 
+    fn ssh_sessions(&self) -> Vec<crate::maintenance::Session> {
+        use crate::maintenance::{sessions, SSH_PORTS, TCP_TABLES};
+        TCP_TABLES
+            .iter()
+            .filter_map(|table| std::fs::read_to_string(table).ok())
+            .flat_map(|table| sessions(&table, &SSH_PORTS))
+            .collect()
+    }
+
     fn scan(&self) -> anyhow::Result<Vec<Network>> {
         self.net.scan()
     }

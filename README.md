@@ -70,10 +70,20 @@ and a reboot always returns the Kindle to stock.
     multiples of 5, when the weather on screen moves on), when the day or
     the next prayer changes, after a fetch, and whenever the device is
     woken. Every 30 minutes it also rejoins Wi-Fi to fetch the weather;
-    between those fetches wpa_supplicant stays off the network. Once an hour
-    it logs a doze ledger: awake and asleep seconds, wakes (ticks and full
-    redraws apart, with the seconds each), Wi-Fi-up seconds, how redraws
-    ended, and the gauge. The power button brings it back with the light
+    between those fetches wpa_supplicant stays off the network. A dozing
+    Kindle is reachable over SSH for 2 minutes every 2 hours, and for as
+    long as an SSH session stays open: every 2 hours (counted from the
+    doze's start, whose 2 idle minutes were the first) the weather fetch's
+    Wi-Fi stays up and the device stays awake for 2 minutes once the
+    fetched frame is on the panel, redrawing each minute without
+    suspending. While a connection to either SSH server (port 22 or 2222)
+    is established in `/proc/net/tcp` or `tcp6`, checked every 5 seconds,
+    it doesn't nap either, and naps once the last one closes; each session
+    holds it at most 30 minutes, so a stuck one can't drain the battery.
+    Once an hour it logs a doze ledger: awake and asleep seconds, wakes
+    (ticks and full redraws apart, with the seconds each), Wi-Fi-up
+    seconds, seconds held awake (maintenance windows, and SSH), how
+    redraws ended, and the gauge. The power button brings it back with the light
     restored, and Wi-Fi rejoins.
   - **Wi-Fi of its own**: kindil runs Wi-Fi itself with the networks joined
     in it, saved in `/var/local/kindil/networks.toml` (plain text, readable
@@ -354,6 +364,7 @@ someone nearby to press the power button, or must end on their own first.
 | `drive.rs`, `usb.rs` | USB drive mode run by kindil: the state machine and sequences, and the device under them |
 | `reader.rs`, `files.rs`, `prefs.rs` | Books, Trash, persisted choices |
 | `location.rs` | Settings → Location: city search, IP lookup, typed coordinates, written into `miqat.toml` and `kindil.toml` |
+| `maintenance.rs` | Doze's maintenance window every 2 hours, and staying awake while an SSH session is open (`/proc/net/tcp`) |
 | `prayer.rs` | Settings → Prayer times: the methods and Asr schools with today's times, edited into `miqat.toml` |
 | `ghosting.rs` | When to flash the panel |
 | `launcher.rs` | Writes out the launcher kindil carries, once it has run two minutes |
