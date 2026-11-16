@@ -9,6 +9,7 @@
 //! to run. The UI runs the effects.
 use crate::battery::{Battery, Charge};
 use crate::host::Brightness;
+use crate::maintenance::Hold;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -471,9 +472,15 @@ pub struct DozeLedger {
     settles: [u32; 3],
     /// The gauge's current at each wake, in mA: (sum, count).
     current: (i64, u32),
+    /// Maintenance windows opened, and the time held awake instead of
+    /// napping (not counted as wakes' time): in all, and for SSH sessions.
+    windows: u32,
+    held: chrono::TimeDelta,
+    ssh_held: chrono::TimeDelta,
     awake_from: Option<DateTime<Utc>>,
     napping_from: Option<(DateTime<Utc>, Instant)>,
     wifi_from: Option<DateTime<Utc>>,
+    held_from: Option<(DateTime<Utc>, Hold)>,
 }
 
 impl DozeLedger {
@@ -492,9 +499,13 @@ impl DozeLedger {
             wifi_up: chrono::TimeDelta::zero(),
             settles: [0; 3],
             current: (0, 0),
+            windows: 0,
+            held: chrono::TimeDelta::zero(),
+            ssh_held: chrono::TimeDelta::zero(),
             awake_from: None,
             napping_from: None,
             wifi_from: None,
+            held_from: None,
         }
     }
 
@@ -509,6 +520,7 @@ impl DozeLedger {
             self.slept += now - wall;
             self.slept_monotonic += monotonic.saturating_duration_since(mono);
         }
+        self.end_hold(now);
         self.wakes += 1;
         if window == Window::Online {
             self.online += 1;
@@ -531,6 +543,25 @@ impl DozeLedger {
 
     /// About to nap.
     pub fn napping(&mut self, now: DateTime<Utc>, monotonic: Instant) {
+        self.wake_ended(now);
+        self.end_hold(now);
+        self.napping_from = Some((now, monotonic));
+    }
+
+    /// Staying awake instead of napping, from `now` and for this reason
+    /// (until the next call, a wake or a nap).
+    pub fn holding(&mut self, now: DateTime<Utc>, hold: Hold) {
+        self.wake_ended(now);
+        self.end_hold(now);
+        self.held_from = Some((now, hold));
+    }
+
+    /// A maintenance window opens.
+    pub fn window_opened(&mut self) {
+        self.windows += 1;
+    }
+
+    fn wake_ended(&mut self, now: DateTime<Utc>) {
         if let Some(from) = self.awake_from.take() {
             self.awake += now - from;
             if self.redraw == Some(Redraw::Tick) {
@@ -538,7 +569,15 @@ impl DozeLedger {
             }
         }
         self.redraw = None;
-        self.napping_from = Some((now, monotonic));
+    }
+
+    fn end_hold(&mut self, now: DateTime<Utc>) {
+        if let Some((from, hold)) = self.held_from.take() {
+            self.held += now - from;
+            if hold == Hold::Ssh {
+                self.ssh_held += now - from;
+            }
+        }
     }
 
     pub fn wifi_on(&mut self, now: DateTime<Utc>) {
@@ -589,6 +628,8 @@ impl DozeLedger {
         if let Some(from) = self.wifi_from {
             self.wifi_up += now - from;
         }
+        let held_from = self.held_from;
+        self.end_hold(now);
         let over = now - self.since;
         let seconds = |d: chrono::TimeDelta| d.num_milliseconds() as f64 / 1000.0;
         let each = |time: chrono::TimeDelta, wakes: u32| match wakes {
@@ -615,8 +656,8 @@ impl DozeLedger {
         let line = format!(
             "doze ledger over {} min: awake {:.0} s in {} wakes ({:.1} s each, {} online; \
              {} ticks {:.2} s each, {} full {:.2} s each), asleep {:.0} s (monotonic {} s), \
-             Wi-Fi up {:.0} s, panel done {} / timed {} / not seen {}, gauge {used}, \
-             current at wake {current}",
+             Wi-Fi up {:.0} s, held awake {:.0} s ({} maintenance windows, {:.0} s for SSH), \
+             panel done {} / timed {} / not seen {}, gauge {used}, current at wake {current}",
             over.num_minutes(),
             seconds(self.awake),
             self.wakes,
@@ -629,6 +670,9 @@ impl DozeLedger {
             seconds(self.slept),
             self.slept_monotonic.as_secs(),
             seconds(self.wifi_up),
+            seconds(self.held),
+            self.windows,
+            seconds(self.ssh_held),
             self.settles[0],
             self.settles[1],
             self.settles[2],
@@ -644,6 +688,7 @@ impl DozeLedger {
         self.redraw = redraw;
         self.napping_from = napping_from;
         self.wifi_from = wifi_from.map(|_| now);
+        self.held_from = held_from.map(|(_, hold)| (now, hold));
         line
     }
 }
@@ -1030,13 +1075,51 @@ mod tests {
             line,
             "doze ledger over 60 min: awake 28 s in 4 wakes (6.9 s each, 1 online; \
              1 ticks 0.50 s each, 3 full 9.00 s each), asleep 274 s (monotonic 4 s), \
-             Wi-Fi up 20 s, panel done 1 / timed 1 / not seen 0, gauge 10 mAh (10 mA), \
+             Wi-Fi up 20 s, held awake 0 s (0 maintenance windows, 0 s for SSH), \
+             panel done 1 / timed 1 / not seen 0, gauge 10 mAh (10 mA), \
              490 mAh left, current at wake -5 mA"
         );
         // The next hour counts from the last gauge reading.
         let line = ledger.close(t0 + secs(7200), None);
         assert!(line.contains("awake 0 s in 0 wakes"), "{line}");
         assert!(line.ends_with("no gauge, current at wake none"), "{line}");
+    }
+
+    #[test]
+    fn the_ledger_accounts_maintenance_windows_and_ssh_holds() {
+        let t0 = wall(1, 0, 0);
+        let i0 = Instant::now();
+        let secs = |s: i64| t0 + chrono::TimeDelta::seconds(s);
+        let mut ledger = DozeLedger::new(t0, None);
+        // An online wake of 20 s opens a window: held to the next minute.
+        ledger.woke(secs(1), i0, Window::Online, Redraw::Full);
+        ledger.window_opened();
+        ledger.holding(secs(21), Hold::Window);
+        ledger.woke(secs(61), i0, Window::Draw, Redraw::Tick);
+        ledger.holding(secs(62), Hold::Window);
+        // The window closes with a session open: held for SSH from 141 s.
+        ledger.holding(secs(141), Hold::Ssh);
+        ledger.woke(secs(181), i0, Window::Draw, Redraw::Tick);
+        ledger.holding(secs(182), Hold::Ssh);
+        ledger.napping(secs(192), i0);
+        // Held over the close: counted up to it, and from it in the next.
+        ledger.woke(secs(241), i0, Window::Draw, Redraw::Full);
+        ledger.holding(secs(250), Hold::Ssh);
+        let line = ledger.close(secs(260), None);
+        assert!(
+            line.contains("awake 31 s in 4 wakes (7.8 s each, 1 online; 2 ticks 1.00 s each"),
+            "{line}"
+        );
+        assert!(
+            line.contains("held awake 179 s (1 maintenance windows, 60 s for SSH)"),
+            "{line}"
+        );
+        ledger.napping(secs(270), i0);
+        let line = ledger.close(secs(300), None);
+        assert!(
+            line.contains("held awake 10 s (0 maintenance windows, 10 s for SSH)"),
+            "{line}"
+        );
     }
 
     #[test]

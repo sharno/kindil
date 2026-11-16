@@ -9,13 +9,14 @@ use crate::files::{FileName, Files, Trashed};
 use crate::ghosting::{Ghosting, Refresh, Update};
 use crate::host::{BootStart, Brightness, DeviceInfo, Host, OwnSsh, Power, Ssh, SshKey, Wifi};
 use crate::location::{self, Place};
+use crate::maintenance::{Hold, Maintenance, HOLD_CHECK};
 use crate::prayer::{self, Setting};
 use crate::prefs::Store;
 use crate::reader::{self, Book, Layout, Reader};
 use crate::sync::Service;
 use crate::system::{
-    AutoSleep, DozeLedger, Effect, Event as DeviceEvent, Idle, Mode, Redraw, Settle, Step, Touches,
-    Window, DRIVE_SETTLE, MIN_NAP, PANEL_SETTLE, PANEL_UPDATE,
+    AutoSleep, Doze, DozeLedger, Effect, Event as DeviceEvent, Idle, Mode, Redraw, Settle, Step,
+    Touches, Window, DRIVE_SETTLE, MIN_NAP, PANEL_SETTLE, PANEL_UPDATE,
 };
 use crate::update::{self, Check, Release, Updates, Version};
 use crate::view;
@@ -273,6 +274,14 @@ struct State {
     online: Option<DateTime<Utc>>,
     /// When this doze last redrew in full ([`Redraw`]).
     full: Option<DateTime<Utc>>,
+    /// This doze's maintenance windows and SSH sessions.
+    maintenance: Maintenance,
+    /// Why the last nap was held off, if it was.
+    held: Option<Hold>,
+    /// Counts naps, so a hold's timer knows its nap is still the one under way.
+    naps: u64,
+    /// A nap parked Wi-Fi, and nothing has brought it back since.
+    wifi_parked: bool,
 }
 
 /// A poisoned lock still holds the last value written, which is all kindil needs.
@@ -466,6 +475,10 @@ impl App {
                 idle: Idle::new(options.touches.count(), Instant::now()),
                 online: None,
                 full: None,
+                maintenance: Maintenance::new((options.now)()),
+                held: None,
+                naps: 0,
+                wifi_parked: false,
             })),
             display: Display {
                 panel: options.panel,
@@ -1358,8 +1371,15 @@ impl Ctx {
         let now = (self.now)();
         match (was, is) {
             (false, true) => {
-                // The first wake draws in full.
-                self.state.borrow_mut().full = None;
+                {
+                    let mut state = self.state.borrow_mut();
+                    // The first wake draws in full.
+                    state.full = None;
+                    // The minutes awake before dozing were a maintenance window.
+                    state.maintenance = Maintenance::new(now);
+                    state.held = None;
+                    state.wifi_parked = false;
+                }
                 let mut ledger = DozeLedger::new(now, None);
                 // Wi-Fi is up until the first nap parks it.
                 ledger.wifi_on(now);
@@ -1435,6 +1455,7 @@ impl Ctx {
     /// Brings Wi-Fi back after a suspend or a parked doze; `then` runs on
     /// the UI thread with the outcome.
     fn reconnect_wifi(&self, then: impl FnOnce(Result<(), ()>) + Send + 'static) {
+        self.state.borrow_mut().wifi_parked = false;
         self.background(
             |host| host.reconnect_wifi(),
             move |_, result| {
@@ -1450,7 +1471,7 @@ impl Ctx {
         let now = (self.now)();
         let dashboard = matches!(self.state.borrow().miqat, Worker::Started(_));
         // Every half hour of wall time: the battery's draw, and the weather.
-        let (half_hour, window, redraw) = {
+        let (half_hour, window, redraw, opens, parked) = {
             let mut state = self.state.borrow_mut();
             let last = state.online;
             let half_hour = Window::after_nap(last, now, true) == Window::Online;
@@ -1465,7 +1486,9 @@ impl Ctx {
             if redraw == Redraw::Full {
                 state.full = Some(now);
             }
-            (half_hour, window, redraw)
+            // Every two hours the fetch's radio stays up a while.
+            let opens = window == Window::Online && state.maintenance.online_wake(now);
+            (half_hour, window, redraw, opens, state.wifi_parked)
         };
         // Before the redraw starts: this wake, and the panel frames drawn so
         // far; its dashboard frame is tagged with the wake.
@@ -1474,6 +1497,9 @@ impl Ctx {
         let due = {
             let mut ledger = lock(&self.ledger);
             ledger.woke(now, Instant::now(), window, redraw);
+            if opens {
+                ledger.window_opened();
+            }
             ledger.due(now)
         };
         if due {
@@ -1496,7 +1522,7 @@ impl Ctx {
                 self.tick_miqat(Tick::Minute(None));
                 lock(&self.ledger).wifi_on(now);
                 let ticks = self.miqat_ticks();
-                self.reconnect_wifi(move |result| {
+                let fetch = move |result: Result<(), ()>| {
                     // Without Wi-Fi a fetch only fails: draw, and nap.
                     if let Some(ticks) = ticks {
                         let _ = ticks.send(match result {
@@ -1504,7 +1530,14 @@ impl Ctx {
                             Err(()) => Tick::Draw(Some(wake)),
                         });
                     }
-                });
+                };
+                // Held awake since the last fetch, Wi-Fi never left: joining
+                // again would only drop an SSH session.
+                if parked {
+                    self.reconnect_wifi(fetch);
+                } else {
+                    fetch(Ok(()));
+                }
             }
         }
         self.settle_wake(wake, window, dashboard, drawn);
@@ -1565,30 +1598,13 @@ impl Ctx {
             Effect::Nap => {
                 let now = (self.now)();
                 // On the redraw's minute, plus a second so the clock has turned.
-                let nap = (crate::system::next_redraw(now) - now)
-                    .to_std()
-                    .unwrap_or_default()
-                    + Duration::from_secs(1);
-                {
-                    let mut ledger = lock(&self.ledger);
-                    ledger.napping(now, Instant::now());
-                }
-                if nap < MIN_NAP {
-                    self.after(nap, DeviceEvent::Resumed);
-                } else {
-                    lock(&self.ledger).wifi_off(now);
-                    self.device_later(move |host| {
-                        // Down until a fetch is due: nothing joins after the resume.
-                        host.park_wifi();
-                        match host.nap(nap) {
-                            Ok(()) => DeviceEvent::Resumed,
-                            Err(error) => {
-                                eprintln!("kindil: nap: {error}");
-                                DeviceEvent::SuspendFailed
-                            }
-                        }
-                    });
-                }
+                let until = crate::system::next_redraw(now) + chrono::TimeDelta::seconds(1);
+                let nap = {
+                    let mut state = self.state.borrow_mut();
+                    state.naps += 1;
+                    state.naps
+                };
+                self.nap_or_hold(now, until, nap);
             }
             Effect::Redraw => self.redraw_doze(),
             Effect::Rouse => {
@@ -1686,6 +1702,73 @@ impl Ctx {
                 eprintln!(
                     "kindil: doze redraw not seen on the panel; napping at the {ceiling:?} ceiling"
                 );
+            }
+        });
+    }
+
+    /// Naps until `until` (the next minute), unless a maintenance window or
+    /// an SSH session holds the device awake: then Wi-Fi stays up, the
+    /// sessions are looked at every [`HOLD_CHECK`], and the minute's wake
+    /// comes without a suspend. `nap` is the nap under way; a hold's timer
+    /// stops once another nap, or the end of the doze, has replaced it.
+    fn nap_or_hold(&self, now: DateTime<Utc>, until: DateTime<Utc>, nap: u64) {
+        let sessions = self.host.ssh_sessions();
+        let (hold, was) = {
+            let mut state = self.state.borrow_mut();
+            let hold = state.maintenance.hold(now, &sessions);
+            (hold, std::mem::replace(&mut state.held, hold))
+        };
+        if hold != was {
+            eprintln!(
+                "kindil: doze: {}",
+                match hold {
+                    Some(Hold::Window) => "maintenance window: awake and online for a while",
+                    Some(Hold::Ssh) => "staying awake while an SSH session is open",
+                    None => "napping again",
+                }
+            );
+        }
+        let left = (until - now).to_std().unwrap_or_default();
+        let Some(hold) = hold else {
+            return self.nap(now, left);
+        };
+        lock(&self.ledger).holding(now, hold);
+        let Execution::Background = self.execution else {
+            return self.after(left, DeviceEvent::Resumed);
+        };
+        let last = left <= HOLD_CHECK;
+        let ctx = self.clone();
+        slint::Timer::single_shot(left.min(HOLD_CHECK), move || {
+            let current = {
+                let state = ctx.state.borrow();
+                state.naps == nap && matches!(state.system, Mode::Dozing(Doze::Napping { .. }))
+            };
+            match (current, last) {
+                (false, _) => {}
+                (true, true) => ctx.device(DeviceEvent::Resumed),
+                (true, false) => ctx.nap_or_hold((ctx.now)(), until, nap),
+            }
+        });
+    }
+
+    /// Suspends for `left`, Wi-Fi parked; a nap too short to be worth it
+    /// waits awake instead.
+    fn nap(&self, now: DateTime<Utc>, left: Duration) {
+        lock(&self.ledger).napping(now, Instant::now());
+        if left < MIN_NAP {
+            return self.after(left, DeviceEvent::Resumed);
+        }
+        lock(&self.ledger).wifi_off(now);
+        self.state.borrow_mut().wifi_parked = true;
+        self.device_later(move |host| {
+            // Down until a fetch is due: nothing joins after the resume.
+            host.park_wifi();
+            match host.nap(left) {
+                Ok(()) => DeviceEvent::Resumed,
+                Err(error) => {
+                    eprintln!("kindil: nap: {error}");
+                    DeviceEvent::SuspendFailed
+                }
             }
         });
     }

@@ -4,6 +4,7 @@ use kindil::battery::{Battery, Charge};
 use kindil::config::Config;
 use kindil::drain::MilliampHours;
 use kindil::host::{Host, Simulated};
+use kindil::maintenance::Session;
 use kindil::preview::{self, drag, pixels, tap};
 use kindil::system::{Drive, Event, Touches};
 use kindil::ui::{
@@ -926,6 +927,25 @@ fn dozing_on_battery_measures_its_draw_each_online_window() {
     host.set_charge(MilliampHours(620));
     f.app.fire_timers();
     assert_eq!(f.k().get_doze_draw(), "6 mA · 4 days left");
+}
+
+#[test]
+fn an_open_ssh_session_keeps_a_dozing_kindil_awake_until_it_closes() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    host.set_ssh_sessions(vec![Session {
+        local_port: 2222,
+        remote: "192.168.1.5:50001".parse().unwrap(),
+    }]);
+    f.app.device_event(Event::Doze);
+    // Rounds alternate: the minute's wake, without a nap, and its redraw.
+    (0..4).for_each(|_| f.app.fire_timers());
+    assert_eq!(host.naps(), 0, "held awake");
+    assert!(!host.parked(), "Wi-Fi stays up");
+    host.set_ssh_sessions(Vec::new());
+    f.app.fire_timers();
+    assert_eq!(host.naps(), 1, "closed: napping again");
+    assert!(host.parked());
 }
 
 #[test]

@@ -188,6 +188,11 @@ pub trait Host: Send + Sync {
     /// Before a suspend: leaves the network, so nothing joins it again on
     /// each resume; [`Host::reconnect_wifi`] brings it back. Quick.
     fn park_wifi(&self) {}
+    /// The SSH sessions open on the device, to either server. Quick: reads
+    /// the kernel's TCP tables.
+    fn ssh_sessions(&self) -> Vec<crate::maintenance::Session> {
+        Vec::new()
+    }
     /// Blocks for a few seconds: call from a worker thread.
     fn scan(&self) -> anyhow::Result<Vec<Network>>;
     /// Joins for this session only; nothing is written to Amazon's Wi-Fi profiles.
@@ -258,6 +263,7 @@ struct SimulatedState {
     /// Off: place lookups fail as without a network.
     online: bool,
     lookups: u32,
+    ssh_sessions: Vec<crate::maintenance::Session>,
 }
 
 /// The Simulated device's place search: well-known public places.
@@ -344,6 +350,7 @@ impl Default for Simulated {
                 boot_start: BootStart::Installed(Boot::Off),
                 online: true,
                 lookups: 0,
+                ssh_sessions: Vec::new(),
             }),
         }
     }
@@ -381,6 +388,11 @@ impl Simulated {
     /// Offline, place lookups fail as without a network.
     pub fn set_online(&self, online: bool) {
         self.with(|s| s.online = online);
+    }
+
+    /// The SSH sessions open from now on.
+    pub fn set_ssh_sessions(&self, sessions: Vec<crate::maintenance::Session>) {
+        self.with(|s| s.ssh_sessions = sessions);
     }
 
     /// How many times a place service was asked.
@@ -429,6 +441,9 @@ impl Host for Simulated {
     }
     fn park_wifi(&self) {
         self.with(|s| s.parked = true);
+    }
+    fn ssh_sessions(&self) -> Vec<crate::maintenance::Session> {
+        self.with(|s| s.ssh_sessions.clone())
     }
     fn scan(&self) -> anyhow::Result<Vec<Network>> {
         use crate::wifi::Security::{Open, Protected};
