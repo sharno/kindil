@@ -514,7 +514,18 @@ mod tests {
             .find(|candidate| candidate.is_file())
             .expect("sleep on PATH");
         std::fs::copy(found, &sleep).unwrap();
-        let mut stale = Command::new(&sleep).arg("30").spawn().unwrap();
+        // A copy just written can stay open a moment in a child another test
+        // thread forked and hasn't exec'd yet: ETXTBSY meanwhile.
+        let mut tries = 0;
+        let mut stale = loop {
+            match Command::new(&sleep).arg("30").spawn() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 50 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => break result.unwrap(),
+            }
+        };
         let file = dir.path().join("pid");
         write_new(&file, stale.id().to_string().as_bytes(), 0o644).unwrap();
         assert_eq!(process_name(stale.id() as i32).as_deref(), Some(NAME));
