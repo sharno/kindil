@@ -124,6 +124,9 @@ pub struct Net {
     lease_for: Mutex<Option<(u32, String)>>,
     /// The running udhcpc, and since when.
     dhcp: Mutex<Option<(Child, Instant)>>,
+    /// Left the network for a doze or a sleep ([`Net::park`]); a reconnect,
+    /// a start, or new networks join again.
+    parked: AtomicBool,
 }
 
 impl Default for Net {
@@ -142,6 +145,7 @@ impl Default for Net {
             scans: AtomicU64::new(0),
             lease_for: Mutex::new(None),
             dhcp: Mutex::new(None),
+            parked: AtomicBool::new(false),
         }
     }
 }
@@ -238,11 +242,32 @@ impl Net {
         }
     }
 
+    /// Before a suspend: wpa_supplicant leaves the network and stays off it.
+    /// Each resume powers the chip up and loads its firmware again, and
+    /// wpa_supplicant would then scan and join, only to be cut off by the
+    /// next nap a second later. [`Net::reconnect`] joins again when a fetch
+    /// is due. kindil's own Wi-Fi (behind its switch) isn't parked yet: its
+    /// keeper rejoins by itself.
+    pub fn park(self: &Arc<Self>) -> anyhow::Result<()> {
+        let _transition = lock(&self.lifecycle);
+        if self.power() == Power::Off
+            || self.backend() != Backend::Supplicant
+            || self.parked.load(Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        wifi::open(INTERFACE)?.command("DISCONNECT")?;
+        self.parked.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
     /// After a suspend: join again, then renew the address (usually kept).
     /// A supplicant that doesn't answer gets the whole stack started again.
     pub fn reconnect(self: &Arc<Self>) -> anyhow::Result<()> {
         let joins = {
             let _transition = lock(&self.lifecycle);
+            // REASSOCIATE (or a restart) undoes a park's DISCONNECT.
+            self.parked.store(false, Ordering::SeqCst);
             if self.power() == Power::Off {
                 return Ok(());
             }
@@ -304,6 +329,8 @@ impl Net {
 
     fn give(self: &Arc<Self>, saved: &[Credentials]) -> anyhow::Result<()> {
         *lock(&self.saved) = saved.to_vec();
+        // Its REASSOCIATE joins again.
+        self.parked.store(false, Ordering::SeqCst);
         if self.power() == Power::Off {
             return Ok(());
         }
@@ -458,6 +485,7 @@ impl Net {
     /// kindil's whole stack up, with `saved` loaded; On only if it all came up.
     fn start(self: &Arc<Self>, saved: &[Credentials]) -> anyhow::Result<()> {
         self.stop();
+        self.parked.store(false, Ordering::SeqCst);
         // From a clean slate, whoever left what behind: a wifid, Amazon's
         // supplicant or a stray one holding the control socket would fight
         // kindil's own.
@@ -551,11 +579,15 @@ impl Net {
                     (pause * 2).min(PAUSE_MAX)
                 };
                 eprintln!("kindil: {name} exited ({status:?}); starting it again in {pause:?}");
+                let mut gone = Gone::default();
                 loop {
                     std::thread::sleep(pause);
                     let _transition = lock(&net.lifecycle);
                     if !wanted(&net) {
                         return;
+                    }
+                    if gone.waits(name, interface_present()) {
+                        continue;
                     }
                     match spawn(&net) {
                         Ok(next) => {
@@ -605,11 +637,15 @@ impl Net {
                     (pause * 2).min(PAUSE_MAX)
                 };
                 eprintln!("kindil: udhcpc exited ({status}); starting it again in {pause:?}");
+                let mut gone = Gone::default();
                 loop {
                     std::thread::sleep(pause);
                     let _transition = lock(&net.lifecycle);
                     if !wanted(&net) {
                         return;
+                    }
+                    if gone.waits("udhcpc", interface_present()) {
+                        continue;
                     }
                     let mut slot = lock(&net.dhcp);
                     // Replaced meanwhile by kindil's own Wi-Fi.
@@ -1097,6 +1133,42 @@ pub fn network_id(reply: &str, ssid: &str) -> Option<u32> {
     })
 }
 
+/// Whether the Wi-Fi interface exists: a child started without it exits at
+/// once ("SIOCGIFINDEX: No such device"), over and over.
+fn interface_present() -> bool {
+    std::path::Path::new("/sys/class/net")
+        .join(INTERFACE)
+        .exists()
+}
+
+/// A supervisor's view of a missing interface: it waits for it to come back
+/// instead of restarting a child that can only fail, and says so once.
+#[derive(Debug, Default)]
+struct Gone {
+    said: bool,
+}
+
+impl Gone {
+    /// True while the interface is missing: skip this restart.
+    fn waits(&mut self, child: &str, present: bool) -> bool {
+        match (present, self.said) {
+            (true, said) => {
+                if said {
+                    eprintln!("kindil: {INTERFACE} is back; starting {child}");
+                }
+                self.said = false;
+                false
+            }
+            (false, false) => {
+                eprintln!("kindil: {INTERFACE} is gone; {child} waits for it");
+                self.said = true;
+                true
+            }
+            (false, true) => true,
+        }
+    }
+}
+
 fn run(command: &mut Command) -> anyhow::Result<()> {
     let status = command.status()?;
     anyhow::ensure!(status.success(), "{command:?} exited with {status}");
@@ -1106,6 +1178,29 @@ fn run(command: &mut Command) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_child_waits_for_a_missing_interface_and_says_so_once() {
+        let mut gone = Gone::default();
+        assert!(!gone.waits("udhcpc", true));
+        assert!(gone.waits("udhcpc", false));
+        assert!(gone.said);
+        assert!(gone.waits("udhcpc", false));
+        assert!(!gone.waits("udhcpc", true), "back: started again");
+        assert!(!gone.said);
+    }
+
+    #[test]
+    fn a_stopped_or_own_wifi_is_never_parked() {
+        let net = Arc::new(Net::default());
+        // Off: nothing to leave, and no supplicant to ask.
+        net.park().unwrap();
+        assert!(!net.parked.load(Ordering::SeqCst));
+        *lock(&net.power) = Power::On;
+        *lock(&net.backend) = Backend::Kindil;
+        net.park().unwrap();
+        assert!(!net.parked.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn finds_a_network_by_name() {
