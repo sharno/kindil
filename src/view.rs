@@ -401,6 +401,7 @@ mod tests {
             }),
             storage: None,
             uptime: Some(Duration::from_secs(600)),
+            current: None,
         };
         let facts = facts(&info, "0.4.0");
         let values: Vec<String> = facts.iter().map(|f| f.value.to_string()).collect();

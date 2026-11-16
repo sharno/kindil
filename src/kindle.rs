@@ -24,6 +24,8 @@ use std::time::Duration;
 const WIFI_START: Duration = Duration::from_secs(180);
 /// The PW1's fuel gauge; it stalls while suspended and catches up on resume.
 const GAUGE_CHARGE: &str = "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_mAH";
+/// The gauge's average current in mA, negative on battery.
+const GAUGE_CURRENT: &str = "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_current";
 /// The gauge's state of charge, as `71%`; powerd's `battLevel` is this.
 const GAUGE_CAPACITY: &str = "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_capacity";
 /// `1` while the charger may charge; writing `0` pauses it (src/power.rs).
@@ -172,6 +174,12 @@ impl Host for KindleHost {
 
     fn reconnect_wifi(&self) -> anyhow::Result<()> {
         self.net.reconnect()
+    }
+
+    fn park_wifi(&self) {
+        if let Err(error) = self.net.park() {
+            eprintln!("kindil: parking Wi-Fi: {error}");
+        }
     }
 
     fn scan(&self) -> anyhow::Result<Vec<Network>> {
@@ -333,6 +341,9 @@ impl Host for KindleHost {
             uptime: std::fs::read_to_string("/proc/uptime")
                 .ok()
                 .and_then(|text| parse_uptime(&text)),
+            current: std::fs::read_to_string(GAUGE_CURRENT)
+                .ok()
+                .and_then(|text| text.trim().parse().ok()),
         }
     }
 

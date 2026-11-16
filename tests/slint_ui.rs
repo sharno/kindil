@@ -801,10 +801,22 @@ fn dozing_keeps_the_screen_and_naps_each_minute_until_a_press() {
         assert_eq!(host.naps(), naps);
     });
     assert_eq!(f.k().get_system(), System::App, "no sleep screen");
+    assert_eq!(host.parked_naps(), 3, "Wi-Fi is parked before every nap");
     f.app.device_event(Event::PowerButton);
     assert_eq!(host.brightness().unwrap().percent(), 40);
+    assert!(!host.parked(), "the press brings Wi-Fi back");
     f.app.fire_timers();
     assert_eq!(host.naps(), 3, "awake: no more naps");
+}
+
+#[test]
+fn sleeping_parks_wifi_and_waking_brings_it_back() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    f.app.device_event(Event::PowerButton);
+    f.app.fire_timers();
+    assert_eq!((host.suspends(), host.parked_naps()), (1, 1));
+    assert!(!host.parked(), "the wake reconnects");
 }
 
 #[test]

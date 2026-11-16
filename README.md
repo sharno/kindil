@@ -61,16 +61,22 @@ and a reboot always returns the Kindle to stock.
   - **Sleep when idle**: Doze (the default), Never, or a full sleep after
     5, 15, 30 or 60 minutes without a touch. Doze is for an always-on wall
     dashboard: after 2 minutes without a touch the light goes off and the
-    Kindle suspends to RAM, waking on the RTC alarm each minute to redraw the
-    clock and countdown, and every 30 minutes to fetch over Wi-Fi. The power
+    Kindle suspends to RAM, waking on the RTC alarm to redraw the clock and
+    countdown (every minute within the hour before the next prayer, every 5
+    minutes before that, on the clock's multiples of 5) and napping again as
+    soon as the panel has the frame. Every 30 minutes it also rejoins Wi-Fi
+    to fetch the weather; between those fetches wpa_supplicant stays off the
+    network. Once an hour it logs a doze ledger: awake and asleep seconds,
+    wakes, Wi-Fi-up seconds, how redraws ended, and the gauge. The power
     button brings it back with the light restored, and Wi-Fi rejoins.
   - **Wi-Fi of its own**: kindil runs Wi-Fi itself with the networks joined
     in it, saved in `/var/local/kindil/networks.toml` (plain text, readable
     by root only; a network is saved once it has joined). It loads the
     driver, runs its own wpa_supplicant (upstream 2.12, built by the flake)
     and DHCP as its children, starting one again if it exits; Off stops
-    them, and is remembered. Back online about a second after
-    a nap. None of Amazon's Wi-Fi services run while kindil does; on a
+    them, and is remembered. Before a nap or a sleep it leaves the network;
+    a wake that needs it (a press, or a doze fetch) joins again in about a
+    second. None of Amazon's Wi-Fi services run while kindil does; on a
     first run it starts with no networks, ready to join one.
   - **SSH of its own**: kindil carries kindil-sshd (`sshd/`, Rust, on
     russh) and runs it as its child on port 2222 for now, beside

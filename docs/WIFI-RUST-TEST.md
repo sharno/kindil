@@ -115,8 +115,9 @@ sleep 25
    afterwards; if it was the joined one, the keeper moves to the other
    network within about 5 s.
 5. **Suspend and resume.** Set Sleep when idle to Doze, leave it untouched
-   2 minutes, let it nap for 5 minutes (it wakes each minute; the 30-minute
-   online window is the one that matters, so better 35 minutes). Each wake
+   2 minutes, let it nap for 5 minutes (it wakes every 1 or 5 minutes to
+   redraw; the 30-minute online wake is the one that matters, so better 35
+   minutes; kindil's own Wi-Fi isn't parked between them yet). Each wake
    that reconnects logs a join; then press the power button. Expect `joined
    NAME` within a few seconds of the wake, the lease renewed (same address),
    internet. The lifeline can't help while it dozes: stay nearby.

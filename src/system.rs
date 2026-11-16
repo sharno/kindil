@@ -27,17 +27,35 @@ pub const PANEL_SETTLE: Duration = Duration::from_millis(1500);
 pub const DRIVE_SETTLE: Duration = Duration::from_secs(3);
 /// Without a touch for this long, a dozing kindil starts napping.
 pub const DOZE_AFTER: Duration = Duration::from_secs(120);
-/// Awake after a nap: long enough to render the minute and for the panel to
-/// show it.
-pub const DRAW_WINDOW: Duration = Duration::from_millis(1500);
-/// While dozing, how often kindil stays up for Wi-Fi to fetch the weather.
+/// How long a PW1 panel update takes once the frame is sent (about 1.25 s
+/// from a doze wake to the frame sent, measured on 0.7.6). When the driver
+/// can't say the update finished, a doze wake naps this long after sending:
+/// suspending mid-update can leave the update, and the panel's power, on.
+pub const PANEL_UPDATE: Duration = Duration::from_millis(1000);
+/// The most a drawing wake stays up when its redraw never reaches the panel
+/// (rendering fails, or the dashboard worker is stuck). Normally the wake
+/// ends as soon as the panel has the frame: about 1.3 s, plus
+/// [`PANEL_UPDATE`] when the driver can't tell.
+pub const DRAW_CEILING: Duration = Duration::from_secs(6);
+/// While dozing, how often kindil goes online to fetch the weather (radar
+/// only comes with it, when rain is expected). Wi-Fi is parked otherwise.
 pub const ONLINE_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(30);
-/// Awake that long when online: Wi-Fi reconnects in about 15 s after a nap.
-pub const ONLINE_WINDOW: Duration = Duration::from_secs(45);
-/// When, in that window, the dashboard fetches.
-pub const FETCH_AFTER: Duration = Duration::from_secs(25);
+/// The most an online wake stays up: Wi-Fi joins in up to 15 s after a nap,
+/// and a fetch gives up after 20 s. It ends as soon as the fetched frame is
+/// on the panel.
+pub const ONLINE_CEILING: Duration = Duration::from_secs(60);
 /// Shorter naps aren't worth a suspend: kindil waits for the minute awake.
 pub const MIN_NAP: Duration = Duration::from_secs(5);
+/// While the next prayer is more than [`NEAR_PRAYER`] away, a dozing
+/// dashboard redraws every this many minutes, on the wall clock's multiples
+/// of it: each wake costs a resume, a render, a panel update and a suspend.
+/// The clock and countdown on screen are then up to 4 minutes behind.
+pub const FAR_REDRAW_MINUTES: u32 = 5;
+/// Within this of the next prayer, a dozing dashboard redraws every minute,
+/// so the countdown is exact when it matters.
+pub const NEAR_PRAYER: chrono::TimeDelta = chrono::TimeDelta::minutes(60);
+/// How often dozing logs where its energy went ([`DozeLedger`]).
+pub const LEDGER_EVERY: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 /// At or below this level on battery, kindil sleeps with a charge screen:
 /// suspended, the last few percent last for days instead of an hour.
 pub const BATTERY_EMPTY: u8 = 5;
@@ -354,27 +372,228 @@ impl Doze {
 /// What a dozing wake does besides drawing the minute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Window {
-    /// Draw, then nap again after [`DRAW_WINDOW`].
+    /// Draw, then nap as soon as the panel has the frame.
     Draw,
-    /// Also let Wi-Fi reconnect and fetch, for [`ONLINE_WINDOW`].
+    /// Also bring Wi-Fi back and fetch, then nap once the fetched frame is
+    /// on the panel.
     Online,
 }
 
 impl Window {
     /// Online at the first wake and then every [`ONLINE_EVERY`] of wall time;
-    /// the monotonic clock stops while the device naps.
-    pub fn after_nap(last_online: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Self {
+    /// the monotonic clock stops while the device naps. Only a dashboard
+    /// fetches: without one there is nothing to go online for.
+    pub fn after_nap(
+        last_online: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+        dashboard: bool,
+    ) -> Self {
         match last_online {
+            _ if !dashboard => Window::Draw,
             Some(last) if now - last < ONLINE_EVERY => Window::Draw,
             _ => Window::Online,
         }
     }
 
-    pub fn length(self) -> Duration {
+    /// The most the wake stays up when its frame never reaches the panel.
+    pub fn ceiling(self) -> Duration {
         match self {
-            Window::Draw => DRAW_WINDOW,
-            Window::Online => ONLINE_WINDOW,
+            Window::Draw => DRAW_CEILING,
+            Window::Online => ONLINE_CEILING,
         }
+    }
+}
+
+/// When a dozing dashboard draws next, after `now`: on the next minute
+/// within [`NEAR_PRAYER`] of `next_prayer` (or without one), else on the
+/// next multiple of [`FAR_REDRAW_MINUTES`], or the minute the last hour
+/// starts in if that comes first. Always on a whole minute.
+pub fn next_redraw(now: DateTime<Utc>, next_prayer: Option<DateTime<Utc>>) -> DateTime<Utc> {
+    use chrono::{DurationRound, TimeDelta};
+    let minute = now.duration_trunc(TimeDelta::minutes(1)).unwrap_or(now) + TimeDelta::minutes(1);
+    let Some(prayer) = next_prayer else {
+        return minute;
+    };
+    let near = prayer - NEAR_PRAYER;
+    let every = TimeDelta::minutes(i64::from(FAR_REDRAW_MINUTES));
+    let far = now.duration_trunc(every).unwrap_or(now) + every;
+    if minute >= near {
+        return minute;
+    }
+    // The minute the countdown's last hour begins in: a whole minute after
+    // `minute`, so after `now`.
+    far.min(near.duration_trunc(TimeDelta::minutes(1)).unwrap_or(near))
+}
+
+/// How a dozing wake's redraw ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Settle {
+    /// The panel said it finished the frame.
+    Done,
+    /// The frame was sent, the panel couldn't say when it finished, and the
+    /// wake waited [`PANEL_UPDATE`].
+    Timed,
+    /// The frame never reached the panel before the window's ceiling.
+    NotSeen,
+}
+
+/// Where a doze's time, and so its energy, went: logged every
+/// [`LEDGER_EVERY`], so a battery measurement explains itself. Times are
+/// wall-clock: the monotonic clock stops while the device naps, which the
+/// monotonic sleep total shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DozeLedger {
+    since: DateTime<Utc>,
+    gauge: Option<crate::drain::MilliampHours>,
+    wakes: u32,
+    awake: chrono::TimeDelta,
+    online: u32,
+    slept: chrono::TimeDelta,
+    slept_monotonic: Duration,
+    wifi_up: chrono::TimeDelta,
+    settles: [u32; 3],
+    /// The gauge's current at each wake, in mA: (sum, count).
+    current: (i64, u32),
+    awake_from: Option<DateTime<Utc>>,
+    napping_from: Option<(DateTime<Utc>, Instant)>,
+    wifi_from: Option<DateTime<Utc>>,
+}
+
+impl DozeLedger {
+    pub fn new(now: DateTime<Utc>, gauge: Option<crate::drain::MilliampHours>) -> Self {
+        Self {
+            since: now,
+            gauge,
+            wakes: 0,
+            awake: chrono::TimeDelta::zero(),
+            online: 0,
+            slept: chrono::TimeDelta::zero(),
+            slept_monotonic: Duration::ZERO,
+            wifi_up: chrono::TimeDelta::zero(),
+            settles: [0; 3],
+            current: (0, 0),
+            awake_from: None,
+            napping_from: None,
+            wifi_from: None,
+        }
+    }
+
+    /// The gauge when the doze began, read once it has been.
+    pub fn set_gauge(&mut self, gauge: Option<crate::drain::MilliampHours>) {
+        self.gauge = self.gauge.or(gauge);
+    }
+
+    /// Back from a nap; `window` says what the wake does.
+    pub fn woke(&mut self, now: DateTime<Utc>, monotonic: Instant, window: Window) {
+        if let Some((wall, mono)) = self.napping_from.take() {
+            self.slept += now - wall;
+            self.slept_monotonic += monotonic.saturating_duration_since(mono);
+        }
+        self.wakes += 1;
+        if window == Window::Online {
+            self.online += 1;
+        }
+        self.awake_from = Some(now);
+    }
+
+    /// About to nap.
+    pub fn napping(&mut self, now: DateTime<Utc>, monotonic: Instant) {
+        if let Some(from) = self.awake_from.take() {
+            self.awake += now - from;
+        }
+        self.napping_from = Some((now, monotonic));
+    }
+
+    pub fn wifi_on(&mut self, now: DateTime<Utc>) {
+        self.wifi_from.get_or_insert(now);
+    }
+
+    pub fn wifi_off(&mut self, now: DateTime<Utc>) {
+        if let Some(from) = self.wifi_from.take() {
+            self.wifi_up += now - from;
+        }
+    }
+
+    pub fn settled(&mut self, settle: Settle) {
+        let slot = match settle {
+            Settle::Done => 0,
+            Settle::Timed => 1,
+            Settle::NotSeen => 2,
+        };
+        self.settles[slot] += 1;
+    }
+
+    /// The gauge's current at a wake: mostly the average over the nap just
+    /// ended, as the PW1's gauge averages over a few seconds.
+    pub fn current_at_wake(&mut self, milliamps: i32) {
+        self.current.0 += i64::from(milliamps);
+        self.current.1 += 1;
+    }
+
+    /// Whether [`LEDGER_EVERY`] has passed.
+    pub fn due(&self, now: DateTime<Utc>) -> bool {
+        now - self.since >= LEDGER_EVERY
+    }
+
+    /// The line to log at `now` with the gauge then; the next ledger starts
+    /// from here.
+    pub fn close(
+        &mut self,
+        now: DateTime<Utc>,
+        gauge: Option<crate::drain::MilliampHours>,
+    ) -> String {
+        // What is under way counts up to now here, and from now in the next.
+        if let Some(from) = self.awake_from {
+            self.awake += now - from;
+        }
+        if let Some(from) = self.wifi_from {
+            self.wifi_up += now - from;
+        }
+        let over = now - self.since;
+        let seconds = |d: chrono::TimeDelta| d.num_milliseconds() as f64 / 1000.0;
+        let per_wake = match self.wakes {
+            0 => 0.0,
+            n => seconds(self.awake) / f64::from(n),
+        };
+        let used = match (self.gauge, gauge) {
+            (Some(from), Some(to)) => {
+                let used = i64::from(from.0) - i64::from(to.0);
+                let rate = match over.num_seconds() {
+                    0 => 0,
+                    s => used * 3600 / s,
+                };
+                format!("{used} mAh ({rate} mA), {} mAh left", to.0)
+            }
+            (_, Some(to)) => format!("{} mAh left", to.0),
+            (_, None) => "no gauge".to_string(),
+        };
+        let current = match self.current {
+            (_, 0) => "none".to_string(),
+            (sum, n) => format!("{} mA", sum / i64::from(n)),
+        };
+        let line = format!(
+            "doze ledger over {} min: awake {:.0} s in {} wakes ({:.1} s each, {} online), \
+             asleep {:.0} s (monotonic {} s), Wi-Fi up {:.0} s, panel done {} / timed {} / \
+             not seen {}, gauge {used}, current at wake {current}",
+            over.num_minutes(),
+            seconds(self.awake),
+            self.wakes,
+            per_wake,
+            self.online,
+            seconds(self.slept),
+            self.slept_monotonic.as_secs(),
+            seconds(self.wifi_up),
+            self.settles[0],
+            self.settles[1],
+            self.settles[2],
+        );
+        let (awake_from, napping_from, wifi_from) =
+            (self.awake_from, self.napping_from, self.wifi_from);
+        *self = Self::new(now, gauge.or(self.gauge));
+        self.awake_from = awake_from.map(|_| now);
+        self.napping_from = napping_from;
+        self.wifi_from = wifi_from.map(|_| now);
+        line
     }
 }
 
@@ -663,10 +882,78 @@ mod tests {
     fn dozing_goes_online_every_half_hour_of_wall_time() {
         let t0 = DateTime::from_timestamp(1_794_398_400, 0).unwrap();
         let at = |minutes| t0 + chrono::TimeDelta::minutes(minutes);
-        assert_eq!(Window::after_nap(None, t0), Window::Online);
-        assert_eq!(Window::after_nap(Some(t0), at(29)), Window::Draw);
-        assert_eq!(Window::after_nap(Some(t0), at(30)), Window::Online);
-        assert!(FETCH_AFTER < ONLINE_WINDOW);
+        assert_eq!(Window::after_nap(None, t0, true), Window::Online);
+        assert_eq!(Window::after_nap(Some(t0), at(29), true), Window::Draw);
+        assert_eq!(Window::after_nap(Some(t0), at(30), true), Window::Online);
+        // Nothing to fetch without a dashboard: Wi-Fi stays parked.
+        assert_eq!(Window::after_nap(None, t0, false), Window::Draw);
+        assert_eq!(Window::after_nap(Some(t0), at(30), false), Window::Draw);
+        // A redraw that never shows can't keep the device up for long.
+        assert!(DRAW_CEILING <= Duration::from_secs(6));
+        assert!(PANEL_UPDATE < DRAW_CEILING);
+    }
+
+    fn wall(hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 11, 16, hour, minute, second)
+            .unwrap()
+    }
+
+    #[test]
+    fn far_from_a_prayer_the_dashboard_redraws_every_five_minutes() {
+        let prayer = Some(wall(12, 30, 0));
+        assert_eq!(next_redraw(wall(9, 0, 3), prayer), wall(9, 5, 0));
+        assert_eq!(next_redraw(wall(9, 4, 59), prayer), wall(9, 5, 0));
+        assert_eq!(next_redraw(wall(9, 5, 1), prayer), wall(9, 10, 0));
+    }
+
+    #[test]
+    fn within_the_last_hour_it_redraws_every_minute() {
+        let prayer = Some(wall(12, 30, 0));
+        // The last hour starts at 11:30, between two five-minute marks.
+        assert_eq!(next_redraw(wall(11, 26, 1), prayer), wall(11, 30, 0));
+        assert_eq!(next_redraw(wall(11, 30, 1), prayer), wall(11, 31, 0));
+        assert_eq!(next_redraw(wall(12, 29, 1), prayer), wall(12, 30, 0));
+        // A prayer at an odd second: its hour starts mid-minute.
+        let odd = Some(wall(12, 32, 30));
+        assert_eq!(next_redraw(wall(11, 30, 1), odd), wall(11, 32, 0));
+        assert_eq!(next_redraw(wall(11, 32, 1), odd), wall(11, 33, 0));
+        // No prayer known (the clock dashboard): every minute.
+        assert_eq!(next_redraw(wall(9, 0, 3), None), wall(9, 1, 0));
+    }
+
+    #[test]
+    fn the_ledger_accounts_wakes_naps_and_wifi() {
+        use crate::drain::MilliampHours;
+        let t0 = wall(1, 0, 0);
+        let i0 = Instant::now();
+        let secs = |s: i64| chrono::TimeDelta::seconds(s);
+        let mut ledger = DozeLedger::new(t0, Some(MilliampHours(500)));
+        ledger.napping(t0, i0);
+        // One online wake with Wi-Fi up 20 s, then a drawing one.
+        ledger.woke(t0 + secs(58), i0 + Duration::from_secs(1), Window::Online);
+        ledger.wifi_on(t0 + secs(58));
+        ledger.current_at_wake(-4);
+        ledger.wifi_off(t0 + secs(78));
+        ledger.settled(Settle::Done);
+        ledger.napping(t0 + secs(80), i0 + Duration::from_secs(23));
+        ledger.woke(t0 + secs(178), i0 + Duration::from_secs(24), Window::Draw);
+        ledger.current_at_wake(-6);
+        ledger.settled(Settle::Timed);
+        ledger.napping(t0 + secs(181), i0 + Duration::from_secs(27));
+        assert!(!ledger.due(t0 + secs(3599)));
+        assert!(ledger.due(t0 + secs(3600)));
+        let line = ledger.close(t0 + secs(3600), Some(MilliampHours(490)));
+        assert_eq!(
+            line,
+            "doze ledger over 60 min: awake 25 s in 2 wakes (12.5 s each, 1 online), \
+             asleep 156 s (monotonic 2 s), Wi-Fi up 20 s, panel done 1 / timed 1 / \
+             not seen 0, gauge 10 mAh (10 mA), 490 mAh left, current at wake -5 mA"
+        );
+        // The next hour counts from the last gauge reading.
+        let line = ledger.close(t0 + secs(7200), None);
+        assert!(line.contains("awake 0 s in 0 wakes"), "{line}");
+        assert!(line.ends_with("no gauge, current at wake none"), "{line}");
     }
 
     #[test]
