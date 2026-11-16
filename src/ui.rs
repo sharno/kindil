@@ -1767,9 +1767,9 @@ impl Ctx {
     /// Reads Miqat's file for the Location page and its index row.
     fn show_location(&self) {
         let path = self.config.miqat_config.clone();
-        let named = self.state.borrow().store.prefs.place.clone();
+        let named = location::named_path(&self.config.prefs);
         self.background(
-            move |_| location::load(&path, named.as_ref()),
+            move |_| location::load(&path, location::read_named(&named).as_ref()),
             |ui, place| show_location(ui, place.map_err(|e| format!("{e:#}"))),
         );
     }
@@ -1916,12 +1916,8 @@ impl Ctx {
             return;
         }
         k.set_location_busy(true);
-        // Kept with where it is: if the files don't change, it names nothing.
-        if let Some(named) = location::named(&place) {
-            self.save(|prefs| prefs.place = Some(named));
-        }
         let (miqat, kindil) = (self.config.miqat_config.clone(), self.config.path.clone());
-        let named = self.state.borrow().store.prefs.place.clone();
+        let named_path = location::named_path(&self.config.prefs);
         let ticks = match &self.state.borrow().miqat {
             Worker::Started(ticks) => Some(ticks.clone()),
             Worker::Idle => None,
@@ -1929,8 +1925,14 @@ impl Ctx {
         let (finding, timezone, now) = (self.finding.clone(), self.timezone.clone(), self.now);
         self.background(
             move |_| {
-                location::save(&miqat, &kindil, &place)
-                    .and_then(|()| location::load(&miqat, named.as_ref()))
+                location::save(&miqat, &kindil, &place)?;
+                // Only the name is lost if this fails: the place is saved.
+                if let Some(named) = location::named(&place) {
+                    if let Err(error) = location::write_named(&named_path, &named) {
+                        eprintln!("kindil: {error:#}");
+                    }
+                }
+                location::load(&miqat, location::read_named(&named_path).as_ref())
             },
             move |ui, saved| {
                 let k = ui.global::<Kindil>();

@@ -369,9 +369,48 @@ pub fn save(miqat: &Path, kindil: &Path, place: &Place) -> anyhow::Result<()> {
     std::fs::rename(&staged.1, kindil).with_context(|| format!("writing {}", kindil.display()))
 }
 
-/// The dashboard's place as Miqat's file has it, named if `named` (saved
-/// in prefs) is at the same coordinates.
-pub fn load(miqat: &Path, named: Option<&crate::prefs::Named>) -> anyhow::Result<Place> {
+/// A saved place's name and the coordinates it belongs to, in its own file
+/// (`place.toml`, beside `prefs.toml`): Miqat's `[location]` takes no name,
+/// and `prefs.toml` must stay readable by older kindils after a rollback.
+/// Once `[location]` is edited by hand, the coordinates differ and the name
+/// is no longer shown.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, Deserialize)]
+pub struct Named {
+    pub name: String,
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+/// `place.toml` beside `prefs`: /mnt/us/kindil/place.toml on the Kindle.
+pub fn named_path(prefs: &Path) -> std::path::PathBuf {
+    prefs.with_file_name("place.toml")
+}
+
+/// The saved name; None when there is none, or the file doesn't read.
+pub fn read_named(path: &Path) -> Option<Named> {
+    toml::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// Replaces `place.toml` atomically: written beside it, then renamed over.
+pub fn write_named(path: &Path, named: &Named) -> anyhow::Result<()> {
+    let text = toml::to_string(named)?;
+    let temp =
+        crate::prayer::stage(path, &text).with_context(|| format!("writing {}", path.display()))?;
+    std::fs::rename(&temp, path).with_context(|| format!("writing {}", path.display()))
+}
+
+/// What `place.toml` keeps of `place`; None for one without a name.
+pub fn named(place: &Place) -> Option<Named> {
+    Some(Named {
+        name: place.name.clone()?,
+        latitude: rounded(place.latitude),
+        longitude: rounded(place.longitude),
+    })
+}
+
+/// The dashboard's place as Miqat's file has it, named if `named` is at
+/// the same coordinates.
+pub fn load(miqat: &Path, named: Option<&Named>) -> anyhow::Result<Place> {
     let location = Miqat::load(miqat)?.location;
     let (latitude, longitude) = (location.latitude.degrees(), location.longitude.degrees());
     Ok(Place {
@@ -381,16 +420,6 @@ pub fn load(miqat: &Path, named: Option<&crate::prefs::Named>) -> anyhow::Result
         latitude,
         longitude,
         timezone: location.timezone,
-    })
-}
-
-/// What prefs keep of a saved place: its name, and where it was, so a
-/// hand-edited `[location]` isn't shown under the old name.
-pub fn named(place: &Place) -> Option<crate::prefs::Named> {
-    Some(crate::prefs::Named {
-        name: place.name.clone()?,
-        latitude: rounded(place.latitude),
-        longitude: rounded(place.longitude),
     })
 }
 
@@ -615,6 +644,25 @@ timezone = "Asia/Riyadh"        # IANA name, for the clock
         assert!(save(&miqat, Path::new(""), &place).is_err());
         assert_eq!(std::fs::read_to_string(&miqat).unwrap(), MECCA);
         assert!(!miqat.with_extension("toml.tmp").exists());
+    }
+
+    #[test]
+    fn the_name_has_its_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = named_path(&dir.path().join("prefs.toml"));
+        assert_eq!(path, dir.path().join("place.toml"));
+        assert_eq!(read_named(&path), None);
+        let mecca = Named {
+            name: "Mecca, Saudi Arabia".into(),
+            latitude: 21.4266,
+            longitude: 39.8256,
+        };
+        write_named(&path, &mecca).unwrap();
+        assert_eq!(read_named(&path), Some(mecca));
+        assert!(!path.with_extension("toml.tmp").exists());
+        assert_eq!(named(&typed("1", "2", "UTC").unwrap()), None);
+        std::fs::write(&path, "name = ").unwrap();
+        assert_eq!(read_named(&path), None, "a broken file names nothing");
     }
 
     /// The real services, with public place names only.

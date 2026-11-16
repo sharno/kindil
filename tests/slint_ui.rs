@@ -494,6 +494,19 @@ fn a_searched_city_is_saved_only_once_confirmed() {
     assert_eq!(f.k().get_clock(), riyadh);
     f.k().invoke_go(Page::Settings);
     assert_eq!(f.k().get_location_title(), "Mecca, Saudi Arabia");
+    // The name has its own file; prefs.toml stays as an older kindil reads it.
+    let prefs = std::fs::read_to_string(f.dir.path().join("prefs.toml")).unwrap();
+    assert!(
+        !prefs.contains("place") && !prefs.contains("Mecca"),
+        "{prefs}"
+    );
+    let place = std::fs::read_to_string(f.dir.path().join("place.toml")).unwrap();
+    assert!(place.contains("name = \"Mecca, Saudi Arabia\""), "{place}");
+    // A hand edit of [location] stops the name showing.
+    let edited = saved.replace("latitude = 21.4266", "latitude = 21.5");
+    std::fs::write(&miqat, edited).unwrap();
+    f.k().invoke_go(Page::Settings);
+    assert_eq!(f.k().get_location_title(), "21.50, 39.83");
 }
 
 #[test]
