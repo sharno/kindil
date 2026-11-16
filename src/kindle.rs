@@ -431,6 +431,14 @@ impl Host for KindleHost {
         }
         Ok(commit)
     }
+
+    fn search_places(&self, name: &str) -> anyhow::Result<Vec<crate::location::Place>> {
+        crate::location::Lookup::default().search(name)
+    }
+
+    fn locate_by_ip(&self) -> anyhow::Result<crate::location::Place> {
+        crate::location::Lookup::default().locate()
+    }
 }
 
 /// Arms `alarm` for the next battery check when on battery; returns when

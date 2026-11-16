@@ -162,6 +162,29 @@ pub fn screens(app: &App, window: &MinimalSoftwareWindow, dir: &Path) -> anyhow:
     drag(window, 380.0, 860.0, 160.0);
     shot("settings-prayer-asr")?;
 
+    // Settings → Location: a search, the internet-address lookup's question,
+    // and typed coordinates with the time zones matching what was typed.
+    k.invoke_go(Page::Location);
+    shot("settings-location")?;
+    k.invoke_go(Page::PlaceSearch);
+    k.set_place_query("Amsterdam".into());
+    k.invoke_search_places("Amsterdam".into());
+    shot("settings-location-search")?;
+    k.invoke_choose_place(0);
+    shot("settings-location-search-confirm")?;
+    k.invoke_go(Page::Location);
+    k.invoke_locate_by_ip();
+    shot("settings-location-ip")?;
+    k.invoke_go(Page::Coordinates);
+    k.set_typed_latitude("21.4225".into());
+    k.set_typed_longitude("39.8262".into());
+    k.set_typed_zone("Riy".into());
+    k.invoke_filter_zones("Riy".into());
+    shot("settings-location-coordinates")?;
+    k.set_typed_zone("".into());
+    k.set_typed_latitude("".into());
+    k.set_typed_longitude("".into());
+
     k.invoke_go(Page::Networks);
     k.invoke_scan_networks();
     shot("networks")?;

@@ -33,6 +33,10 @@ pub struct Config {
     /// Absent: the Settings screen shows sync as not installed.
     #[serde(default)]
     pub syncthing: Option<Syncthing>,
+    /// Where this file is, or would be: Settings → Location writes its
+    /// `timezone`. Empty for a config not read from a file.
+    #[serde(skip)]
+    pub path: PathBuf,
 }
 
 /// A user-supplied Syncthing build. kindil starts it only when switched on.
@@ -64,7 +68,8 @@ impl Config {
         toml::from_str(text)
     }
 
-    /// An explicit path must exist; the device default may be absent (all defaults).
+    /// An explicit path must exist; the device default may be absent (all
+    /// defaults, and the file is created there when a setting is saved).
     pub fn load(explicit: Option<&Path>) -> anyhow::Result<Self> {
         use anyhow::Context;
         let read = |path: &Path| -> anyhow::Result<Self> {
@@ -72,11 +77,17 @@ impl Config {
                 std::fs::read_to_string(path).with_context(|| format!("{}", path.display()))?;
             Self::parse(&text).with_context(|| format!("{}", path.display()))
         };
-        match explicit {
-            Some(path) => read(path),
-            None if Path::new(DEVICE_CONFIG).is_file() => read(Path::new(DEVICE_CONFIG)),
-            None => Ok(Self::parse("")?),
-        }
+        let (config, path) = match explicit {
+            Some(path) => (read(path)?, path),
+            None if Path::new(DEVICE_CONFIG).is_file() => {
+                (read(Path::new(DEVICE_CONFIG))?, Path::new(DEVICE_CONFIG))
+            }
+            None => (Self::parse("")?, Path::new(DEVICE_CONFIG)),
+        };
+        Ok(Self {
+            path: path.to_owned(),
+            ..config
+        })
     }
 }
 

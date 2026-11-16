@@ -4,6 +4,7 @@
 //! battery and front light drivers, USBNetwork's dropbear. [`Simulated`] returns fixtures
 //! and never opens a device, so previews and tests cannot touch hardware.
 use crate::battery::Battery;
+use crate::location::Place;
 use crate::update::{Check, Commit, Release};
 use crate::wifi::{Credentials, Network, Ssid};
 use serde::{Deserialize, Serialize};
@@ -220,6 +221,11 @@ pub trait Host: Send + Sync {
     fn stage_update(&self, release: &Release) -> anyhow::Result<()>;
     /// Keeps a version on trial once it has run long enough.
     fn commit_update(&self) -> anyhow::Result<Commit>;
+    /// Places whose name starts with `name`. Blocks: call from a worker thread.
+    fn search_places(&self, name: &str) -> anyhow::Result<Vec<Place>>;
+    /// Where the internet address seems to be; only ever on the owner's tap.
+    /// Blocks: call from a worker thread.
+    fn locate_by_ip(&self) -> anyhow::Result<Place>;
 }
 
 /// Fixture device for previews and tests. Switches remember their state so UI
@@ -240,6 +246,45 @@ struct SimulatedState {
     ssh_at_boot: Power,
     own_ssh: OwnSsh,
     boot_start: BootStart,
+    /// Off: place lookups fail as without a network.
+    online: bool,
+    lookups: u32,
+}
+
+/// The Simulated device's place search: well-known public places.
+fn simulated_places() -> Vec<Place> {
+    let place = |name: &str, latitude, longitude, timezone| Place {
+        name: Some(name.into()),
+        latitude,
+        longitude,
+        timezone,
+    };
+    vec![
+        place(
+            "Amsterdam, North Holland, Netherlands",
+            52.37403,
+            4.88969,
+            chrono_tz::Europe::Amsterdam,
+        ),
+        place(
+            "Amsterdam, New York, United States",
+            42.93869,
+            -74.18819,
+            chrono_tz::America::New_York,
+        ),
+        place(
+            "Mecca, Saudi Arabia",
+            21.42664,
+            39.82563,
+            chrono_tz::Asia::Riyadh,
+        ),
+        place(
+            "New York, United States",
+            40.71427,
+            -74.00597,
+            chrono_tz::America::New_York,
+        ),
+    ]
 }
 
 /// The Simulated device's keys: one trusted, one new on the USB storage.
@@ -286,6 +331,8 @@ impl Default for Simulated {
                 ssh_at_boot: Power::On,
                 own_ssh: simulated_ssh(),
                 boot_start: BootStart::Installed(Boot::Off),
+                online: true,
+                lookups: 0,
             }),
         }
     }
@@ -308,6 +355,24 @@ impl Simulated {
     /// How many times the device napped while dozing.
     pub fn naps(&self) -> u32 {
         self.with(|s| s.naps)
+    }
+
+    /// Offline, place lookups fail as without a network.
+    pub fn set_online(&self, online: bool) {
+        self.with(|s| s.online = online);
+    }
+
+    /// How many times a place service was asked.
+    pub fn lookups(&self) -> u32 {
+        self.with(|s| s.lookups)
+    }
+
+    fn lookup(&self) -> anyhow::Result<()> {
+        self.with(|s| {
+            s.lookups += 1;
+            anyhow::ensure!(s.online, "can't reach the service: network unreachable");
+            Ok(())
+        })
     }
 
     fn with<T>(&self, f: impl FnOnce(&mut SimulatedState) -> T) -> T {
@@ -452,6 +517,23 @@ impl Host for Simulated {
     }
     fn commit_update(&self) -> anyhow::Result<Commit> {
         Ok(Commit::Nothing)
+    }
+    fn search_places(&self, name: &str) -> anyhow::Result<Vec<Place>> {
+        self.lookup()?;
+        let name = name.trim().to_lowercase();
+        Ok(simulated_places()
+            .into_iter()
+            .filter(|p| p.title().to_lowercase().starts_with(&name))
+            .collect())
+    }
+    fn locate_by_ip(&self) -> anyhow::Result<Place> {
+        self.lookup()?;
+        Ok(Place {
+            name: Some("Amsterdam, North Holland, NL".into()),
+            latitude: 52.374,
+            longitude: 4.8897,
+            timezone: chrono_tz::Europe::Amsterdam,
+        })
     }
 }
 

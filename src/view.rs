@@ -5,7 +5,7 @@ use crate::host::{Boot, BootStart, DeviceInfo, OwnSsh, Power, Ssh, SshKey, Wifi}
 use crate::prefs::Progress;
 use crate::reader::Book;
 use crate::sync::Service;
-use crate::ui::{BookItem, BootChoice, Fact, NetworkItem, SshKeyItem, Switch};
+use crate::ui::{BookItem, BootChoice, Fact, NetworkItem, PlaceItem, SshKeyItem, Switch};
 use crate::update::{Updates, Version};
 use crate::wifi::{Network, Security};
 use chrono::{DateTime, TimeZone};
@@ -288,6 +288,20 @@ pub fn network(network: &Network) -> NetworkItem {
         }
         .into(),
         bars: i32::from(network.signal.bars()),
+    }
+}
+
+/// A search result: "Amsterdam, North Holland, Netherlands" over
+/// "Europe/Amsterdam · 52.37, 4.89".
+pub fn place(place: &crate::location::Place) -> PlaceItem {
+    PlaceItem {
+        title: place.title().into(),
+        detail: format!(
+            "{} · {}",
+            place.timezone.name(),
+            crate::location::coordinates(place.latitude, place.longitude)
+        )
+        .into(),
     }
 }
 

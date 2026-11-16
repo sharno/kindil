@@ -87,8 +87,21 @@ pub struct Prefs {
     /// The front light level last chosen; the light comes back to it when
     /// kindil starts, after a reboot too. None until one is chosen.
     pub light: Option<crate::host::Brightness>,
+    /// The name of the place last chosen in Settings → Location; Miqat's
+    /// file has no room for one.
+    pub place: Option<Named>,
     /// Keyed by file name inside the books directory.
     pub positions: BTreeMap<String, Progress>,
+}
+
+/// A place's name and where it is, so a `[location]` edited by hand since
+/// isn't shown under the old name.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Named {
+    pub name: String,
+    pub latitude: f64,
+    pub longitude: f64,
 }
 
 pub struct Store {
@@ -134,6 +147,11 @@ mod tests {
         store.prefs.dashboard = Some(Dashboard::Clock);
         store.prefs.font = store.prefs.font.larger();
         store.prefs.light = Some(crate::host::Brightness::new(70));
+        store.prefs.place = Some(Named {
+            name: "Mecca, Saudi Arabia".into(),
+            latitude: 21.4266,
+            longitude: 39.8256,
+        });
         store
             .prefs
             .positions

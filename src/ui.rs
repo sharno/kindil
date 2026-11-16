@@ -7,6 +7,7 @@ use crate::drain::{Drain, Gauge};
 use crate::files::{FileName, Files, Trashed};
 use crate::ghosting::{Ghosting, Refresh, Update};
 use crate::host::{BootStart, Brightness, DeviceInfo, Host, OwnSsh, Power, Ssh, SshKey, Wifi};
+use crate::location::{self, Place};
 use crate::prayer::{self, Setting};
 use crate::prefs::Store;
 use crate::reader::{self, Book, Layout, Reader};
@@ -297,7 +298,23 @@ struct Ctx {
     /// The doze wake whose redraw is awaited.
     draw_wake: Arc<DrawWake>,
     now: fn() -> DateTime<Utc>,
+    /// The clock's and status bar's zone: kindil.toml's, until Settings →
+    /// Location changes it.
+    timezone: Arc<Mutex<chrono_tz::Tz>>,
+    /// What Settings → Location found, shared with its workers.
+    finding: Arc<Mutex<Finding>>,
 }
+
+/// Settings → Location's search results, and the place waiting for Save.
+#[derive(Default)]
+struct Finding {
+    places: Vec<Place>,
+    pending: Option<Place>,
+}
+
+/// Shown under a place found from the internet address.
+pub const IP_NOTE: &str =
+    "Found from your internet address; it can be off by tens of kilometres, or wrong behind a VPN.";
 
 pub struct App {
     pub window: AppWindow,
@@ -412,6 +429,7 @@ impl App {
         let sync = Service::new(options.config.syncthing.clone());
         let dashboard = store.prefs.dashboard.unwrap_or(options.config.dashboard);
         let (sender, queue) = mpsc::channel();
+        let timezone = options.config.timezone;
         let ctx = Ctx {
             weak: window.as_weak(),
             host: options.host,
@@ -445,6 +463,8 @@ impl App {
             doze_gauge: Arc::default(),
             timers: Rc::default(),
             draw_wake: Arc::default(),
+            timezone: Arc::new(Mutex::new(timezone)),
+            finding: Arc::default(),
         };
         {
             let k = window.global::<Kindil>();
@@ -560,6 +580,35 @@ fn show_prayer(ui: &AppWindow, page: Result<prayer::Page, String>) {
     }
 }
 
+fn show_location(ui: &AppWindow, place: Result<Place, String>) {
+    let k = ui.global::<Kindil>();
+    match place {
+        Ok(place) => {
+            k.set_location_error("".into());
+            k.set_location_title(place.title().into());
+            k.set_location_zone(place.timezone.name().into());
+        }
+        Err(error) => k.set_location_error(error.into()),
+    }
+}
+
+/// Opens the sheet asking to save `place`.
+fn confirm_location(ui: &AppWindow, finding: &Mutex<Finding>, place: Place, note: &str) {
+    let k = ui.global::<Kindil>();
+    k.set_confirm_place(place.summary().into());
+    k.set_confirm_note(note.into());
+    k.set_confirm_open(true);
+    lock(finding).pending = Some(place);
+}
+
+/// The clock and date in `timezone`.
+fn show_clock(ui: &AppWindow, now: DateTime<Utc>, timezone: chrono_tz::Tz) {
+    let (clock, date) = view::clock(&now.with_timezone(&timezone));
+    let k = ui.global::<Kindil>();
+    k.set_clock(clock.into());
+    k.set_date(date.into());
+}
+
 fn show_updates(ui: &AppWindow, state: &Mutex<Updates>, updates: Updates) {
     let (status, button, enabled) = view::updates(&updates, Version::current());
     let k = ui.global::<Kindil>();
@@ -627,6 +676,13 @@ fn wire(window: &AppWindow, ctx: &Ctx) {
     on!(on_update => update());
     on!(on_choose_prayer_method => choose_prayer_method(index));
     on!(on_choose_asr_school => choose_asr_school(index));
+    on!(on_search_places => search_places(name));
+    on!(on_choose_place => choose_place(index));
+    on!(on_locate_by_ip => locate_by_ip());
+    on!(on_enter_coordinates => enter_coordinates(latitude, longitude, zone));
+    on!(on_filter_zones => filter_zones(typed));
+    on!(on_save_location => save_location());
+    on!(on_cancel_location => cancel_location());
 }
 
 fn arm_clock(timer: Rc<slint::Timer>, ctx: Ctx) {
@@ -684,10 +740,7 @@ impl Ctx {
 
     fn tick_clock(&self) {
         let Some(ui) = self.ui() else { return };
-        let (clock, date) = view::clock(&(self.now)().with_timezone(&self.config.timezone));
-        let k = ui.global::<Kindil>();
-        k.set_clock(clock.into());
-        k.set_date(date.into());
+        show_clock(&ui, (self.now)(), *lock(&self.timezone));
     }
 
     fn refresh_status(&self) {
@@ -713,6 +766,12 @@ impl Ctx {
     fn navigated(&self, page: Page) {
         if let Some(ui) = self.ui() {
             self.display.updated(&ui, Update::Navigate);
+            let k = ui.global::<Kindil>();
+            // A question about a place belongs to the page it was asked on.
+            k.set_confirm_open(false);
+            if !k.get_location_busy() {
+                k.set_location_status("".into());
+            }
         }
         match page {
             Page::Library => self.reload_library(),
@@ -720,8 +779,11 @@ impl Ctx {
                 self.refresh_status();
                 self.show_sync();
                 self.show_prayer();
+                self.show_location();
             }
             Page::Prayer => self.show_prayer(),
+            Page::Location | Page::PlaceSearch => self.show_location(),
+            Page::Coordinates => self.start_coordinates(),
             Page::Display
             | Page::Wifi
             | Page::Remote
@@ -1695,6 +1757,203 @@ impl Ctx {
                     let error = format!("{error:#}");
                     notify(ui, &format!("Prayer times not saved: {error}"));
                     ui.global::<Kindil>().set_prayer_error(error.into());
+                }
+            },
+        );
+    }
+
+    // ── location ──
+
+    /// Reads Miqat's file for the Location page and its index row.
+    fn show_location(&self) {
+        let path = self.config.miqat_config.clone();
+        let named = self.state.borrow().store.prefs.place.clone();
+        self.background(
+            move |_| location::load(&path, named.as_ref()),
+            |ui, place| show_location(ui, place.map_err(|e| format!("{e:#}"))),
+        );
+    }
+
+    /// The coordinates page starts from the time zone in use.
+    fn start_coordinates(&self) {
+        self.show_location();
+        let Some(ui) = self.ui() else { return };
+        let k = ui.global::<Kindil>();
+        if k.get_typed_zone().is_empty() {
+            let zone = k.get_location_zone();
+            k.set_typed_zone(zone);
+        }
+        k.set_zone_matches(model(Vec::new()));
+    }
+
+    fn search_places(&self, name: slint::SharedString) {
+        let Some(ui) = self.ui() else { return };
+        let k = ui.global::<Kindil>();
+        if k.get_location_busy() {
+            return;
+        }
+        let name = name.trim().to_string();
+        if name.chars().count() < 2 {
+            k.set_location_status("Type at least two letters of the name.".into());
+            return;
+        }
+        k.set_location_busy(true);
+        k.set_location_status(format!("Searching for “{name}”…").into());
+        let finding = self.finding.clone();
+        self.background(
+            {
+                let name = name.clone();
+                move |host| host.search_places(&name)
+            },
+            move |ui, result| {
+                let k = ui.global::<Kindil>();
+                k.set_location_busy(false);
+                let (places, status) = match result {
+                    Ok(places) => {
+                        let status = match places.len() {
+                            0 => format!(
+                                "No places found for “{name}”. Check the spelling, or try a nearby city."
+                            ),
+                            1 => "1 place. Tap it to use it.".to_string(),
+                            n => format!("{n} places. Tap one to use it."),
+                        };
+                        (places, status)
+                    }
+                    Err(error) => (Vec::new(), format!("Search failed: {error:#}")),
+                };
+                k.set_location_status(status.into());
+                k.set_places(model(places.iter().map(view::place).collect()));
+                lock(&finding).places = places;
+            },
+        );
+    }
+
+    fn choose_place(&self, index: i32) {
+        let Some(ui) = self.ui() else { return };
+        let place = usize::try_from(index)
+            .ok()
+            .and_then(|i| lock(&self.finding).places.get(i).cloned());
+        if let Some(place) = place {
+            confirm_location(&ui, &self.finding, place, "");
+        }
+    }
+
+    /// Only ever on the owner's tap: never at start or in the background.
+    fn locate_by_ip(&self) {
+        let Some(ui) = self.ui() else { return };
+        let k = ui.global::<Kindil>();
+        if k.get_location_busy() {
+            return;
+        }
+        k.set_location_busy(true);
+        k.set_location_status("Asking ipinfo.io where your internet address is…".into());
+        let finding = self.finding.clone();
+        self.background(
+            |host| host.locate_by_ip(),
+            move |ui, result| {
+                let k = ui.global::<Kindil>();
+                k.set_location_busy(false);
+                match result {
+                    Ok(place) => {
+                        k.set_location_status("".into());
+                        confirm_location(ui, &finding, place, IP_NOTE);
+                    }
+                    Err(error) => k.set_location_status(
+                        format!("Couldn't find your location: {error:#}").into(),
+                    ),
+                }
+            },
+        );
+    }
+
+    fn enter_coordinates(
+        &self,
+        latitude: slint::SharedString,
+        longitude: slint::SharedString,
+        zone: slint::SharedString,
+    ) {
+        let Some(ui) = self.ui() else { return };
+        match location::typed(&latitude, &longitude, &zone) {
+            Ok(place) => {
+                ui.global::<Kindil>().set_location_status("".into());
+                confirm_location(&ui, &self.finding, place, "");
+            }
+            Err(error) => ui.global::<Kindil>().set_location_status(error.into()),
+        }
+    }
+
+    /// The zones holding what was typed; none once it names one exactly.
+    fn filter_zones(&self, typed: slint::SharedString) {
+        let Some(ui) = self.ui() else { return };
+        let exact = typed.trim().parse::<chrono_tz::Tz>().is_ok();
+        let matches = if exact {
+            Vec::new()
+        } else {
+            location::zones(&typed, 6)
+                .into_iter()
+                .map(slint::SharedString::from)
+                .collect()
+        };
+        ui.global::<Kindil>().set_zone_matches(model(matches));
+    }
+
+    fn cancel_location(&self) {
+        lock(&self.finding).pending = None;
+        if let Some(ui) = self.ui() {
+            ui.global::<Kindil>().set_confirm_open(false);
+        }
+    }
+
+    /// Writes the confirmed place into Miqat's file and kindil's, then the
+    /// clock and the dashboard follow it.
+    fn save_location(&self) {
+        let Some(ui) = self.ui() else { return };
+        let Some(place) = lock(&self.finding).pending.clone() else {
+            return;
+        };
+        let k = ui.global::<Kindil>();
+        if k.get_location_busy() {
+            return;
+        }
+        k.set_location_busy(true);
+        // Kept with where it is: if the files don't change, it names nothing.
+        if let Some(named) = location::named(&place) {
+            self.save(|prefs| prefs.place = Some(named));
+        }
+        let (miqat, kindil) = (self.config.miqat_config.clone(), self.config.path.clone());
+        let named = self.state.borrow().store.prefs.place.clone();
+        let ticks = match &self.state.borrow().miqat {
+            Worker::Started(ticks) => Some(ticks.clone()),
+            Worker::Idle => None,
+        };
+        let (finding, timezone, now) = (self.finding.clone(), self.timezone.clone(), self.now);
+        self.background(
+            move |_| {
+                location::save(&miqat, &kindil, &place)
+                    .and_then(|()| location::load(&miqat, named.as_ref()))
+            },
+            move |ui, saved| {
+                let k = ui.global::<Kindil>();
+                k.set_location_busy(false);
+                match saved {
+                    Ok(place) => {
+                        lock(&finding).pending = None;
+                        *lock(&timezone) = place.timezone;
+                        show_clock(ui, now(), place.timezone);
+                        notify(ui, &format!("Location saved: {}", place.title()));
+                        show_location(ui, Ok(place));
+                        k.set_typed_zone("".into());
+                        k.invoke_go(Page::Location);
+                        // New weather and radar for the new place; an idle
+                        // dashboard reads the file when it starts.
+                        if let Some(ticks) = ticks {
+                            let _ = ticks.send(Tick::Reload);
+                        }
+                    }
+                    Err(error) => {
+                        k.set_confirm_open(false);
+                        k.set_location_status(format!("Not saved: {error:#}").into());
+                    }
                 }
             },
         );
