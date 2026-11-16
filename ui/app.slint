@@ -109,7 +109,10 @@ export global Kindil {
     in property <int> wifi-bars: -1;
 
     // Dashboard
-    in property <image> miqat-frame;
+    // Miqat's page in two: the header (clock, countdown) on top of the
+    // body, so a minute that redraws only the header updates only its rows.
+    in property <image> miqat-header;
+    in property <image> miqat-body;
     in property <string> miqat-error: "Starting the prayer dashboard…";
 
     // Library
@@ -2410,13 +2413,23 @@ export component AppWindow inherits Window {
 
     // Full-bleed and pixel-exact: Miqat renders for this exact panel.
     if root.immersive: Rectangle {
-        Image {
-            source: Kindil.miqat-frame;
-            width: 100%;
-            height: 100%;
-            image-fit: contain;
+        header := Image {
+            x: 0;
+            y: 0;
+            width: Kindil.miqat-header.width * 1px;
+            height: Kindil.miqat-header.height * 1px;
+            source: Kindil.miqat-header;
+            image-fit: fill;
         }
-        if Kindil.miqat-frame.width == 0: Text {
+        Image {
+            x: 0;
+            y: header.height;
+            width: Kindil.miqat-body.width * 1px;
+            height: Kindil.miqat-body.height * 1px;
+            source: Kindil.miqat-body;
+            image-fit: fill;
+        }
+        if Kindil.miqat-body.width == 0: Text {
             x: 48px;
             width: parent.width - 96px;
             text: Kindil.miqat-error;

@@ -3,6 +3,7 @@
 //! the event loop, so a timeout never freezes a tap.
 use crate::battery::{Battery, Charge};
 use crate::config::{Config, Dashboard};
+use crate::dashboards::{Board, Draw};
 use crate::drain::{Drain, Gauge};
 use crate::files::{FileName, Files, Trashed};
 use crate::ghosting::{Ghosting, Refresh, Update};
@@ -13,8 +14,8 @@ use crate::prefs::Store;
 use crate::reader::{self, Book, Layout, Reader};
 use crate::sync::Service;
 use crate::system::{
-    AutoSleep, DozeLedger, Effect, Event as DeviceEvent, Idle, Mode, Settle, Step, Touches, Window,
-    DRIVE_SETTLE, MIN_NAP, PANEL_SETTLE, PANEL_UPDATE,
+    AutoSleep, DozeLedger, Effect, Event as DeviceEvent, Idle, Mode, Redraw, Settle, Step, Touches,
+    Window, DRIVE_SETTLE, MIN_NAP, PANEL_SETTLE, PANEL_UPDATE,
 };
 use crate::update::{self, Check, Release, Updates, Version};
 use crate::view;
@@ -87,6 +88,9 @@ struct Display {
     dozing: Arc<AtomicBool>,
     /// Whether the panel's inability to say an update finished was logged.
     panel_error_logged: Arc<AtomicBool>,
+    /// Where this doze's time went; shared with the threads that end wakes
+    /// and the dashboard worker, which says when a tick drew in full.
+    ledger: Arc<Mutex<DozeLedger>>,
 }
 
 /// How a wait for a doze wake's redraw ended.
@@ -107,9 +111,6 @@ enum Drawn {
 struct DashboardFrames {
     shown: Mutex<Shown>,
     changed: Condvar,
-    /// The next prayer as of the last frame: how often a dozing dashboard
-    /// needs drawing ([`crate::system::next_redraw`]).
-    next_prayer: Mutex<Option<DateTime<Utc>>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -247,6 +248,9 @@ enum Tick {
     /// Render the minute now; no network, which may still be down after a nap.
     /// A doze wake's draw carries the wake, which its frame reports back.
     Draw(Option<u64>),
+    /// Like [`Tick::Draw`], but only the clock and countdown, unless the day
+    /// or the next prayer has changed since the last full frame.
+    Minute(Option<u64>),
     /// Fetch what is due, then render; an online doze wake's carries the wake.
     Fetch(Option<u64>),
     /// Read Miqat's file again, as a fresh start would, then render.
@@ -267,6 +271,8 @@ struct State {
     /// When dozing last measured the battery, and went online if it has a
     /// dashboard to fetch for.
     online: Option<DateTime<Utc>>,
+    /// When this doze last redrew in full ([`Redraw`]).
+    full: Option<DateTime<Utc>>,
 }
 
 /// A poisoned lock still holds the last value written, which is all kindil needs.
@@ -445,6 +451,7 @@ impl App {
         let dashboard = store.prefs.dashboard.unwrap_or(options.config.dashboard);
         let (sender, queue) = mpsc::channel();
         let timezone = options.config.timezone;
+        let ledger = Arc::new(Mutex::new(DozeLedger::new((options.now)(), None)));
         let ctx = Ctx {
             weak: window.as_weak(),
             host: options.host,
@@ -458,6 +465,7 @@ impl App {
                 system: Mode::start(Instant::now()),
                 idle: Idle::new(options.touches.count(), Instant::now()),
                 online: None,
+                full: None,
             })),
             display: Display {
                 panel: options.panel,
@@ -466,6 +474,7 @@ impl App {
                 dashboard: Arc::default(),
                 dozing: Arc::default(),
                 panel_error_logged: Arc::default(),
+                ledger: ledger.clone(),
             },
             config: Rc::new(options.config),
             execution: options.execution,
@@ -480,7 +489,7 @@ impl App {
             doze_gauge: Arc::default(),
             timers: Rc::default(),
             draw_wake: Arc::default(),
-            ledger: Arc::new(Mutex::new(DozeLedger::new((options.now)(), None))),
+            ledger,
             timezone: Arc::new(Mutex::new(timezone)),
             finding: Arc::default(),
         };
@@ -544,9 +553,19 @@ impl App {
         *lock(&self.ctx.exit)
     }
 
+    /// A whole dashboard page.
     pub fn set_miqat(&self, gray: miqat::image::Gray) {
+        let split = crate::dashboards::Split::of(gray);
         let k = self.window.global::<Kindil>();
-        k.set_miqat_frame(slint::Image::from_rgb8(pixels(gray)));
+        k.set_miqat_header(slint::Image::from_rgb8(pixels(split.header)));
+        k.set_miqat_body(slint::Image::from_rgb8(pixels(split.body)));
+    }
+
+    /// Only the dashboard's header, over the body on screen, as a minute
+    /// tick draws it.
+    pub fn set_miqat_header(&self, gray: miqat::image::Gray) {
+        let k = self.window.global::<Kindil>();
+        k.set_miqat_header(slint::Image::from_rgb8(pixels(gray)));
     }
 
     /// A power press, USB drive mode, ... as the device would report it.
@@ -1339,6 +1358,8 @@ impl Ctx {
         let now = (self.now)();
         match (was, is) {
             (false, true) => {
+                // The first wake draws in full.
+                self.state.borrow_mut().full = None;
                 let mut ledger = DozeLedger::new(now, None);
                 // Wi-Fi is up until the first nap parks it.
                 ledger.wifi_on(now);
@@ -1422,29 +1443,29 @@ impl Ctx {
         );
     }
 
-    /// The next prayer, while the prayer dashboard is on screen.
-    fn next_prayer(&self) -> Option<DateTime<Utc>> {
-        let ui = self.ui()?;
-        (ui.global::<Kindil>().get_dashboard() == DashboardKind::Miqat
-            && matches!(self.state.borrow().miqat, Worker::Started(_)))
-        .then(|| *lock(&self.display.dashboard.next_prayer))
-        .flatten()
-    }
-
-    /// Back from a nap: draw what is due, go online if a fetch is due, and
-    /// nap again as soon as the panel has the frame.
+    /// Back from a nap: draw what is due (most minutes only the clock and
+    /// countdown), go online if a fetch is due, and nap again as soon as the
+    /// panel has the frame.
     fn redraw_doze(&self) {
         let now = (self.now)();
         let dashboard = matches!(self.state.borrow().miqat, Worker::Started(_));
         // Every half hour of wall time: the battery's draw, and the weather.
-        let (half_hour, window) = {
+        let (half_hour, window, redraw) = {
             let mut state = self.state.borrow_mut();
             let last = state.online;
             let half_hour = Window::after_nap(last, now, true) == Window::Online;
             if half_hour {
                 state.online = Some(now);
             }
-            (half_hour, Window::after_nap(last, now, dashboard))
+            let window = Window::after_nap(last, now, dashboard);
+            let redraw = match window {
+                Window::Online => Redraw::Full,
+                Window::Draw => Redraw::after_nap(state.full, now),
+            };
+            if redraw == Redraw::Full {
+                state.full = Some(now);
+            }
+            (half_hour, window, redraw)
         };
         // Before the redraw starts: this wake, and the panel frames drawn so
         // far; its dashboard frame is tagged with the wake.
@@ -1452,22 +1473,27 @@ impl Ctx {
         let drawn = self.display.frames();
         let due = {
             let mut ledger = lock(&self.ledger);
-            ledger.woke(now, Instant::now(), window);
+            ledger.woke(now, Instant::now(), window, redraw);
             ledger.due(now)
         };
         if due {
             self.log_ledger(now);
         }
         self.tick_clock();
-        self.refresh_battery();
+        // A tick reads nothing: the battery on screen is at most a few
+        // minutes old.
+        if redraw == Redraw::Full {
+            self.refresh_battery();
+        }
         if half_hour {
             self.measure_doze(now);
         }
-        match window {
-            Window::Draw => self.tick_miqat(Tick::Draw(Some(wake))),
-            Window::Online => {
-                // The minute now; the fetched frame once Wi-Fi is back.
-                self.tick_miqat(Tick::Draw(None));
+        match (window, redraw) {
+            (Window::Draw, Redraw::Full) => self.tick_miqat(Tick::Draw(Some(wake))),
+            (Window::Draw, Redraw::Tick) => self.tick_miqat(Tick::Minute(Some(wake))),
+            (Window::Online, _) => {
+                // The minute now; the fetched frame, in full, once Wi-Fi is back.
+                self.tick_miqat(Tick::Minute(None));
                 lock(&self.ledger).wifi_on(now);
                 let ticks = self.miqat_ticks();
                 self.reconnect_wifi(move |result| {
@@ -1539,7 +1565,7 @@ impl Ctx {
             Effect::Nap => {
                 let now = (self.now)();
                 // On the redraw's minute, plus a second so the clock has turned.
-                let nap = (crate::system::next_redraw(now, self.next_prayer()) - now)
+                let nap = (crate::system::next_redraw(now) - now)
                     .to_std()
                     .unwrap_or_default()
                     + Duration::from_secs(1);
@@ -2171,6 +2197,45 @@ fn load_miqat(
     }
 }
 
+/// A rendered dashboard frame: the header, and the body unless only the
+/// header was drawn.
+type Rendered = (
+    slint::SharedPixelBuffer<slint::Rgb8Pixel>,
+    Option<slint::SharedPixelBuffer<slint::Rgb8Pixel>>,
+);
+
+/// Renders what `asked` calls for at `now`, given the board of the full
+/// frame on screen; returns the frame (or its error), what it drew, and the
+/// board on screen after it.
+fn render_miqat(
+    config: &miqat::config::Config,
+    renderer: &miqat::render::Renderer,
+    sources: &miqat::sources::Sources,
+    now: DateTime<Utc>,
+    asked: Draw,
+    shown: Option<Board>,
+) -> (Result<Rendered, String>, Draw, Option<Board>) {
+    let board = Board::at(config, now);
+    let draw = crate::dashboards::draw(asked, shown, board);
+    let frame = match draw {
+        Draw::Full => crate::dashboards::render(renderer, config, now, sources).map(|page| {
+            let split = crate::dashboards::Split::of(page);
+            (pixels(split.header), Some(pixels(split.body)))
+        }),
+        Draw::Header => {
+            crate::dashboards::render_header(renderer, config, now).map(|h| (pixels(h), None))
+        }
+    }
+    .map_err(|e| e.to_string());
+    let shown = match (&frame, draw) {
+        (Ok(_), Draw::Full) => board,
+        (Ok(_), Draw::Header) => shown,
+        // Whatever is on screen, the next draw is in full.
+        (Err(_), _) => None,
+    };
+    (frame, draw, shown)
+}
+
 /// Owns Miqat's cached weather and radar sources; renders on each minute.
 fn miqat_worker(
     path: &std::path::Path,
@@ -2183,40 +2248,52 @@ fn miqat_worker(
     };
     let mut renderer = miqat::render::Renderer::new(config.display.contrast);
     let mut sources = miqat::sources::Sources::new(&config);
-    let show = |config: &miqat::config::Config,
-                renderer: &miqat::render::Renderer,
-                sources: &miqat::sources::Sources,
-                wake: Option<u64>| {
-        let now = Utc::now();
-        let frame = crate::dashboards::render(renderer, config, now, sources)
-            .map(pixels)
-            .map_err(|e| e.to_string());
-        *lock(&display.dashboard.next_prayer) = crate::dashboards::next_prayer(config, now);
+    // The board of the full frame on screen.
+    let mut shown = None;
+    let mut show = |config: &miqat::config::Config,
+                    renderer: &miqat::render::Renderer,
+                    sources: &miqat::sources::Sources,
+                    wake: Option<u64>,
+                    asked: Draw| {
+        let (frame, drew, board) =
+            render_miqat(config, renderer, sources, Utc::now(), asked, shown);
+        shown = board;
         let display = display.clone();
         weak.upgrade_in_event_loop(move |ui| {
             let k = ui.global::<Kindil>();
             match frame {
-                Ok(buffer) => {
-                    k.set_miqat_frame(slint::Image::from_rgb8(buffer));
-                    display.updated(&ui, Update::DashboardFrame);
+                Ok((header, body)) => {
+                    k.set_miqat_header(slint::Image::from_rgb8(header));
+                    let update = match body {
+                        Some(body) => {
+                            k.set_miqat_body(slint::Image::from_rgb8(body));
+                            Update::DashboardFrame
+                        }
+                        None => Update::DashboardHeader,
+                    };
+                    display.updated(&ui, update);
                 }
                 Err(error) => k.set_miqat_error(error.into()),
+            }
+            if wake.is_some() && (asked, drew) == (Draw::Header, Draw::Full) {
+                lock(&display.ledger).drew_full();
             }
             display.dashboard_shown(wake);
         })
     };
     // First paint before any network, so a slow fetch never leaves it blank.
-    if show(&config, &renderer, &sources, None).is_err() {
+    if show(&config, &renderer, &sources, None, Draw::Full).is_err() {
         return;
     }
     let mut tick = Tick::Fetch(None);
     loop {
-        let wake = match tick {
+        let (wake, asked) = match tick {
             Tick::Fetch(wake) => {
                 sources.refresh(&config, Utc::now());
-                wake
+                (wake, Draw::Full)
             }
-            Tick::Draw(wake) => wake,
+            Tick::Draw(wake) => (wake, Draw::Full),
+            Tick::Minute(wake) => (wake, Draw::Header),
             // A file that no longer reads keeps the dashboard as it was.
             Tick::Reload => match miqat::config::Config::load(path) {
                 Ok(fresh) => {
@@ -2226,15 +2303,15 @@ fn miqat_worker(
                     }
                     renderer = miqat::render::Renderer::new(fresh.display.contrast);
                     config = fresh;
-                    None
+                    (None, Draw::Full)
                 }
                 Err(error) => {
                     eprintln!("kindil: reloading {}: {error:#}", path.display());
-                    None
+                    (None, Draw::Full)
                 }
             },
         };
-        if show(&config, &renderer, &sources, wake).is_err() {
+        if show(&config, &renderer, &sources, wake, asked).is_err() {
             return;
         }
         tick = loop {
@@ -2276,6 +2353,7 @@ mod tests {
             dashboard: Arc::default(),
             dozing: Arc::default(),
             panel_error_logged: Arc::default(),
+            ledger: Arc::new(Mutex::new(DozeLedger::new(Utc::now(), None))),
         }
     }
 

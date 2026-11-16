@@ -256,6 +256,92 @@ fn miqat_is_pixel_exact_and_taps_reveal_both_bars() {
 }
 
 #[test]
+fn a_minute_tick_redraws_only_the_header_rows() {
+    use slint::platform::software_renderer::RepaintBufferType;
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    let miqat = miqat::config::Config::load(Path::new("examples/miqat.toml")).unwrap();
+    let noon = chrono::DateTime::from_timestamp(1_794_398_400, 0).unwrap();
+    let minute = noon + chrono::TimeDelta::minutes(1);
+    f.app
+        .set_miqat(kindil::dashboards::preview(&miqat, noon).unwrap());
+    f.k().set_dashboard(DashboardKind::Miqat);
+    // As the Kindle backend renders: into the buffer the last frame left,
+    // reporting the region that changed.
+    let mut buffer = vec![slint::Rgb8Pixel::default(); 758 * 1024];
+    let mut render = || {
+        let mut dirty = None;
+        slint::platform::update_timers_and_animations();
+        f.window.draw_if_needed(|renderer| {
+            renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
+            let region = renderer.render(&mut buffer, 758);
+            dirty = Some((region.bounding_box_origin(), region.bounding_box_size()));
+        });
+        dirty
+    };
+    f.app.window.window().request_redraw();
+    render();
+    f.app
+        .set_miqat_header(kindil::dashboards::preview_header(&miqat, minute).unwrap());
+    assert_eq!(
+        render(),
+        Some((
+            slint::PhysicalPosition::new(0, 0),
+            slint::PhysicalSize::new(758, miqat::layout::HEADER_HEIGHT)
+        )),
+        "only the header's rows go to the panel"
+    );
+    // The header patched over the last page is the next minute's page.
+    let expected = kindil::dashboards::preview(&miqat, minute).unwrap().pixels;
+    let badge = |i: usize| (300..460).contains(&(i % 758)) && (4..48).contains(&(i / 758));
+    assert!(
+        buffer
+            .iter()
+            .enumerate()
+            .all(|(i, p)| badge(i) || p.r == expected[i]),
+        "the patched frame is the next minute's page, pixel for pixel"
+    );
+}
+
+/// Host timings of the window's share of a doze wake: `cargo test --release
+/// --test slint_ui window_render_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "a timing, not a check"]
+fn window_render_cost() {
+    use slint::platform::software_renderer::RepaintBufferType;
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    let miqat = miqat::config::Config::load(Path::new("examples/miqat.toml")).unwrap();
+    let noon = chrono::DateTime::from_timestamp(1_794_398_400, 0).unwrap();
+    let page = kindil::dashboards::preview(&miqat, noon).unwrap();
+    let header = kindil::dashboards::preview_header(&miqat, noon).unwrap();
+    f.app.set_miqat(page.clone());
+    f.k().set_dashboard(DashboardKind::Miqat);
+    let mut buffer = vec![slint::Rgb8Pixel::default(); 758 * 1024];
+    let mut render = || {
+        slint::platform::update_timers_and_animations();
+        f.window.draw_if_needed(|renderer| {
+            renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
+            std::hint::black_box(renderer.render(&mut buffer, 758));
+        });
+    };
+    f.app.window.window().request_redraw();
+    render();
+    let rounds = 20;
+    let start = std::time::Instant::now();
+    (0..rounds).for_each(|_| {
+        f.app.set_miqat(page.clone());
+        render();
+    });
+    let full = start.elapsed() / rounds;
+    let start = std::time::Instant::now();
+    (0..rounds).for_each(|_| {
+        f.app.set_miqat_header(header.clone());
+        render();
+    });
+    let tick = start.elapsed() / rounds;
+    println!("window: full page set and rendered {full:?}, header only {tick:?}");
+}
+
+#[test]
 fn the_status_row_drops_a_panel_over_the_page() {
     let f = Fixture::new(Arc::new(Simulated::default()));
     f.tap(LIBRARY_TAB, TAB_Y);

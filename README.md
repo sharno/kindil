@@ -61,14 +61,20 @@ and a reboot always returns the Kindle to stock.
   - **Sleep when idle**: Doze (the default), Never, or a full sleep after
     5, 15, 30 or 60 minutes without a touch. Doze is for an always-on wall
     dashboard: after 2 minutes without a touch the light goes off and the
-    Kindle suspends to RAM, waking on the RTC alarm to redraw the clock and
-    countdown (every minute within the hour before the next prayer, every 5
-    minutes before that, on the clock's multiples of 5) and napping again as
-    soon as the panel has the frame. Every 30 minutes it also rejoins Wi-Fi
-    to fetch the weather; between those fetches wpa_supplicant stays off the
-    network. Once an hour it logs a doze ledger: awake and asleep seconds,
-    wakes, Wi-Fi-up seconds, how redraws ended, and the gauge. The power
-    button brings it back with the light restored, and Wi-Fi rejoins.
+    Kindle suspends to RAM, waking on the RTC alarm each minute and napping
+    again as soon as the panel has the frame. Most minutes are a tick: only
+    the dashboard's top 300 rows (the clock, the next prayer and the
+    countdown) are rendered and sent to the panel as a partial update, with
+    nothing else read. The whole dashboard (timetable, weather, radar) and
+    the battery gauge redraw once in each 5 minutes of the clock (on its
+    multiples of 5, when the weather on screen moves on), when the day or
+    the next prayer changes, after a fetch, and whenever the device is
+    woken. Every 30 minutes it also rejoins Wi-Fi to fetch the weather;
+    between those fetches wpa_supplicant stays off the network. Once an hour
+    it logs a doze ledger: awake and asleep seconds, wakes (ticks and full
+    redraws apart, with the seconds each), Wi-Fi-up seconds, how redraws
+    ended, and the gauge. The power button brings it back with the light
+    restored, and Wi-Fi rejoins.
   - **Wi-Fi of its own**: kindil runs Wi-Fi itself with the networks joined
     in it, saved in `/var/local/kindil/networks.toml` (plain text, readable
     by root only; a network is saved once it has joined). It loads the
@@ -111,7 +117,8 @@ and a reboot always returns the Kindle to stock.
   the moved area gets a fast black-and-white clean, and on release a hard
   grayscale clean (a flash of that area only). In the
   reader, swipe left/right or tap to turn pages. Page changes flash the panel
-  once; reading flashes every 6th page turn, the dashboard every 30 minutes, to
+  once; reading flashes every 6th page turn, the dashboard every 30 minutes
+  (on the first full redraw after 30 updates; a minute tick never flashes), to
   clear ghosting.
 
 ## Install on the Kindle

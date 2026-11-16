@@ -41,11 +41,28 @@ impl Renderer {
         )
     }
 
+    /// Only the header: the top [`layout::HEADER_HEIGHT`] rows of [`Self::gray`]'s
+    /// page, pixel for pixel, at a fraction of the cost. The frame's weather
+    /// and radar aren't used.
+    pub fn header_gray(&self, frame: &Frame) -> anyhow::Result<Gray> {
+        self.rasterize(&layout::header_svg(frame), layout::HEADER_HEIGHT, None)
+    }
+
     /// Rasterises a dashboard SVG, blitting an optional radar raster first at (left, top).
     pub fn gray_svg(&self, svg: &str, radar: Option<(&Gray, i64, i64)>) -> anyhow::Result<Gray> {
+        self.rasterize(svg, layout::HEIGHT, radar)
+    }
+
+    /// The top `height` rows of the page `svg` draws.
+    fn rasterize(
+        &self,
+        svg: &str,
+        height: u32,
+        radar: Option<(&Gray, i64, i64)>,
+    ) -> anyhow::Result<Gray> {
         let tree = usvg::Tree::from_str(svg, &self.options).context("parsing SVG")?;
         let mut pixmap =
-            tiny_skia::Pixmap::new(layout::WIDTH, layout::HEIGHT).context("allocating canvas")?;
+            tiny_skia::Pixmap::new(layout::WIDTH, height).context("allocating canvas")?;
         pixmap.fill(tiny_skia::Color::WHITE);
         if let Some((map, left, top)) = radar {
             draw_gray(&mut pixmap, map, left, top);
@@ -53,7 +70,7 @@ impl Renderer {
         resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
         Ok(Gray {
             width: layout::WIDTH,
-            height: layout::HEIGHT,
+            height,
             // The canvas is opaque, so premultiplied and straight RGBA agree.
             pixels: pixmap
                 .pixels()
@@ -97,6 +114,72 @@ fn quantize(value: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::config::{ClockFormat, Config};
+    use crate::prayer::{DayTimes, local_date};
+    use crate::sources::Snapshot;
+    use crate::weather::{Quarter, WET_MM};
+    use chrono::{DateTime, Duration, Utc};
+
+    /// Every layout the header sits over: each prayer next, both clocks,
+    /// without weather, with it, and with rain on the way (the radar card).
+    #[test]
+    fn the_header_alone_is_the_pages_top_pixel_for_pixel() {
+        let mut config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        let mut weather = crate::weather::decode(
+            include_str!("../tests/fixtures/open-meteo.json"),
+            config.location.timezone,
+        )
+        .unwrap();
+        let start = weather.hours[0].at;
+        let mut rainy = weather.clone();
+        rainy.quarters = (0..400)
+            .map(|i| Quarter {
+                at: start + Duration::minutes(15 * i),
+                precipitation_mm: WET_MM,
+            })
+            .collect();
+        weather
+            .quarters
+            .iter_mut()
+            .for_each(|q| q.precipitation_mm = 0.0);
+        let snapshot = |data| Snapshot {
+            data,
+            fetched_at: start,
+        };
+        let (dry, wet) = (snapshot(weather), snapshot(rainy));
+        let renderer = Renderer::new(config.display.contrast);
+        let header_len = (layout::WIDTH * layout::HEADER_HEIGHT) as usize;
+        for clock in [ClockFormat::TwentyFourHour, ClockFormat::TwelveHour] {
+            config.display.clock = clock;
+            // Through a day, each prayer's countdown in turn, and past Isha.
+            for hours in (1..24).step_by(2) {
+                let now: DateTime<Utc> = start + Duration::hours(hours) + Duration::minutes(7);
+                let date = local_date(&config.location, now);
+                let prayers = DayTimes::compute(&config.location, &config.prayer, date).unwrap();
+                for weather in [None, Some(&dry), Some(&wet)] {
+                    let frame = Frame {
+                        now,
+                        config: &config,
+                        prayers: &prayers,
+                        weather,
+                        radar: None,
+                    };
+                    let page = renderer.gray(&frame).unwrap();
+                    let header = renderer.header_gray(&frame).unwrap();
+                    assert_eq!((header.width, header.height), (layout::WIDTH, 300));
+                    assert!(
+                        page.pixels[..header_len] == header.pixels[..],
+                        "the header differs from the page's top at {now} ({clock:?})"
+                    );
+                    assert!(
+                        header.pixels.iter().filter(|&&p| p == 0).count() > 10_000,
+                        "the header draws the clock and countdown"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn quantize_hits_16_levels() {

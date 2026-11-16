@@ -26,8 +26,14 @@ const MARGIN: f64 = 28.0;
 const RIGHT: f64 = WIDTH as f64 - MARGIN;
 const MUTED: &str = "#666";
 
+/// The rows the header (clock, date, next prayer, countdown and its divider)
+/// draws in, and nothing else does: [`header_svg`] renders just these, the
+/// same pixels as the whole page has there.
+pub const HEADER_HEIGHT: u32 = 300;
 /// The timetable starts under the header divider.
 const PRAYERS_TOP: f64 = 302.0;
+/// The next prayer's highlight starts 3 px into the timetable: below the header.
+const _: () = assert!(PRAYERS_TOP + 3.0 > HEADER_HEIGHT as f64);
 /// Two columns of three rows: the six times fit in half the height they used to.
 const PRAYER_ROW: f64 = 46.0;
 const COLUMN_WIDTH: f64 = 336.0;
@@ -57,9 +63,22 @@ impl Frame<'_> {
 }
 
 pub fn svg(frame: &Frame) -> String {
-    let body = [header(frame), prayers(frame), weather(frame)].concat();
+    document(
+        HEIGHT,
+        &[header(frame), prayers(frame), weather(frame)].concat(),
+    )
+}
+
+/// Only the header, on a canvas [`HEADER_HEIGHT`] tall: the top of
+/// [`svg`]'s page, for redrawing the clock and countdown alone. Uses only
+/// the frame's time, config and prayers.
+pub fn header_svg(frame: &Frame) -> String {
+    document(HEADER_HEIGHT, &header(frame))
+}
+
+fn document(height: u32, body: &str) -> String {
     format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{HEIGHT}" viewBox="0 0 {WIDTH} {HEIGHT}" font-family="IBM Plex Sans Arabic">{body}</svg>"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{height}" viewBox="0 0 {WIDTH} {height}" font-family="IBM Plex Sans Arabic">{body}</svg>"#
     )
 }
 

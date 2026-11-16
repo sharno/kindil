@@ -46,14 +46,12 @@ pub const ONLINE_EVERY: chrono::TimeDelta = chrono::TimeDelta::minutes(30);
 pub const ONLINE_CEILING: Duration = Duration::from_secs(60);
 /// Shorter naps aren't worth a suspend: kindil waits for the minute awake.
 pub const MIN_NAP: Duration = Duration::from_secs(5);
-/// While the next prayer is more than [`NEAR_PRAYER`] away, a dozing
-/// dashboard redraws every this many minutes, on the wall clock's multiples
-/// of it: each wake costs a resume, a render, a panel update and a suspend.
-/// The clock and countdown on screen are then up to 4 minutes behind.
-pub const FAR_REDRAW_MINUTES: u32 = 5;
-/// Within this of the next prayer, a dozing dashboard redraws every minute,
-/// so the countdown is exact when it matters.
-pub const NEAR_PRAYER: chrono::TimeDelta = chrono::TimeDelta::minutes(60);
+/// A dozing dashboard wakes every minute, but redraws all of itself only
+/// once in each block of this many minutes of the wall clock (and when the
+/// day or the next prayer changes, or the weather was fetched): the other
+/// minutes are [`Redraw::Tick`]s, which redraw only the clock and countdown.
+/// The weather on screen changes on quarter hours, which are block starts.
+pub const FULL_REDRAW_MINUTES: u32 = 5;
 /// How often dozing logs where its energy went ([`DozeLedger`]).
 pub const LEDGER_EVERY: chrono::TimeDelta = chrono::TimeDelta::hours(1);
 /// At or below this level on battery, kindil sleeps with a charge screen:
@@ -404,25 +402,38 @@ impl Window {
     }
 }
 
-/// When a dozing dashboard draws next, after `now`: on the next minute
-/// within [`NEAR_PRAYER`] of `next_prayer` (or without one), else on the
-/// next multiple of [`FAR_REDRAW_MINUTES`], or the minute the last hour
-/// starts in if that comes first. Always on a whole minute.
-pub fn next_redraw(now: DateTime<Utc>, next_prayer: Option<DateTime<Utc>>) -> DateTime<Utc> {
+/// When a dozing kindil wakes next, after `now`: on the next whole minute,
+/// when the clock on screen turns.
+pub fn next_redraw(now: DateTime<Utc>) -> DateTime<Utc> {
     use chrono::{DurationRound, TimeDelta};
-    let minute = now.duration_trunc(TimeDelta::minutes(1)).unwrap_or(now) + TimeDelta::minutes(1);
-    let Some(prayer) = next_prayer else {
-        return minute;
-    };
-    let near = prayer - NEAR_PRAYER;
-    let every = TimeDelta::minutes(i64::from(FAR_REDRAW_MINUTES));
-    let far = now.duration_trunc(every).unwrap_or(now) + every;
-    if minute >= near {
-        return minute;
+    now.duration_trunc(TimeDelta::minutes(1)).unwrap_or(now) + TimeDelta::minutes(1)
+}
+
+/// What a dozing wake redraws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Redraw {
+    /// Everything, and the battery is read.
+    Full,
+    /// The clock and countdown only, with nothing else read; the dashboard
+    /// still draws in full if the day or the next prayer has changed.
+    Tick,
+}
+
+impl Redraw {
+    /// Full on the first wake and then once in each block of
+    /// [`FULL_REDRAW_MINUTES`] of the wall clock: on the block's first
+    /// minute, or the first wake after it if that one was missed. `last_full`
+    /// is when the last full one was.
+    pub fn after_nap(last_full: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Self {
+        use chrono::{DurationRound, TimeDelta};
+        let every = TimeDelta::minutes(i64::from(FULL_REDRAW_MINUTES));
+        let block = now.duration_trunc(every).unwrap_or(now);
+        match last_full {
+            // A clock set back draws in full rather than ticking until then.
+            Some(last) if last >= block && last <= now => Redraw::Tick,
+            _ => Redraw::Full,
+        }
     }
-    // The minute the countdown's last hour begins in: a whole minute after
-    // `minute`, so after `now`.
-    far.min(near.duration_trunc(TimeDelta::minutes(1)).unwrap_or(near))
 }
 
 /// How a dozing wake's redraw ended.
@@ -448,6 +459,12 @@ pub struct DozeLedger {
     wakes: u32,
     awake: chrono::TimeDelta,
     online: u32,
+    /// The wakes that redrew only the clock and countdown, and their time
+    /// up; the rest drew in full.
+    ticks: u32,
+    tick_awake: chrono::TimeDelta,
+    /// What the wake under way redraws.
+    redraw: Option<Redraw>,
     slept: chrono::TimeDelta,
     slept_monotonic: Duration,
     wifi_up: chrono::TimeDelta,
@@ -467,6 +484,9 @@ impl DozeLedger {
             wakes: 0,
             awake: chrono::TimeDelta::zero(),
             online: 0,
+            ticks: 0,
+            tick_awake: chrono::TimeDelta::zero(),
+            redraw: None,
             slept: chrono::TimeDelta::zero(),
             slept_monotonic: Duration::ZERO,
             wifi_up: chrono::TimeDelta::zero(),
@@ -483,8 +503,8 @@ impl DozeLedger {
         self.gauge = self.gauge.or(gauge);
     }
 
-    /// Back from a nap; `window` says what the wake does.
-    pub fn woke(&mut self, now: DateTime<Utc>, monotonic: Instant, window: Window) {
+    /// Back from a nap; `window` and `redraw` say what the wake does.
+    pub fn woke(&mut self, now: DateTime<Utc>, monotonic: Instant, window: Window, redraw: Redraw) {
         if let Some((wall, mono)) = self.napping_from.take() {
             self.slept += now - wall;
             self.slept_monotonic += monotonic.saturating_duration_since(mono);
@@ -493,14 +513,31 @@ impl DozeLedger {
         if window == Window::Online {
             self.online += 1;
         }
+        if redraw == Redraw::Tick {
+            self.ticks += 1;
+        }
+        self.redraw = Some(redraw);
         self.awake_from = Some(now);
+    }
+
+    /// The tick under way drew in full after all: the day or the next prayer
+    /// changed.
+    pub fn drew_full(&mut self) {
+        if self.redraw == Some(Redraw::Tick) {
+            self.ticks = self.ticks.saturating_sub(1);
+            self.redraw = Some(Redraw::Full);
+        }
     }
 
     /// About to nap.
     pub fn napping(&mut self, now: DateTime<Utc>, monotonic: Instant) {
         if let Some(from) = self.awake_from.take() {
             self.awake += now - from;
+            if self.redraw == Some(Redraw::Tick) {
+                self.tick_awake += now - from;
+            }
         }
+        self.redraw = None;
         self.napping_from = Some((now, monotonic));
     }
 
@@ -545,16 +582,20 @@ impl DozeLedger {
         // What is under way counts up to now here, and from now in the next.
         if let Some(from) = self.awake_from {
             self.awake += now - from;
+            if self.redraw == Some(Redraw::Tick) {
+                self.tick_awake += now - from;
+            }
         }
         if let Some(from) = self.wifi_from {
             self.wifi_up += now - from;
         }
         let over = now - self.since;
         let seconds = |d: chrono::TimeDelta| d.num_milliseconds() as f64 / 1000.0;
-        let per_wake = match self.wakes {
+        let each = |time: chrono::TimeDelta, wakes: u32| match wakes {
             0 => 0.0,
-            n => seconds(self.awake) / f64::from(n),
+            n => seconds(time) / f64::from(n),
         };
+        let fulls = self.wakes.saturating_sub(self.ticks);
         let used = match (self.gauge, gauge) {
             (Some(from), Some(to)) => {
                 let used = i64::from(from.0) - i64::from(to.0);
@@ -572,14 +613,19 @@ impl DozeLedger {
             (sum, n) => format!("{} mA", sum / i64::from(n)),
         };
         let line = format!(
-            "doze ledger over {} min: awake {:.0} s in {} wakes ({:.1} s each, {} online), \
-             asleep {:.0} s (monotonic {} s), Wi-Fi up {:.0} s, panel done {} / timed {} / \
-             not seen {}, gauge {used}, current at wake {current}",
+            "doze ledger over {} min: awake {:.0} s in {} wakes ({:.1} s each, {} online; \
+             {} ticks {:.2} s each, {} full {:.2} s each), asleep {:.0} s (monotonic {} s), \
+             Wi-Fi up {:.0} s, panel done {} / timed {} / not seen {}, gauge {used}, \
+             current at wake {current}",
             over.num_minutes(),
             seconds(self.awake),
             self.wakes,
-            per_wake,
+            each(self.awake, self.wakes),
             self.online,
+            self.ticks,
+            each(self.tick_awake, self.ticks),
+            fulls,
+            each(self.awake - self.tick_awake, fulls),
             seconds(self.slept),
             self.slept_monotonic.as_secs(),
             seconds(self.wifi_up),
@@ -587,10 +633,15 @@ impl DozeLedger {
             self.settles[1],
             self.settles[2],
         );
-        let (awake_from, napping_from, wifi_from) =
-            (self.awake_from, self.napping_from, self.wifi_from);
+        let (awake_from, napping_from, wifi_from, redraw) = (
+            self.awake_from,
+            self.napping_from,
+            self.wifi_from,
+            self.redraw,
+        );
         *self = Self::new(now, gauge.or(self.gauge));
         self.awake_from = awake_from.map(|_| now);
+        self.redraw = redraw;
         self.napping_from = napping_from;
         self.wifi_from = wifi_from.map(|_| now);
         line
@@ -900,26 +951,28 @@ mod tests {
     }
 
     #[test]
-    fn far_from_a_prayer_the_dashboard_redraws_every_five_minutes() {
-        let prayer = Some(wall(12, 30, 0));
-        assert_eq!(next_redraw(wall(9, 0, 3), prayer), wall(9, 5, 0));
-        assert_eq!(next_redraw(wall(9, 4, 59), prayer), wall(9, 5, 0));
-        assert_eq!(next_redraw(wall(9, 5, 1), prayer), wall(9, 10, 0));
+    fn dozing_wakes_on_every_minute() {
+        assert_eq!(next_redraw(wall(9, 0, 3)), wall(9, 1, 0));
+        assert_eq!(next_redraw(wall(9, 4, 59)), wall(9, 5, 0));
+        assert_eq!(next_redraw(wall(9, 5, 0)), wall(9, 6, 0));
     }
 
     #[test]
-    fn within_the_last_hour_it_redraws_every_minute() {
-        let prayer = Some(wall(12, 30, 0));
-        // The last hour starts at 11:30, between two five-minute marks.
-        assert_eq!(next_redraw(wall(11, 26, 1), prayer), wall(11, 30, 0));
-        assert_eq!(next_redraw(wall(11, 30, 1), prayer), wall(11, 31, 0));
-        assert_eq!(next_redraw(wall(12, 29, 1), prayer), wall(12, 30, 0));
-        // A prayer at an odd second: its hour starts mid-minute.
-        let odd = Some(wall(12, 32, 30));
-        assert_eq!(next_redraw(wall(11, 30, 1), odd), wall(11, 32, 0));
-        assert_eq!(next_redraw(wall(11, 32, 1), odd), wall(11, 33, 0));
-        // No prayer known (the clock dashboard): every minute.
-        assert_eq!(next_redraw(wall(9, 0, 3), None), wall(9, 1, 0));
+    fn minutes_tick_and_each_five_minute_block_redraws_in_full() {
+        use Redraw::{Full, Tick};
+        // The first wake of a doze draws in full.
+        assert_eq!(Redraw::after_nap(None, wall(9, 1, 1)), Full);
+        let full = Some(wall(9, 0, 1));
+        assert_eq!(Redraw::after_nap(full, wall(9, 1, 1)), Tick);
+        assert_eq!(Redraw::after_nap(full, wall(9, 4, 1)), Tick);
+        assert_eq!(Redraw::after_nap(full, wall(9, 5, 1)), Full);
+        // A wake that slipped past the block's first minute still draws it.
+        assert_eq!(Redraw::after_nap(full, wall(9, 6, 1)), Full);
+        assert_eq!(Redraw::after_nap(Some(wall(9, 6, 1)), wall(9, 7, 1)), Tick);
+        // Within the hour before a prayer too: the tick keeps the countdown exact.
+        assert_eq!(Redraw::after_nap(full, wall(9, 2, 1)), Tick);
+        // A clock set back doesn't tick until it catches up.
+        assert_eq!(Redraw::after_nap(Some(wall(10, 0, 1)), wall(9, 2, 1)), Full);
     }
 
     #[test]
@@ -931,24 +984,54 @@ mod tests {
         let mut ledger = DozeLedger::new(t0, Some(MilliampHours(500)));
         ledger.napping(t0, i0);
         // One online wake with Wi-Fi up 20 s, then a drawing one.
-        ledger.woke(t0 + secs(58), i0 + Duration::from_secs(1), Window::Online);
+        ledger.woke(
+            t0 + secs(58),
+            i0 + Duration::from_secs(1),
+            Window::Online,
+            Redraw::Full,
+        );
         ledger.wifi_on(t0 + secs(58));
         ledger.current_at_wake(-4);
         ledger.wifi_off(t0 + secs(78));
         ledger.settled(Settle::Done);
         ledger.napping(t0 + secs(80), i0 + Duration::from_secs(23));
-        ledger.woke(t0 + secs(178), i0 + Duration::from_secs(24), Window::Draw);
+        ledger.woke(
+            t0 + secs(178),
+            i0 + Duration::from_secs(24),
+            Window::Draw,
+            Redraw::Full,
+        );
         ledger.current_at_wake(-6);
         ledger.settled(Settle::Timed);
         ledger.napping(t0 + secs(181), i0 + Duration::from_secs(27));
+        // Two ticks of half a second; the second drew in full after all.
+        ledger.woke(
+            t0 + secs(240),
+            i0 + Duration::from_secs(28),
+            Window::Draw,
+            Redraw::Tick,
+        );
+        ledger.napping(
+            t0 + secs(240) + chrono::TimeDelta::milliseconds(500),
+            i0 + Duration::from_secs(29),
+        );
+        ledger.woke(
+            t0 + secs(300),
+            i0 + Duration::from_secs(30),
+            Window::Draw,
+            Redraw::Tick,
+        );
+        ledger.drew_full();
+        ledger.napping(t0 + secs(302), i0 + Duration::from_secs(32));
         assert!(!ledger.due(t0 + secs(3599)));
         assert!(ledger.due(t0 + secs(3600)));
         let line = ledger.close(t0 + secs(3600), Some(MilliampHours(490)));
         assert_eq!(
             line,
-            "doze ledger over 60 min: awake 25 s in 2 wakes (12.5 s each, 1 online), \
-             asleep 156 s (monotonic 2 s), Wi-Fi up 20 s, panel done 1 / timed 1 / \
-             not seen 0, gauge 10 mAh (10 mA), 490 mAh left, current at wake -5 mA"
+            "doze ledger over 60 min: awake 28 s in 4 wakes (6.9 s each, 1 online; \
+             1 ticks 0.50 s each, 3 full 9.00 s each), asleep 274 s (monotonic 4 s), \
+             Wi-Fi up 20 s, panel done 1 / timed 1 / not seen 0, gauge 10 mAh (10 mA), \
+             490 mAh left, current at wake -5 mA"
         );
         // The next hour counts from the last gauge reading.
         let line = ledger.close(t0 + secs(7200), None);
