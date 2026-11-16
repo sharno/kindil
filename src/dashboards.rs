@@ -1,4 +1,4 @@
-//! Miqat is a pinned git submodule/library, not a forked layout.
+//! Miqat is its own library (a git subtree of sharno/miqat), not a forked layout.
 use chrono::{DateTime, Utc};
 pub fn render(
     renderer: &miqat::render::Renderer,

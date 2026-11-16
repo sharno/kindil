@@ -266,7 +266,7 @@ Caveats before relying on it:
 ## Develop
 
 ```sh
-git clone --recurse-submodules git@github.com:sharno/kindil.git
+git clone git@github.com:sharno/kindil.git
 cd kindil
 nix develop
 
@@ -274,6 +274,16 @@ cargo xtask sim       # every screen → dist/sim/*.png, simulated device
 cargo xtask desktop   # interactive window, simulated device
 cargo xtask check     # fmt, clippy, every test suite
 cargo xtask test-arm  # tests on ARM under qemu-arm
+```
+
+The dashboard engine, Miqat, is its own project
+([sharno/miqat](https://github.com/sharno/miqat)), carried in
+`crates/miqat` as a git subtree: a plain clone has it, and changes made here
+go back with `git subtree push`.
+
+```sh
+git subtree pull --prefix=crates/miqat https://github.com/sharno/miqat.git main   # take Miqat's changes
+git subtree push --prefix=crates/miqat https://github.com/sharno/miqat.git BRANCH # send kindil's back
 ```
 
 `preview` and `desktop` use a simulated device: no file under `/mnt/us`, no

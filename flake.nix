@@ -1,7 +1,6 @@
 {
   description = "kindil (قنديل): Slint dashboard and reader for Kindle PW1";
   inputs = {
-    self.submodules = true;
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";

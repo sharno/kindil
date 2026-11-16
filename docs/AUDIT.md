@@ -27,7 +27,7 @@ the riskiest duplication.
 | Initial tests copied the renderer instead of exercising it | Drive the real Slint component/software renderer |
 | Timezone offsets passed as seconds at runtime but hours in prayer tests | Remove the parallel prayer implementation; reuse Miqat's existing `salah` configuration and renderer |
 | Bitmap-font-only rendering displayed disconnected Arabic | Runtime vector fonts + contextual shaping; regression compares normal Arabic with ZWNJ-separated Arabic |
-| Recreating Miqat would drift from the actual dashboard | Export Miqat's existing Rust engine as a library and pin its repository as a submodule |
+| Recreating Miqat would drift from the actual dashboard | Export Miqat's existing Rust engine as a library and carry its repository as a git subtree |
 | Full-screen clock repaint after every raw input record | Slint's event/dirty-region pipeline; Miqat image refresh on one background worker |
 | A 74-minute source cross-toolchain build blocked iteration | Prebuilt Rust/ARM std and cached Zig; Cargo artifact reuse |
 | GNU/glibc link driver was insufficient once `-ldl` appeared | Musl-aware Zig link driver; disable Rust's self-contained CRT when Zig supplies it, avoiding duplicate `_start` |
