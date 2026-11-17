@@ -381,7 +381,8 @@ pub enum Window {
 impl Window {
     /// Online at the first wake and then every [`ONLINE_EVERY`] of wall time;
     /// the monotonic clock stops while the device naps. Only a dashboard
-    /// fetches: without one there is nothing to go online for.
+    /// fetches: without one there is nothing to go online for. A last time
+    /// after `now` (a clock set back without it) is no reason to wait.
     pub fn after_nap(
         last_online: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
@@ -389,7 +390,7 @@ impl Window {
     ) -> Self {
         match last_online {
             _ if !dashboard => Window::Draw,
-            Some(last) if now - last < ONLINE_EVERY => Window::Draw,
+            Some(last) if last <= now && now - last < ONLINE_EVERY => Window::Draw,
             _ => Window::Online,
         }
     }
@@ -437,6 +438,59 @@ impl Redraw {
     }
 }
 
+/// What a dozing wake does: whether it is the half hour's (the battery's
+/// draw is measured), whether it goes online, and what it redraws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DozeWake {
+    pub half_hour: bool,
+    pub window: Window,
+    pub redraw: Redraw,
+}
+
+/// When dozing last went online (or would have, without a dashboard) and
+/// redrew in full, on the wall clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Schedule {
+    online: Option<DateTime<Utc>>,
+    full: Option<DateTime<Utc>>,
+}
+
+impl Schedule {
+    /// A doze's first wake draws in full.
+    pub fn doze_began(&mut self) {
+        self.full = None;
+    }
+
+    /// A wake at `now`, with or without a dashboard to fetch for.
+    pub fn wake(&mut self, now: DateTime<Utc>, dashboard: bool) -> DozeWake {
+        let half_hour = Window::after_nap(self.online, now, true) == Window::Online;
+        let window = Window::after_nap(self.online, now, dashboard);
+        if half_hour {
+            self.online = Some(now);
+        }
+        let redraw = match window {
+            Window::Online => Redraw::Full,
+            Window::Draw => Redraw::after_nap(self.full, now),
+        };
+        if redraw == Redraw::Full {
+            self.full = Some(now);
+        }
+        DozeWake {
+            half_hour,
+            window,
+            redraw,
+        }
+    }
+
+    /// Network time stepped the clock by `by`: the last fetch was on the old
+    /// clock, so it moves too and the next comes half an hour after it. The
+    /// last full redraw stays: a step into another block of minutes draws
+    /// that block in full, one set back draws in full at once.
+    pub fn clock_stepped(&mut self, by: chrono::TimeDelta) {
+        self.online = self.online.map(|at| at + by);
+    }
+}
+
 /// How a dozing wake's redraw ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Settle {
@@ -452,7 +506,10 @@ pub enum Settle {
 /// Where a doze's time, and so its energy, went: logged every
 /// [`LEDGER_EVERY`], so a battery measurement explains itself. Times are
 /// wall-clock: the monotonic clock stops while the device naps, which the
-/// monotonic sleep total shows.
+/// monotonic sleep total shows. It notes the clock's corrections too: an
+/// RTC catch-up gives back time a resume lost, so it counts as time that
+/// passed; a step from network time fixes error that built up before, so
+/// the times noted so far move with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DozeLedger {
     since: DateTime<Utc>,
@@ -481,6 +538,10 @@ pub struct DozeLedger {
     napping_from: Option<(DateTime<Utc>, Instant)>,
     wifi_from: Option<DateTime<Utc>>,
     held_from: Option<(DateTime<Utc>, Hold)>,
+    /// Clock corrections: how many, and their sum, from the RTC and from
+    /// the network.
+    clock_rtc: (u32, chrono::TimeDelta),
+    clock_net: (u32, chrono::TimeDelta),
 }
 
 impl DozeLedger {
@@ -506,7 +567,40 @@ impl DozeLedger {
             napping_from: None,
             wifi_from: None,
             held_from: None,
+            clock_rtc: (0, chrono::TimeDelta::zero()),
+            clock_net: (0, chrono::TimeDelta::zero()),
         }
+    }
+
+    /// The clock was stepped.
+    pub fn clock_corrected(&mut self, correction: crate::clock::Correction) {
+        let by = correction.delta();
+        if !correction.online() {
+            self.clock_rtc.0 += 1;
+            self.clock_rtc.1 += by;
+            return;
+        }
+        self.clock_net.0 += 1;
+        self.clock_net.1 += by;
+        self.since += by;
+        for at in [&mut self.awake_from, &mut self.wifi_from]
+            .into_iter()
+            .flatten()
+        {
+            *at += by;
+        }
+        if let Some((at, _)) = &mut self.napping_from {
+            *at += by;
+        }
+        if let Some((at, _)) = &mut self.held_from {
+            *at += by;
+        }
+    }
+
+    /// Whether [`LEDGER_EVERY`] has passed (or the clock went back past its
+    /// start).
+    pub fn due(&self, now: DateTime<Utc>) -> bool {
+        now - self.since >= LEDGER_EVERY || now < self.since
     }
 
     /// The gauge when the doze began, read once it has been.
@@ -606,11 +700,6 @@ impl DozeLedger {
         self.current.1 += 1;
     }
 
-    /// Whether [`LEDGER_EVERY`] has passed.
-    pub fn due(&self, now: DateTime<Utc>) -> bool {
-        now - self.since >= LEDGER_EVERY
-    }
-
     /// The line to log at `now` with the gauge then; the next ledger starts
     /// from here.
     pub fn close(
@@ -657,7 +746,8 @@ impl DozeLedger {
             "doze ledger over {} min: awake {:.0} s in {} wakes ({:.1} s each, {} online; \
              {} ticks {:.2} s each, {} full {:.2} s each), asleep {:.0} s (monotonic {} s), \
              Wi-Fi up {:.0} s, held awake {:.0} s ({} maintenance windows, {:.0} s for SSH), \
-             panel done {} / timed {} / not seen {}, gauge {used}, current at wake {current}",
+             panel done {} / timed {} / not seen {}, gauge {used}, current at wake {current}, \
+             clock corrected {} times by the RTC ({:+.1} s) and {} by the network ({:+.1} s)",
             over.num_minutes(),
             seconds(self.awake),
             self.wakes,
@@ -676,6 +766,10 @@ impl DozeLedger {
             self.settles[0],
             self.settles[1],
             self.settles[2],
+            self.clock_rtc.0,
+            seconds(self.clock_rtc.1),
+            self.clock_net.0,
+            seconds(self.clock_net.1),
         );
         let (awake_from, napping_from, wifi_from, redraw) = (
             self.awake_from,
@@ -984,6 +1078,9 @@ mod tests {
         // Nothing to fetch without a dashboard: Wi-Fi stays parked.
         assert_eq!(Window::after_nap(None, t0, false), Window::Draw);
         assert_eq!(Window::after_nap(Some(t0), at(30), false), Window::Draw);
+        // Fetched "in the future" (a clock set back without the doze's
+        // times): fetch rather than wait for the clock to catch up.
+        assert_eq!(Window::after_nap(Some(at(60)), at(1), true), Window::Online);
         // A redraw that never shows can't keep the device up for long.
         assert!(DRAW_CEILING <= Duration::from_secs(6));
         assert!(PANEL_UPDATE < DRAW_CEILING);
@@ -1018,6 +1115,50 @@ mod tests {
         assert_eq!(Redraw::after_nap(full, wall(9, 2, 1)), Tick);
         // A clock set back doesn't tick until it catches up.
         assert_eq!(Redraw::after_nap(Some(wall(10, 0, 1)), wall(9, 2, 1)), Full);
+    }
+
+    /// Dozes for 70 minutes of real time on a clock off by `error`
+    /// seconds, which network time corrects at the first (online) wake, as
+    /// the UI does: wakes come a second past each minute of the clock.
+    /// Returns the real minutes of the online wakes after the step, and
+    /// each block of minutes' full redraws.
+    fn doze_through_a_step(error: i64) -> (Vec<i64>, Vec<u32>) {
+        use chrono::{DurationRound, TimeDelta};
+        let real0 = wall(9, 0, 1);
+        let mut schedule = Schedule::default();
+        schedule.doze_began();
+        let first = schedule.wake(real0 + TimeDelta::seconds(error), true);
+        assert_eq!((first.window, first.redraw), (Window::Online, Redraw::Full));
+        // The sync: the clock was `error` ahead.
+        schedule.clock_stepped(TimeDelta::seconds(-error));
+        let mut online = Vec::new();
+        let mut fulls = std::collections::BTreeMap::<DateTime<Utc>, u32>::new();
+        for minute in 1..=70 {
+            let now = real0 + TimeDelta::minutes(minute);
+            let wake = schedule.wake(now, true);
+            assert_eq!(wake.half_hour, wake.window == Window::Online);
+            if wake.window == Window::Online {
+                online.push(minute);
+            }
+            let block = now
+                .duration_trunc(TimeDelta::minutes(i64::from(FULL_REDRAW_MINUTES)))
+                .unwrap();
+            *fulls.entry(block).or_default() += u32::from(wake.redraw == Redraw::Full);
+        }
+        (online, fulls.into_values().collect())
+    }
+
+    #[test]
+    fn a_clock_step_neither_doubles_nor_skips_a_fetch_or_a_full_redraw() {
+        // 724 s fast, set back; 724 s and 40 minutes slow, set forward; and
+        // a clock from 1970 after a lost RTC.
+        for error in [724, -724, -2_400, -1_794_398_400] {
+            let (online, fulls) = doze_through_a_step(error);
+            assert_eq!(online, [30, 60], "{error} s off");
+            // Each block of five minutes on the right clock draws in full
+            // once (the 70 minutes after 9:00:01 end in a block of one).
+            assert_eq!(fulls, [1; 15], "{error} s off");
+        }
     }
 
     #[test]
@@ -1077,12 +1218,61 @@ mod tests {
              1 ticks 0.50 s each, 3 full 9.00 s each), asleep 274 s (monotonic 4 s), \
              Wi-Fi up 20 s, held awake 0 s (0 maintenance windows, 0 s for SSH), \
              panel done 1 / timed 1 / not seen 0, gauge 10 mAh (10 mA), \
-             490 mAh left, current at wake -5 mA"
+             490 mAh left, current at wake -5 mA, \
+             clock corrected 0 times by the RTC (+0.0 s) and 0 by the network (+0.0 s)"
         );
         // The next hour counts from the last gauge reading.
         let line = ledger.close(t0 + secs(7200), None);
         assert!(line.contains("awake 0 s in 0 wakes"), "{line}");
-        assert!(line.ends_with("no gauge, current at wake none"), "{line}");
+        assert!(line.contains("no gauge, current at wake none"), "{line}");
+    }
+
+    #[test]
+    fn the_ledger_notes_clock_corrections_and_a_network_step_moves_its_times() {
+        use crate::clock::{Correction, Source};
+        let t0 = wall(1, 0, 0);
+        let i0 = Instant::now();
+        let secs = |s: i64| t0 + chrono::TimeDelta::seconds(s);
+        let mut ledger = DozeLedger::new(t0, None);
+        ledger.napping(t0, i0);
+        // Resumes gave back time they lost: it passed, and counts as asleep.
+        ledger.clock_corrected(Correction {
+            seconds: 1.4,
+            source: Source::Rtc,
+        });
+        ledger.woke(secs(60), i0, Window::Online, Redraw::Full);
+        ledger.wifi_on(secs(60));
+        // Network time, 10 s into the wake: the clock was 724 s slow.
+        ledger.clock_corrected(Correction {
+            seconds: 724.0,
+            source: Source::Ntp("time.google.com"),
+        });
+        ledger.wifi_off(secs(724 + 70));
+        ledger.napping(secs(724 + 70), i0);
+        ledger.clock_corrected(Correction {
+            seconds: 1.1,
+            source: Source::Rtc,
+        });
+        // The hour counts from the doze's start on the right clock.
+        assert!(!ledger.due(secs(3599)));
+        assert!(ledger.due(secs(724 + 3600)));
+        let line = ledger.close(secs(724 + 3600), None);
+        assert!(
+            line.starts_with("doze ledger over 60 min: awake 10 s in 1 wakes"),
+            "{line}"
+        );
+        assert!(line.contains("Wi-Fi up 10 s"), "{line}");
+        assert!(
+            line.ends_with(
+                "clock corrected 2 times by the RTC (+2.5 s) and 1 by the network (+724.0 s)"
+            ),
+            "{line}"
+        );
+        // A clock set back before the ledger's start: logged, not left for hours.
+        let mut ledger = DozeLedger::new(t0, None);
+        assert!(ledger.due(t0 - chrono::TimeDelta::seconds(1)));
+        assert!(!ledger.due(t0 + chrono::TimeDelta::seconds(1)));
+        ledger.napping(t0, i0);
     }
 
     #[test]

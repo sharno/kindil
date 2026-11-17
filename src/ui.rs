@@ -15,8 +15,8 @@ use crate::prefs::Store;
 use crate::reader::{self, Book, Layout, Reader};
 use crate::sync::Service;
 use crate::system::{
-    AutoSleep, Doze, DozeLedger, Effect, Event as DeviceEvent, Idle, Mode, Redraw, Settle, Step,
-    Touches, Window, DRIVE_SETTLE, MIN_NAP, PANEL_SETTLE, PANEL_UPDATE,
+    AutoSleep, Doze, DozeLedger, DozeWake, Effect, Event as DeviceEvent, Idle, Mode, Redraw,
+    Schedule, Settle, Step, Touches, Window, DRIVE_SETTLE, MIN_NAP, PANEL_SETTLE, PANEL_UPDATE,
 };
 use crate::update::{self, Check, Release, Updates, Version};
 use crate::view;
@@ -269,11 +269,8 @@ struct State {
     miqat: Worker,
     system: Mode,
     idle: Idle,
-    /// When dozing last measured the battery, and went online if it has a
-    /// dashboard to fetch for.
-    online: Option<DateTime<Utc>>,
-    /// When this doze last redrew in full ([`Redraw`]).
-    full: Option<DateTime<Utc>>,
+    /// When dozing last went online and redrew in full.
+    schedule: Schedule,
     /// This doze's maintenance windows and SSH sessions.
     maintenance: Maintenance,
     /// Why the last nap was held off, if it was.
@@ -327,6 +324,9 @@ struct Ctx {
     draw_wake: Arc<DrawWake>,
     /// Where this doze's time went; shared with the threads that end wakes.
     ledger: Arc<Mutex<DozeLedger>>,
+    /// Steps of the clock from network time not yet applied to the doze's
+    /// schedule ([`Ctx::apply_clock_steps`]); the workers that sync add them.
+    clock_steps: Arc<Mutex<chrono::TimeDelta>>,
     now: fn() -> DateTime<Utc>,
     /// The clock's and status bar's zone: kindil.toml's, until Settings →
     /// Location changes it.
@@ -473,8 +473,7 @@ impl App {
                 miqat: Worker::Idle,
                 system: Mode::start(Instant::now()),
                 idle: Idle::new(options.touches.count(), Instant::now()),
-                online: None,
-                full: None,
+                schedule: Schedule::default(),
                 maintenance: Maintenance::new((options.now)()),
                 held: None,
                 naps: 0,
@@ -503,6 +502,7 @@ impl App {
             timers: Rc::default(),
             draw_wake: Arc::default(),
             ledger,
+            clock_steps: Arc::new(Mutex::new(chrono::TimeDelta::zero())),
             timezone: Arc::new(Mutex::new(timezone)),
             finding: Arc::default(),
         };
@@ -1375,7 +1375,7 @@ impl Ctx {
                 {
                     let mut state = self.state.borrow_mut();
                     // The first wake draws in full.
-                    state.full = None;
+                    state.schedule.doze_began();
                     // The minutes awake before dozing were a maintenance window.
                     state.maintenance = Maintenance::new(now);
                     state.held = None;
@@ -1453,40 +1453,70 @@ impl Ctx {
         );
     }
 
-    /// Brings Wi-Fi back after a suspend or a parked doze; `then` runs on
-    /// the UI thread with the outcome.
+    /// Brings Wi-Fi back after a suspend or a parked doze, then the clock
+    /// from network time; `then` runs on the UI thread with the outcome.
     fn reconnect_wifi(&self, then: impl FnOnce(Result<(), ()>) + Send + 'static) {
         self.state.borrow_mut().wifi_parked = false;
+        self.online(true, then);
+    }
+
+    /// Online, after bringing Wi-Fi back if `reconnect`: first the clock
+    /// from network time, so the fetch and its frame have the right time;
+    /// `then` runs on the UI thread with whether Wi-Fi is up.
+    fn online(&self, reconnect: bool, then: impl FnOnce(Result<(), ()>) + Send + 'static) {
+        let ledger = self.ledger.clone();
+        let steps = self.clock_steps.clone();
         self.background(
-            |host| host.reconnect_wifi(),
+            move |host| {
+                let up = match reconnect {
+                    true => host.reconnect_wifi(),
+                    false => Ok(()),
+                };
+                if up.is_ok() {
+                    match host.sync_clock() {
+                        Ok(Some(correction)) => {
+                            eprintln!("kindil: {correction}");
+                            lock(&ledger).clock_corrected(correction);
+                            *lock(&steps) += correction.delta();
+                        }
+                        Ok(None) => {}
+                        Err(error) => eprintln!("kindil: clock: {error:#}"),
+                    }
+                }
+                up
+            },
             move |_, result| {
                 then(result.map_err(|error| eprintln!("kindil: reconnect Wi-Fi: {error}")));
             },
         );
     }
 
+    /// Network time stepped the clock: the doze's schedule, noted on the
+    /// old clock, moves with it (the ledger did as it heard).
+    fn apply_clock_steps(&self) {
+        let by = std::mem::replace(&mut *lock(&self.clock_steps), chrono::TimeDelta::zero());
+        if by != chrono::TimeDelta::zero() {
+            let mut state = self.state.borrow_mut();
+            state.schedule.clock_stepped(by);
+            state.maintenance.clock_stepped(by);
+        }
+    }
+
     /// Back from a nap: draw what is due (most minutes only the clock and
     /// countdown), go online if a fetch is due, and nap again as soon as the
     /// panel has the frame.
     fn redraw_doze(&self) {
+        self.apply_clock_steps();
         let now = (self.now)();
         let dashboard = matches!(self.state.borrow().miqat, Worker::Started(_));
         // Every half hour of wall time: the battery's draw, and the weather.
         let (half_hour, window, redraw, opens, parked) = {
             let mut state = self.state.borrow_mut();
-            let last = state.online;
-            let half_hour = Window::after_nap(last, now, true) == Window::Online;
-            if half_hour {
-                state.online = Some(now);
-            }
-            let window = Window::after_nap(last, now, dashboard);
-            let redraw = match window {
-                Window::Online => Redraw::Full,
-                Window::Draw => Redraw::after_nap(state.full, now),
-            };
-            if redraw == Redraw::Full {
-                state.full = Some(now);
-            }
+            let DozeWake {
+                half_hour,
+                window,
+                redraw,
+            } = state.schedule.wake(now, dashboard);
             // Every two hours the fetch's radio stays up a while.
             let opens = window == Window::Online && state.maintenance.online_wake(now);
             (half_hour, window, redraw, opens, state.wifi_parked)
@@ -1537,7 +1567,7 @@ impl Ctx {
                 if parked {
                     self.reconnect_wifi(fetch);
                 } else {
-                    fetch(Ok(()));
+                    self.online(false, fetch);
                 }
             }
         }
@@ -1713,6 +1743,7 @@ impl Ctx {
     /// comes without a suspend. `nap` is the nap under way; a hold's timer
     /// stops once another nap, or the end of the doze, has replaced it.
     fn nap_or_hold(&self, now: DateTime<Utc>, until: DateTime<Utc>, nap: u64) {
+        self.apply_clock_steps();
         let sessions = self.host.ssh_sessions();
         let (hold, was) = {
             let mut state = self.state.borrow_mut();
@@ -1761,11 +1792,18 @@ impl Ctx {
         }
         lock(&self.ledger).wifi_off(now);
         self.state.borrow_mut().wifi_parked = true;
+        let ledger = self.ledger.clone();
         self.device_later(move |host| {
             // Down until a fetch is due: nothing joins after the resume.
             host.park_wifi();
             match host.nap(left) {
-                Ok(()) => DeviceEvent::Resumed,
+                Ok(()) => {
+                    // Before the wake reads the clock: the resume lost time.
+                    if let Some(correction) = host.catch_up_clock() {
+                        lock(&ledger).clock_corrected(correction);
+                    }
+                    DeviceEvent::Resumed
+                }
                 Err(error) => {
                     eprintln!("kindil: nap: {error}");
                     DeviceEvent::SuspendFailed

@@ -87,8 +87,20 @@ and a reboot always returns the Kindle to stock.
     Once an hour it logs a doze ledger: awake and asleep seconds, wakes
     (ticks and full redraws apart, with the seconds each), Wi-Fi-up
     seconds, seconds held awake (maintenance windows, and SSH), how
-    redraws ended, and the gauge. The power button brings it back with the light
-    restored, and Wi-Fi rejoins.
+    redraws ended, the gauge, and the clock's corrections. The power button
+    brings it back with the light restored, and Wi-Fi rejoins.
+  - **Time keeping**: with Amazon's services stopped nothing else sets the
+    clock (Amazon's `updatetime` did), and each resume from a nap loses
+    about half a second of it (12 minutes slow after two days of dozing,
+    29 s more in the next hour, while the SoC's RTC, `rtc0`, stayed right). So after each nap or sleep kindil steps the clock up to
+    `rtc0` once it is a whole second behind, and whenever it goes online
+    (at start once Wi-Fi has an address, each doze fetch, each wake) it asks
+    pool.ntp.org, time.google.com and time.cloudflare.com (SNTP) and sets
+    the clock and `rtc0` when two agree it is off by a quarter second or
+    more; with UDP 123 blocked, the `Date` of Open-Meteo's HTTP answer does,
+    to within 2 s. A step of over a year is refused unless the clock is
+    before 2026. Each step is logged ("clock was 724 s slow; set from
+    time.google.com").
   - **Wi-Fi of its own**: kindil runs Wi-Fi itself with the networks joined
     in it, saved in `/var/local/kindil/networks.toml` (plain text, readable
     by root only; a network is saved once it has joined). It loads the
@@ -435,6 +447,7 @@ someone nearby to press the power button, or must end on their own first.
 | `drive.rs`, `usb.rs` | USB drive mode run by kindil: the state machine and sequences, and the device under them |
 | `reader.rs`, `files.rs`, `prefs.rs` | Books, Trash, persisted choices |
 | `location.rs` | Settings → Location: city search, IP lookup, typed coordinates, written into `miqat.toml` and `kindil.toml` |
+| `clock.rs` | Time keeping: SNTP and HTTP `Date`, the RTC after each resume |
 | `maintenance.rs` | Doze's maintenance window every 2 hours, and staying awake while an SSH session is open (`/proc/net/tcp`) |
 | `prayer.rs` | Settings → Prayer times: the methods and Asr schools with today's times, edited into `miqat.toml` |
 | `ghosting.rs` | When to flash the panel |
