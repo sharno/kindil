@@ -23,6 +23,8 @@ const LIBRARY_TAB: f32 = 284.0;
 const SETTINGS_TAB: f32 = 663.0;
 // The status row's grip, and the quick panel below it.
 const STATUS_ROW: (f32, f32) = (380.0, 28.0);
+/// The last row of the Settings index.
+const ABOUT_ROW: (f32, f32) = (380.0, 849.0);
 // The front light slider's track (0% to 100%) and row height, in the panel and in Settings.
 const PANEL_LIGHT: (f32, f32) = (100.0, 588.0);
 const PANEL_LIGHT_Y: f32 = 104.0;
@@ -803,10 +805,37 @@ fn settings_switch_the_simulated_device() {
         .iter()
         .map(|fact| fact.label.to_string())
         .collect();
-    assert_eq!(
-        facts,
-        ["Battery", "Memory free", "Storage free", "Up for", "kindil"]
-    );
+    assert_eq!(facts, ["Battery", "Memory free", "Storage free", "Up for"]);
+}
+
+#[test]
+fn about_is_the_last_settings_row_and_shows_kindil() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    f.tap(SETTINGS_TAB, TAB_Y);
+    let index = pixels(&f.window);
+    // The whole index fits above the tab bar: About's row ends with ink in
+    // it, and paper follows down to the bar.
+    let inked = |frame: &[slint::Rgb8Pixel], y: usize| (0..758).any(|x| frame[y * 758 + x].r < 128);
+    assert!((ABOUT_ROW.1 as usize - 20..ABOUT_ROW.1 as usize + 20).any(|y| inked(&index, y)));
+    assert!((ABOUT_ROW.1 as usize + 50..930).all(|y| !inked(&index, y)));
+    f.tap(ABOUT_ROW.0, ABOUT_ROW.1);
+    assert_eq!(f.k().get_page(), Page::About);
+    assert!(!f.k().get_update_checked(), "nothing asked GitHub yet");
+    let about = pixels(&f.window);
+    // The lantern, centred under the title: ink in the middle column, none
+    // at the sides of its rows.
+    let logo = 152..312_usize;
+    assert!(logo
+        .clone()
+        .any(|y| (300..458).any(|x| about[y * 758 + x].r < 128)));
+    assert!(logo
+        .clone()
+        .all(|y| (0..200).all(|x| about[y * 758 + x].r == 255)));
+    assert!(logo
+        .clone()
+        .all(|y| (560..758).all(|x| about[y * 758 + x].r == 255)));
+    f.tap(40.0, 112.0); // back
+    assert_eq!(f.k().get_page(), Page::Settings);
 }
 
 #[test]

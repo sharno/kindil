@@ -422,7 +422,7 @@ impl Snapshot {
         let (boot, detail) = view::boot_start(self.boot_start);
         k.set_boot(boot);
         k.set_boot_start_detail(detail.into());
-        k.set_facts(model(view::facts(&self.info, env!("CARGO_PKG_VERSION"))));
+        k.set_facts(model(view::facts(&self.info)));
         k.set_brightness(self.brightness.map_or(-1, |b| i32::from(b.percent())));
     }
 }
@@ -665,6 +665,7 @@ fn show_updates(ui: &AppWindow, state: &Mutex<Updates>, updates: Updates) {
     k.set_update_status(status.into());
     k.set_update_button(button.into());
     k.set_update_enabled(enabled);
+    k.set_update_checked(!matches!(updates, Updates::Idle));
     *lock(state) = updates;
 }
 

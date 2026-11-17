@@ -195,6 +195,9 @@ export global Kindil {
     /// The Updates row.
     in property <string> update-status;
     in property <string> update-button: "Check";
+    /// Whether GitHub has been asked since kindil started: until then the
+    /// status is only the version.
+    in property <bool> update-checked;
     in property <bool> update-enabled: true;
     callback update();
     callback restart();
@@ -1518,7 +1521,7 @@ component SettingsPage {
             Divider { }
             SectionRow { title: "Updates"; summary: Kindil.update-status; target: Page.updates; }
             Divider { }
-            SectionRow { title: "About"; summary: "Battery " + Kindil.battery-label; target: Page.about; }
+            SectionRow { title: "About"; summary: "kindil " + Kindil.version + " · battery " + Kindil.battery-label; target: Page.about; }
         }
     }
 }
@@ -2239,9 +2242,58 @@ component UpdateSettings inherits SectionPage {
     }
 }
 
+/// kindil itself (the lantern, version, where it lives), then the device.
 component AboutSettings inherits SectionPage {
     title: "About";
+    VerticalLayout {
+        spacing: 6px;
+        HorizontalLayout {
+            alignment: center;
+            Image {
+                source: @image-url("../assets/logo.svg");
+                width: 160px;
+                height: 160px;
+            }
+        }
+        Text {
+            text: "kindil · قنديل";
+            font-size: 40px;
+            font-weight: 700;
+            color: Theme.ink;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: Kindil.version;
+            font-size: 24px;
+            font-weight: 600;
+            color: Theme.ink;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: Kindil.update-checked ? Kindil.update-status : "Not checked for updates yet";
+            font-size: 19px;
+            color: Theme.ink-2;
+            wrap: word-wrap;
+            horizontal-alignment: center;
+        }
+        Rectangle { height: 6px; }
+        Text {
+            text: "A prayer-time dashboard and e-reader for the Kindle Paperwhite";
+            font-size: 20px;
+            color: Theme.ink;
+            wrap: word-wrap;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "github.com/sharno/kindil";
+            font-size: 20px;
+            font-weight: 600;
+            color: Theme.ink-2;
+            horizontal-alignment: center;
+        }
+    }
     Group {
+        title: "DEVICE";
         for fact in Kindil.facts: HorizontalLayout {
             min-height: 52px;
             Text {
