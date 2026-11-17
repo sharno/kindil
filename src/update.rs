@@ -17,6 +17,11 @@ pub const REPO: &str = "sharno/kindil";
 /// The key CI signs releases with (`release.yml`).
 const PUBLIC_KEY: &str = "RWToylUetjwYsYn48p66hk/uI0UF3dn9HsRGmsNjF923AT80JDaW+5Q8";
 
+/// Names this build's version inside the binary, for the installer to read
+/// off an ARM binary it can't run (installer/src/detect.rs).
+#[used]
+pub static VERSION_MARKER: &str = concat!("kindil-version=", env!("CARGO_PKG_VERSION"), "\n");
+
 /// How long a new version must run before it replaces the previous one.
 pub const SETTLE: Duration = Duration::from_secs(120);
 

@@ -25,31 +25,10 @@ pub struct Binary {
     pub bytes: Vec<u8>,
 }
 
-/// The public key in `src/update.rs`: one key, the one the updater trusts.
-pub fn public_key(update_rs: &str) -> anyhow::Result<String> {
-    update_rs
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("const PUBLIC_KEY: &str = \"")?
-                .strip_suffix("\";")
-        })
-        .map(str::to_owned)
-        .context("no PUBLIC_KEY in src/update.rs")
-}
-
-/// Checks `bytes` against `signature` and that the signature names `version`.
-pub fn verify(key: &str, version: &str, bytes: &[u8], signature: &str) -> anyhow::Result<()> {
-    let key = minisign_verify::PublicKey::from_base64(key).context("the public key")?;
-    let signature = minisign_verify::Signature::decode(signature).context("the signature")?;
-    key.verify(bytes, &signature, false)
-        .map_err(|e| anyhow::anyhow!("v{version}: bad signature: {e}"))?;
-    ensure!(
-        signature.trusted_comment() == format!("kindil v{version}"),
-        "v{version}: the signature is for {:?}",
-        signature.trusted_comment()
-    );
-    Ok(())
-}
+use kindil_installer::release::public_key;
+/// The release key (src/update.rs's, the one the updater trusts) and its
+/// check, shared with the installer.
+pub use kindil_installer::release::verify;
 
 fn download(url: &str) -> anyhow::Result<Vec<u8>> {
     let mut response = ureq::get(url)
@@ -62,8 +41,8 @@ fn download(url: &str) -> anyhow::Result<Vec<u8>> {
         .read_to_vec()?)
 }
 
-pub fn fetch(root: &Path, version: &str) -> anyhow::Result<Binary> {
-    let key = public_key(&std::fs::read_to_string(root.join("src/update.rs"))?)?;
+pub fn fetch(version: &str) -> anyhow::Result<Binary> {
+    let key = public_key();
     let base = format!("https://github.com/{REPO}/releases/download/v{version}");
     let bytes = download(&format!("{base}/kindil"))?;
     let signature = String::from_utf8(download(&format!("{base}/kindil.minisig"))?)?;
@@ -161,7 +140,7 @@ pub fn install(
     hours: u64,
 ) -> anyhow::Result<()> {
     let device = Device::from_env()?;
-    let new = fetch(root, version)?;
+    let new = fetch(version)?;
     let (bundle, sum) = bundle(&launcher_files(root, version)?, &new.bytes)?;
     let work = tempdir()?;
     let mut files = vec![
@@ -170,11 +149,7 @@ pub fn install(
         write(&work, "kindil.install", &new.bytes)?,
     ];
     if let Some(rollback) = rollback {
-        files.push(write(
-            &work,
-            "kindil.rollback",
-            &fetch(root, rollback)?.bytes,
-        )?);
+        files.push(write(&work, "kindil.rollback", &fetch(rollback)?.bytes)?);
     }
     println!(
         "v{} bundled and verified; waiting for the Kindle",
@@ -287,20 +262,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_the_updaters_key() {
-        let update_rs = "x\nconst PUBLIC_KEY: &str = \"RWTkey+/=\";\ny\n";
-        assert_eq!(public_key(update_rs).unwrap(), "RWTkey+/=");
-        assert!(public_key("nothing here").is_err());
-        // The real one.
-        let real = include_str!("../../src/update.rs");
-        assert!(public_key(real).unwrap().starts_with("RW"));
-    }
-
-    #[test]
     fn rejects_a_signature_that_doesnt_match() {
-        let real = public_key(include_str!("../../src/update.rs")).unwrap();
         let signature = "untrusted comment: x\nRUQ=\ntrusted comment: kindil v1.0.0\nAAAA\n";
-        assert!(verify(&real, "1.0.0", b"kindil", signature).is_err());
+        assert!(verify(&public_key(), "1.0.0", b"kindil", signature).is_err());
     }
 
     fn launcher() -> Vec<u8> {

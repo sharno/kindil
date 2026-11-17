@@ -1,0 +1,38 @@
+[package]
+name = "kindil-installer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+description = "Installs kindil on a jailbroken Kindle Paperwhite (PW1) plugged in over USB"
+license = "MIT"
+publish = false
+
+# Runs on the computer the Kindle is plugged into (macOS, Linux, Windows),
+# never on the Kindle: xtask's ARM tasks leave it out.
+[[bin]]
+name = "kindil-install"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+flate2 = "1.1"
+minisign-verify = "0.2"
+# The Kindle's USB serial number names its model (Lab126, vendor 0x1949);
+# pure Rust, no libusb.
+nusb = { version = "0.2", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tar = "0.4"
+textwrap = { version = "0.16", default-features = false }
+ureq = "3"
+
+[features]
+default = ["usb"]
+usb = ["dep:nusb"]
+
+[dev-dependencies]
+flate2 = "1.1"
+tar = "0.4"
+tempfile = "3.27"
