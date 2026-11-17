@@ -1,9 +1,13 @@
-<img src="assets/logo.svg" alt="" width="96" align="right">
+<p align="center">
+  <img src="assets/logo.svg" alt="kindil's lantern logo" width="160">
+</p>
 
-# kindil · قنديل
+<h1 align="center">kindil · قنديل</h1>
 
-A prayer-time wall dashboard and e-reader for the first-generation Kindle
-Paperwhite (PW1), in Rust and Slint.
+<p align="center">
+  A prayer-time wall dashboard and e-reader for the first-generation Kindle
+  Paperwhite (PW1), in Rust and Slint.
+</p>
 
 kindil runs **as an app on Amazon's stock OS**, started from KUAL. While it
 runs, Amazon's UI steps aside; when it exits, Amazon's UI comes back. A crash
