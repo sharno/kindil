@@ -221,7 +221,8 @@ pub fn drive_notice(notice: crate::drive::Notice) -> Option<String> {
     }
 }
 
-pub fn facts(info: &DeviceInfo, version: &str) -> Vec<Fact> {
+/// The device, for About; kindil's own version heads the page.
+pub fn facts(info: &DeviceInfo) -> Vec<Fact> {
     let fact = |label: &str, value: String| Fact {
         label: label.into(),
         value: value.into(),
@@ -256,7 +257,6 @@ pub fn facts(info: &DeviceInfo, version: &str) -> Vec<Fact> {
             }),
         ),
         fact("Up for", info.uptime.map_or_else(unknown, duration)),
-        fact("kindil", version.into()),
     ]
 }
 
@@ -403,11 +403,11 @@ mod tests {
             uptime: Some(Duration::from_secs(600)),
             current: None,
         };
-        let facts = facts(&info, "0.4.0");
+        let facts = facts(&info);
         let values: Vec<String> = facts.iter().map(|f| f.value.to_string()).collect();
         assert_eq!(
             values,
-            ["82% · charging", "166 MB of 249 MB", "—", "10 min", "0.4.0"]
+            ["82% · charging", "166 MB of 249 MB", "—", "10 min"]
         );
     }
 }

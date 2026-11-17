@@ -105,8 +105,14 @@ pub fn drag(window: &MinimalSoftwareWindow, x: f32, from: f32, to: f32) {
     );
 }
 
-/// Every screen, in a fixed state, as `<dir>/<name>.ppm`.
-pub fn screens(app: &App, window: &MinimalSoftwareWindow, dir: &Path) -> anyhow::Result<()> {
+/// Every screen, in a fixed state, as `<dir>/<name>.ppm`; `rain` is a
+/// dashboard page with the radar, shown after the one already set.
+pub fn screens(
+    app: &App,
+    window: &MinimalSoftwareWindow,
+    dir: &Path,
+    rain: Option<miqat::image::Gray>,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let k = app.window.global::<Kindil>();
     let shot = |name: &str| snapshot(window, &dir.join(format!("{name}.ppm")));
@@ -116,11 +122,16 @@ pub fn screens(app: &App, window: &MinimalSoftwareWindow, dir: &Path) -> anyhow:
     k.set_dashboard(DashboardKind::Miqat);
     k.invoke_go(Page::Dashboard);
     shot("dashboard-miqat")?;
-    k.set_chrome_visible(true);
     k.set_panel_open(true);
     shot("dashboard-miqat-panel")?;
     k.set_panel_open(false);
+    k.set_chrome_visible(true);
     shot("dashboard-miqat-tabs")?;
+    k.set_chrome_visible(false);
+    if let Some(rain) = rain {
+        app.set_miqat(rain);
+        shot("dashboard-miqat-rain")?;
+    }
     k.set_dashboard(DashboardKind::Clock);
     k.invoke_go(Page::Dashboard);
     shot("dashboard-clock")?;
