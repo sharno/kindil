@@ -1,0 +1,391 @@
+// kindil installer: one window walking through the installer's steps.
+// kindil's own look (ui/app.slint), sized for a desktop: black on white,
+// solid grays, IBM Plex Sans Arabic, the lantern.
+import "../../../crates/miqat/assets/fonts/IBMPlexSansArabic-Regular.ttf";
+import "../../../crates/miqat/assets/fonts/IBMPlexSansArabic-SemiBold.ttf";
+import "../../../crates/miqat/assets/fonts/IBMPlexSansArabic-Bold.ttf";
+
+global Theme {
+    out property <color> ink: #000000;
+    out property <color> ink-2: #333333;
+    out property <color> ink-3: #4d4d4d;
+    out property <color> dim: #707070;
+    out property <color> line: #c0c0c0;
+    out property <color> surface: #ececec;
+    out property <color> paper: #ffffff;
+    out property <color> alert: #a00000;
+    out property <length> gutter: 24px;
+    out property <length> touch: 40px;
+    out property <length> radius: 10px;
+}
+
+export enum CheckStatus { pass, fail, unknown }
+
+export struct CheckItem {
+    title: string,
+    detail: string,
+    status: CheckStatus,
+    links: [string],
+}
+
+enum ButtonKind { primary, outline }
+
+component Button {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <ButtonKind> kind: ButtonKind.outline;
+    callback clicked();
+    min-height: Theme.touch;
+    preferred-width: label.preferred-width + 36px;
+    horizontal-stretch: 0;
+
+    Rectangle {
+        border-radius: Theme.radius;
+        background: root.kind == ButtonKind.primary
+            ? (root.enabled ? (touch.pressed ? Theme.ink-2 : Theme.ink) : Theme.line)
+            : (touch.pressed ? Theme.surface : transparent);
+        border-width: root.kind == ButtonKind.outline ? 2px : 0px;
+        border-color: root.enabled ? Theme.ink : Theme.line;
+    }
+    label := Text {
+        text: root.text;
+        font-size: 15px;
+        font-weight: 600;
+        color: root.kind == ButtonKind.primary ? Theme.paper : (root.enabled ? Theme.ink : Theme.dim);
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Link inherits Text {
+    callback clicked();
+    font-size: 13px;
+    color: Theme.ink;
+    wrap: word-wrap;
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// A step's number in a circle, filled once the step is done.
+component StepNumber {
+    in property <int> number;
+    in property <bool> done;
+    width: 30px;
+    height: 30px;
+    Rectangle {
+        border-radius: self.width / 2;
+        border-width: 2px;
+        border-color: Theme.ink;
+        background: root.done ? Theme.ink : Theme.paper;
+    }
+    Text {
+        text: root.done ? "✓" : root.number;
+        font-size: 15px;
+        font-weight: 700;
+        color: root.done ? Theme.paper : Theme.ink;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component Step inherits HorizontalLayout {
+    in property <int> number;
+    in property <string> title;
+    in property <bool> done;
+    in property <bool> active: true;
+    spacing: 14px;
+    VerticalLayout {
+        alignment: start;
+        StepNumber {
+            number: root.number;
+            done: root.done;
+        }
+    }
+    VerticalLayout {
+        spacing: 8px;
+        Text {
+            text: root.title;
+            font-size: 18px;
+            font-weight: 700;
+            color: root.active || root.done ? Theme.ink : Theme.dim;
+        }
+        @children
+    }
+}
+
+component Divider inherits Rectangle {
+    height: 1px;
+    background: Theme.line;
+}
+
+component Mark {
+    in property <CheckStatus> status;
+    width: 22px;
+    height: 22px;
+    Rectangle {
+        border-radius: 4px;
+        border-width: 2px;
+        border-color: root.status == CheckStatus.fail ? Theme.alert : Theme.ink;
+        background: root.status == CheckStatus.pass ? Theme.ink : Theme.paper;
+    }
+    Text {
+        text: root.status == CheckStatus.pass ? "✓" : root.status == CheckStatus.fail ? "✕" : "?";
+        font-size: 14px;
+        font-weight: 700;
+        color: root.status == CheckStatus.pass ? Theme.paper : root.status == CheckStatus.fail ? Theme.alert : Theme.ink;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export component InstallerWindow inherits Window {
+    title: "kindil installer";
+    preferred-width: 640px;
+    preferred-height: 860px;
+    min-width: 520px;
+    min-height: 600px;
+    background: Theme.paper;
+    default-font-family: "IBM Plex Sans Arabic";
+    default-font-size: 14px;
+
+    // Step 1: the Kindle.
+    in property <bool> found;
+    /// "Looking for a Kindle…", or where it is.
+    in property <string> kindle-status: "Looking for a Kindle…";
+    in property <string> model;
+    in property <string> firmware;
+    in property <string> installed;
+    // Step 2: the checklist.
+    in property <[CheckItem]> checks;
+    /// Every check passes.
+    in property <bool> ready;
+    /// Ready, but for a model that can't be told from here.
+    in property <bool> needs-vouch;
+    in-out property <bool> vouched;
+    // Step 3: install.
+    /// "Latest release: 0.13.3", or why it can't be had.
+    in property <string> latest;
+    in property <bool> have-release;
+    in property <string> install-label: "Install kindil";
+    in property <bool> busy;
+    in property <float> progress;
+    in property <string> progress-text;
+    in property <bool> done;
+    in property <string> next-steps;
+    in property <string> error;
+    // Step 4: eject.
+    in property <string> eject-text;
+    in property <bool> ejected;
+
+    callback install();
+    callback eject();
+    callback refresh();
+    callback open-link(string);
+
+    out property <bool> can-install: root.found && root.have-release && !root.busy
+        && (root.ready || (root.needs-vouch && root.vouched));
+
+    Flickable {
+        content-height: content.preferred-height;
+        content := VerticalLayout {
+            padding: Theme.gutter;
+            spacing: 18px;
+
+            HorizontalLayout {
+                spacing: 16px;
+                alignment: start;
+                Image {
+                    source: @image-url("../../../assets/logo.svg");
+                    width: 64px;
+                    height: 64px;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "kindil · قنديل";
+                        font-size: 26px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: "Installer for the first-generation Kindle Paperwhite";
+                        font-size: 14px;
+                        color: Theme.ink-3;
+                    }
+                }
+            }
+            Divider { }
+
+            Step {
+                number: 1;
+                title: "Plug in the Kindle";
+                done: root.found;
+                Text {
+                    text: root.kindle-status;
+                    wrap: word-wrap;
+                    color: root.found ? Theme.ink : Theme.ink-3;
+                }
+                if !root.found: Text {
+                    text: "Use a data cable and unlock the Kindle's screen: it shows \"USB drive mode\" and appears as a drive. This window checks every 2 seconds.";
+                    wrap: word-wrap;
+                    font-size: 13px;
+                    color: Theme.ink-3;
+                }
+                if root.found: VerticalLayout {
+                    spacing: 2px;
+                    Text { text: "Model: " + root.model; wrap: word-wrap; }
+                    Text { text: "Firmware: " + root.firmware; wrap: word-wrap; }
+                    Text { text: "kindil: " + root.installed; wrap: word-wrap; }
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    Button {
+                        text: "Look again";
+                        enabled: !root.busy;
+                        clicked => { root.refresh(); }
+                    }
+                }
+            }
+
+            Step {
+                number: 2;
+                title: "Check it's ready";
+                done: root.found && root.ready;
+                active: root.found;
+                if !root.found: Text {
+                    text: "A Paperwhite 1, jailbroken, with KUAL.";
+                    color: Theme.dim;
+                }
+                for check in root.checks: HorizontalLayout {
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: start;
+                        Mark { status: check.status; }
+                    }
+                    VerticalLayout {
+                        spacing: 3px;
+                        Text {
+                            text: check.title;
+                            font-weight: 700;
+                        }
+                        Text {
+                            text: check.detail;
+                            wrap: word-wrap;
+                            font-size: 13px;
+                            color: Theme.ink-2;
+                        }
+                        for link in check.links: Link {
+                            text: "→ " + link;
+                            clicked => { root.open-link(link); }
+                        }
+                    }
+                }
+                if root.needs-vouch: HorizontalLayout {
+                    spacing: 10px;
+                    alignment: start;
+                    Rectangle {
+                        width: 20px;
+                        height: 20px;
+                        border-radius: 4px;
+                        border-width: 2px;
+                        border-color: Theme.ink;
+                        background: root.vouched ? Theme.ink : Theme.paper;
+                        Text {
+                            text: "✓";
+                            color: Theme.paper;
+                            font-weight: 700;
+                            visible: root.vouched;
+                        }
+                        TouchArea {
+                            clicked => { root.vouched = !root.vouched; }
+                        }
+                    }
+                    Text {
+                        text: "I checked: its serial number starts with B024, B01B, B020, B01C, B01D or B01F";
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                        TouchArea {
+                            clicked => { root.vouched = !root.vouched; }
+                        }
+                    }
+                }
+            }
+
+            Step {
+                number: 3;
+                title: "Install kindil";
+                done: root.done;
+                active: root.can-install || root.busy;
+                Text {
+                    text: root.latest;
+                    wrap: word-wrap;
+                    color: Theme.ink-3;
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    Button {
+                        text: root.install-label;
+                        kind: ButtonKind.primary;
+                        enabled: root.can-install;
+                        clicked => { root.install(); }
+                    }
+                }
+                if root.busy || root.done: VerticalLayout {
+                    spacing: 6px;
+                    Rectangle {
+                        height: 10px;
+                        border-radius: 5px;
+                        border-width: 1px;
+                        border-color: Theme.ink;
+                        Rectangle {
+                            x: 0;
+                            width: parent.width * clamp(root.progress, 0, 1);
+                            border-radius: 5px;
+                            background: Theme.ink;
+                        }
+                    }
+                    Text {
+                        text: root.progress-text;
+                        wrap: word-wrap;
+                        font-size: 13px;
+                    }
+                }
+                if root.done: Text {
+                    text: root.next-steps;
+                    wrap: word-wrap;
+                }
+                if root.error != "": Text {
+                    text: root.error;
+                    wrap: word-wrap;
+                    color: Theme.alert;
+                    font-weight: 600;
+                }
+            }
+
+            Step {
+                number: 4;
+                title: "Eject";
+                done: root.ejected;
+                active: root.done;
+                HorizontalLayout {
+                    alignment: start;
+                    Button {
+                        text: "Eject the Kindle";
+                        enabled: root.done && !root.ejected && !root.busy;
+                        clicked => { root.eject(); }
+                    }
+                }
+                if root.eject-text != "": Text {
+                    text: root.eject-text;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}

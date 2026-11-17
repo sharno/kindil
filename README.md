@@ -135,7 +135,74 @@ and a reboot always returns the Kindle to stock.
   (on the first full redraw after 30 updates; a minute tick never flashes), to
   clear ghosting.
 
-## Install on the Kindle
+## Install
+
+The installer puts kindil on a Kindle plugged into your computer (macOS,
+Linux or Windows) with a USB cable. It doesn't need a terminal on the Kindle,
+SSH or Wi-Fi.
+
+<p align="center">
+  <img src="docs/installer.png" alt="The installer's window: a Kindle found, checked and ready to upgrade" width="480">
+</p>
+
+**What you need first:**
+
+- A **first-generation Kindle Paperwhite** (2012). Its serial number
+  (Settings → Device Info) starts with B024, B01B, B020, B01C, B01D or B01F.
+  kindil drives this model's screen, touch, light and Wi-Fi directly and
+  doesn't run on any other Kindle; the installer refuses them.
+- A **jailbreak** and **KUAL**. Amazon's firmware only runs code Amazon
+  signed; kindil runs as root, started from a KUAL menu. The jailbreak is a
+  one-time step done on the Kindle itself; the installer doesn't do it, and
+  checks for it. The MobileRead community's instructions for the PW1:
+  - Firmware up to 5.4.4.2: the
+    [Kindle Touch/PW1/PW2 jailbreak](https://www.mobileread.com/forums/showthread.php?t=186645).
+  - Firmware 5.6.1.1 (the PW1's last): users
+    [downgrade to 5.3.3](https://www.mobileread.com/forums/showthread.php?t=264432)
+    first, then run the jailbreak above. Read the threads through before you
+    start: a firmware change can brick a Kindle.
+    [KindleModding's guides](https://kindlemodding.org/jailbreaking/) list
+    newer jailbreaks too.
+  - Then [KUAL](https://www.mobileread.com/forums/showthread.php?t=203326),
+    usually installed with
+    [MRPI](https://www.mobileread.com/forums/showthread.php?t=251143).
+
+**Run it.** There are no prebuilt installer downloads yet: build it with
+[Rust](https://rustup.rs) (on Linux the window also needs the usual
+desktop libraries, e.g. `libxkbcommon` and Wayland or X11):
+
+```sh
+git clone https://github.com/sharno/kindil && cd kindil
+cargo run --release -p kindil-installer-gui     # the window
+cargo run --release -p kindil-installer -- install   # or the terminal
+```
+
+Plug the Kindle in and unlock it, so it shows USB drive mode. The installer:
+
+1. **Finds the Kindle** (it checks every 2 seconds) and reads its model from
+   the USB serial number and its firmware from `system/version.txt`.
+2. **Checks it's ready**: a PW1, jailbroken, with KUAL. If something is
+   missing it says why and links to the instructions above.
+3. **Installs** the latest release from GitHub, after checking its signature
+   against kindil's release key: the KUAL extension in `extensions/kindil/`,
+   and, only if they aren't there yet, example settings in
+   `kindil/miqat.toml` and `kindil/kindil.toml`. Your settings are never
+   overwritten, so the same button upgrades an existing install. Each file is
+   copied under a temporary name, moved into place and read back to check it.
+4. **Ejects** the Kindle.
+
+Then, on the Kindle: KUAL → **kindil → Start kindil**. Set your location in
+kindil's **Settings → Location**; to have kindil start whenever the Kindle
+boots, pick a mode in **Settings → Power → Start at boot**
+([Start at boot](#start-at-boot)).
+
+In the terminal, `kindil-install detect` lists the Kindles plugged in,
+`kindil-install check` prints the checklist, and `kindil-install install`
+takes `--version 0.13.2`, `--volume /Volumes/Kindle` (or `E:\`), `--yes` to
+skip the questions, and `--force` when the model can't be read over USB and
+you checked the serial number yourself.
+
+## Install over SSH (developers)
 
 Needs a jailbroken PW1 with KUAL. SSH needs the USBNetwork hack; for Wi-Fi
 SSH set `USE_WIFI="true"` and `USE_WIFI_SSHD_ONLY="true"` in
@@ -375,6 +442,7 @@ someone nearby to press the power button, or must end on their own first.
 | `vendor/slint-backend-kindle` | Display/touch backend, patched for full refresh |
 | `sshd/` | kindil-sshd, its own small crate: keys-only SSH server (exec, shells on a pty) |
 | `launcher/` | The launcher, its own small crate: the session around kindil (Amazon's UI and services aside, crash restart, update trial, restore) and the boot guard |
+| `installer/` | The [installer](#install), for the computer the Kindle is plugged into (never built for the Kindle): the `kindil-installer` library and `kindil-install` CLI; `installer/gui/` is the Slint window, `kindil-installer-gui` |
 
 The build pins Slint 1.18.1 with its software renderer and full font shaping
 (Arabic joins correctly). IBM Plex Sans Arabic, from Miqat, is the only font.

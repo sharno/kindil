@@ -62,12 +62,11 @@ fn model(kindle: &Kindle) -> Check {
         .map(|f| format!(", firmware {f}"))
         .unwrap_or_default();
     match &kindle.model {
-        Model::Paperwhite1 { .. } => Check {
+        Model::Paperwhite1 { variant } => Check {
             title: MODEL.into(),
             status: Status::Pass,
             detail: format!(
-                "{}{firmware} (serial {}…)",
-                kindle.model,
+                "2012, {variant}{firmware}; serial {}…",
                 kindle
                     .serial
                     .as_deref()

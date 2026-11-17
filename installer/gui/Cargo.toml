@@ -1,0 +1,28 @@
+[package]
+name = "kindil-installer-gui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+description = "A desktop window that installs kindil on a Kindle Paperwhite (PW1)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "kindil-installer-gui"
+path = "src/main.rs"
+
+[dependencies]
+kindil-installer = { path = ".." }
+anyhow = "1.0"
+# The same Slint as the app, on the desktop's windowing (winit) and the
+# software renderer: no GPU stack to build or ship.
+slint = { version = "=1.18.1", default-features = false, features = ["std", "compat-1-18", "backend-winit", "renderer-software"] }
+# The lantern (SVG) and the app's fonts, as in kindil's own Cargo.toml.
+i-slint-core = { version = "=1.18.1", default-features = false, features = ["image-decoders", "svg"] }
+
+[dev-dependencies]
+png = "0.18"
+tempfile = "3.27"
+
+[build-dependencies]
+slint-build = "=1.18.1"
