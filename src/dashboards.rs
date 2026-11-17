@@ -1,7 +1,15 @@
 //! Miqat is its own library (a git subtree of sharno/miqat), not a forked layout.
 use chrono::{DateTime, NaiveDate, Utc};
 use miqat::image::Gray;
-use miqat::layout::{HEADER_HEIGHT, WIDTH};
+use miqat::layout::{Page, WIDTH};
+
+/// The status bar's height in `ui/app.slint` (`StatusRow`): the dashboard
+/// shows under it, so Miqat lays its page out in the rest of the panel.
+pub const STATUS_BAR: u32 = 56;
+/// Miqat's page as the window shows it: 758 × (1024 − [`STATUS_BAR`]).
+pub const PAGE: Page = Page::below(STATUS_BAR);
+/// The rows of [`PAGE`] the header draws in.
+pub const HEADER_HEIGHT: u32 = PAGE.header_height();
 
 /// A dashboard frame, as the window shows it: the header (clock, date, next
 /// prayer and countdown) and the body under it are separate images, so a
@@ -89,6 +97,7 @@ pub fn render(
         prayers: &prayers,
         weather: sources.weather(),
         radar: sources.radar(),
+        page: PAGE,
     })
 }
 
@@ -107,6 +116,7 @@ pub fn render_header(
         prayers: &prayers,
         weather: None,
         radar: None,
+        page: PAGE,
     })?;
     debug_assert_eq!((header.width, header.height), (WIDTH, HEADER_HEIGHT));
     Ok(header)
@@ -124,17 +134,72 @@ pub fn preview(
     )
 }
 
+/// [`preview`] with rain on the way: the layout with the radar card, over a
+/// made-up map (rings of rain round the centre) instead of fetched tiles.
+pub fn preview_rain(
+    config: &miqat::config::Config,
+    now: DateTime<Utc>,
+) -> anyhow::Result<miqat::image::Gray> {
+    let renderer = miqat::render::Renderer::new(config.display.contrast);
+    let mut weather = fixture_weather(config)?;
+    weather.quarters = (0..400)
+        .map(|i| miqat::weather::Quarter {
+            at: now + chrono::TimeDelta::minutes(15 * i - 15),
+            precipitation_mm: if i >= 3 { miqat::weather::WET_MM } else { 0.0 },
+        })
+        .collect();
+    let (width, height) = miqat::layout::RADAR_SIZE;
+    let map = Gray {
+        width,
+        height,
+        pixels: (0..width * height)
+            .map(|i| {
+                let (x, y) = (f64::from(i % width), f64::from(i / width));
+                let r = (x - 150.0).hypot(y - 124.0);
+                match r as u32 {
+                    0..40 => 0x55,
+                    40..80 => 0x99,
+                    80..120 => 0xcc,
+                    _ if (i / width) % 46 == 0 || (i % width) % 46 == 0 => 0xbb,
+                    _ => 0xf4,
+                }
+            })
+            .collect(),
+    };
+    let radar = miqat::sources::Snapshot {
+        data: miqat::radar::RadarImage {
+            observed_at: now - chrono::TimeDelta::minutes(5),
+            map,
+        },
+        fetched_at: now,
+    };
+    frame_with(&renderer, config, now, weather, Some(&radar))
+}
+
+fn fixture_weather(config: &miqat::config::Config) -> anyhow::Result<miqat::weather::Weather> {
+    miqat::weather::decode(
+        include_str!("../crates/miqat/tests/fixtures/open-meteo.json"),
+        config.location.timezone,
+    )
+}
+
 fn preview_with(
     renderer: &miqat::render::Renderer,
     config: &miqat::config::Config,
     now: DateTime<Utc>,
 ) -> anyhow::Result<miqat::image::Gray> {
+    frame_with(renderer, config, now, fixture_weather(config)?, None)
+}
+
+fn frame_with(
+    renderer: &miqat::render::Renderer,
+    config: &miqat::config::Config,
+    now: DateTime<Utc>,
+    weather: miqat::weather::Weather,
+    radar: Option<&miqat::sources::Snapshot<miqat::radar::RadarImage>>,
+) -> anyhow::Result<miqat::image::Gray> {
     let date = miqat::prayer::local_date(&config.location, now);
     let prayers = miqat::prayer::DayTimes::compute(&config.location, &config.prayer, date)?;
-    let weather = miqat::weather::decode(
-        include_str!("../crates/miqat/tests/fixtures/open-meteo.json"),
-        config.location.timezone,
-    )?;
     let snapshot = miqat::sources::Snapshot {
         data: weather,
         fetched_at: now,
@@ -144,7 +209,8 @@ fn preview_with(
         config,
         prayers: &prayers,
         weather: Some(&snapshot),
-        radar: None,
+        radar,
+        page: PAGE,
     })
 }
 
@@ -185,6 +251,22 @@ mod tests {
             [split.header.pixels, split.body.pixels].concat(),
             page.pixels
         );
+    }
+
+    #[test]
+    fn the_page_fits_under_the_status_bar() {
+        let config = config();
+        let noon = DateTime::from_timestamp(1_794_398_400, 0).unwrap();
+        for page in [
+            preview(&config, noon).unwrap(),
+            preview_rain(&config, noon).unwrap(),
+        ] {
+            assert_eq!((page.width, page.height), (WIDTH, 1024 - STATUS_BAR));
+            let split = Split::of(page);
+            assert_eq!(split.header.height, HEADER_HEIGHT);
+            assert_eq!(split.header.height + split.body.height, 1024 - STATUS_BAR);
+        }
+        assert_eq!(HEADER_HEIGHT, 282);
     }
 
     #[test]

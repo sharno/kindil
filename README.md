@@ -15,11 +15,11 @@ and a reboot always returns the Kindle to stock.
 ## What it does
 
 - **Home**: the [Miqat](https://github.com/sharno/miqat) prayer dashboard,
-  full-bleed and pixel-exact, refreshed on each minute; or a large clock. A
-  small battery gauge always shows at the top. Tap the dashboard to reveal the
-  status row, the quick panel and the tab bar; they hide again after 20 s.
+  pixel-exact under the status row, refreshed on each minute; or a large
+  clock. Tap the dashboard to reveal the tab bar; it hides again after 20 s.
 - **Status row and quick panel**: every page has a slim status row (clock,
-  Wi-Fi, battery). Tapping it drops a panel over the page with the front light
+  Wi-Fi, battery; Home leaves out the clock, having a big one of its own, so
+  a minute redraws none of the row). Tapping it drops a panel over the page with the front light
   slider (dim sun to bright sun, with the level) and, in the reader, text size
   smaller/larger. A tap outside, or 20 s, puts it away; using a control
   restarts the 20 s.

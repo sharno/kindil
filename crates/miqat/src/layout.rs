@@ -17,7 +17,8 @@ use crate::weather::{
 
 pub const WIDTH: u32 = 758;
 pub const HEIGHT: u32 = 1024;
-/// Where the radar raster goes when rain is expected; the SVG draws its card on top.
+/// Where the radar raster goes on a [`Page::FULL`] page when rain is
+/// expected; the SVG draws its card on top. See [`Page::radar_top`].
 pub const RADAR_LEFT: i64 = 452;
 pub const RADAR_TOP: i64 = 638;
 pub const RADAR_SIZE: (u32, u32) = (276, 276);
@@ -26,9 +27,10 @@ const MARGIN: f64 = 28.0;
 const RIGHT: f64 = WIDTH as f64 - MARGIN;
 const MUTED: &str = "#666";
 
-/// The rows the header (clock, date, next prayer, countdown and its divider)
-/// draws in, and nothing else does: [`header_svg`] renders just these, the
-/// same pixels as the whole page has there.
+/// The rows a [`Page::FULL`] header (clock, date, next prayer, countdown and
+/// its divider) draws in, and nothing else does: [`header_svg`] renders just
+/// these, the same pixels as the whole page has there. See
+/// [`Page::header_height`].
 pub const HEADER_HEIGHT: u32 = 300;
 /// The timetable starts under the header divider.
 const PRAYERS_TOP: f64 = 302.0;
@@ -46,12 +48,122 @@ const _: () = assert!(PRAYERS_BOTTOM + 8.0 < HOURLY_TOP);
 /// Data older than this gets an "as of" note.
 const STALE_AFTER: Duration = Duration::minutes(45);
 
+/// The canvas the dashboard draws on: the whole panel, or the panel under a
+/// host's bar across the top (kindil's status bar), [`WIDTH`] wide either
+/// way. A shorter page keeps every element at its size and tightens the
+/// spacing between them instead: [`Page::MAX_INSET`] rows come out of the
+/// header's air, the timetable's rows and the bottom margin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Page {
+    height: u32,
+}
+
+impl Default for Page {
+    fn default() -> Self {
+        Self::FULL
+    }
+}
+
+impl Page {
+    /// The whole 758×1024 panel, as Miqat draws on its own.
+    pub const FULL: Self = Self { height: HEIGHT };
+    /// The most a page can give up and still fit everything.
+    pub const MAX_INSET: u32 = 56;
+
+    /// The page under `inset` rows of someone else's, up to [`Self::MAX_INSET`].
+    pub const fn below(inset: u32) -> Self {
+        let inset = if inset > Self::MAX_INSET {
+            Self::MAX_INSET
+        } else {
+            inset
+        };
+        Self {
+            height: HEIGHT - inset,
+        }
+    }
+
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+
+    /// The rows the header draws in: [`HEADER_HEIGHT`] on a full page, less
+    /// on a shorter one. [`header_svg`] renders exactly these.
+    pub const fn header_height(self) -> u32 {
+        HEADER_HEIGHT - self.header_cut()
+    }
+
+    /// Where the radar raster goes, in this page's rows.
+    pub const fn radar_top(self) -> i64 {
+        RADAR_TOP - self.body_cut() as i64
+    }
+
+    const fn inset(self) -> u32 {
+        HEIGHT - self.height
+    }
+
+    /// Of [`Self::MAX_INSET`]: 6 from above the clock, 12 from between the
+    /// names and the countdown...
+    const fn header_cut(self) -> u32 {
+        (self.inset() * 18 + Self::MAX_INSET / 2) / Self::MAX_INSET
+    }
+
+    /// ...6 more from the timetable's rows, so everything under it moves
+    /// up by 24...
+    const fn body_cut(self) -> u32 {
+        (self.inset() * 24 + Self::MAX_INSET / 2) / Self::MAX_INSET
+    }
+
+    /// ...and the rest from the margin under the rain line.
+    fn geometry(self) -> Geometry {
+        let inset = f64::from(self.inset());
+        let share = inset / f64::from(Self::MAX_INSET);
+        let header_cut = f64::from(self.header_cut());
+        let body_cut = f64::from(self.body_cut());
+        let prayers_top = PRAYERS_TOP - header_cut;
+        Geometry {
+            names: -6.0 * share,
+            hero: -header_cut,
+            prayers_top,
+            prayer_row: PRAYER_ROW - (body_cut - header_cut) / 3.0,
+            body: -body_cut,
+            tomorrow: -8.0 * share,
+            // 56 under it on a full page, 32 at the most inset.
+            footer: f64::from(self.height) - 56.0 + 24.0 * share,
+        }
+    }
+}
+
+/// Where things go on a [`Page`]: offsets from the full page's positions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Geometry {
+    /// The clock, dates and the next prayer's names.
+    names: f64,
+    /// The countdown and the header's divider.
+    hero: f64,
+    prayers_top: f64,
+    prayer_row: f64,
+    /// Everything from the hourly strip down.
+    body: f64,
+    /// Tomorrow beside the radar, on top of `body`.
+    tomorrow: f64,
+    /// The rain line's baseline.
+    footer: f64,
+}
+
+impl Geometry {
+    fn prayers_bottom(&self) -> f64 {
+        self.prayers_top + 3.0 * self.prayer_row
+    }
+}
+
 pub struct Frame<'a> {
     pub now: DateTime<Utc>,
     pub config: &'a Config,
     pub prayers: &'a DayTimes,
     pub weather: Option<&'a Snapshot<Weather>>,
     pub radar: Option<&'a Snapshot<RadarImage>>,
+    /// The canvas: [`Page::FULL`] unless a host draws above it.
+    pub page: Page,
 }
 
 impl Frame<'_> {
@@ -64,16 +176,16 @@ impl Frame<'_> {
 
 pub fn svg(frame: &Frame) -> String {
     document(
-        HEIGHT,
+        frame.page.height(),
         &[header(frame), prayers(frame), weather(frame)].concat(),
     )
 }
 
-/// Only the header, on a canvas [`HEADER_HEIGHT`] tall: the top of
+/// Only the header, on a canvas [`Page::header_height`] tall: the top of
 /// [`svg`]'s page, for redrawing the clock and countdown alone. Uses only
-/// the frame's time, config and prayers.
+/// the frame's time, config, prayers and page.
 pub fn header_svg(frame: &Frame) -> String {
-    document(HEADER_HEIGHT, &header(frame))
+    document(frame.page.header_height(), &header(frame))
 }
 
 fn document(height: u32, body: &str) -> String {
@@ -98,31 +210,38 @@ fn header(frame: &Frame) -> String {
         .format("%A, %-d %B")
         .to_string();
     let (clock, suffix) = clock_parts(frame.now, tz, frame.config.display.clock);
+    let g = frame.page.geometry();
+    let y = |full: f64| full + g.names;
     // The left column has to stay clear of the right-anchored prayer name,
     // whose widest form ("Jumu'ah") reaches x 373. The Hijri line ends at 332
     // on the longest month; adding the Arabic form again would run to 516.
     [
-        text(MARGIN - 4.0, 66.0, 72, &clock).weight(700).to_string(),
+        text(MARGIN - 4.0, y(66.0), 72, &clock)
+            .weight(700)
+            .to_string(),
         suffix.map_or_else(String::new, |s| {
-            text(MARGIN + 4.0 + numeric_width(&clock, 72.0), 66.0, 21, s)
+            text(MARGIN + 4.0 + numeric_width(&clock, 72.0), y(66.0), 21, s)
                 .weight(600)
                 .to_string()
         }),
-        text(MARGIN, 100.0, 22, &date).weight(600).to_string(),
-        text(MARGIN, 130.0, 22, &hijri.english())
+        text(MARGIN, y(100.0), 22, &date).weight(600).to_string(),
+        text(MARGIN, y(130.0), 22, &hijri.english())
             .weight(600)
             .to_string(),
-        text(RIGHT, 48.0, 32, arabic).weight(600).end().to_string(),
-        text(RIGHT, 122.0, 88, english)
+        text(RIGHT, y(48.0), 32, arabic)
+            .weight(600)
+            .end()
+            .to_string(),
+        text(RIGHT, y(122.0), 88, english)
             .weight(700)
             .end()
             .to_string(),
         countdown_hero(
             f64::from(WIDTH) / 2.0,
-            268.0,
+            268.0 + g.hero,
             &countdown(frame.now, upcoming.at),
         ),
-        hline(292.0, 2.0),
+        hline(292.0 + g.hero, 2.0),
     ]
     .concat()
 }
@@ -138,37 +257,37 @@ fn countdown_hero(x: f64, baseline: f64, remaining: &str) -> String {
 fn prayers(frame: &Frame) -> String {
     let weekday = frame.prayers.date.weekday();
     let upcoming = frame.prayers.upcoming(frame.now);
+    let g = frame.page.geometry();
     let mut cells = String::new();
     for (index, (salah, at)) in frame.prayers.board(frame.now).into_iter().enumerate() {
-        let (x, top) = cell_position(index);
+        let (x, top) = cell_position(&g, index);
         cells += &prayer_cell(
             frame,
-            x,
-            top,
+            (x, top, g.prayer_row),
             salah,
             at,
             weekday,
             RowState::of(salah, at, upcoming, frame.now),
         );
     }
-    cells += &hline(PRAYERS_BOTTOM + 8.0, 2.0);
+    cells += &hline(g.prayers_bottom() + 8.0, 2.0);
     cells
 }
 
 /// Where the n-th prayer sits: two columns of three, filled left to right.
-fn cell_position(index: usize) -> (f64, f64) {
+fn cell_position(g: &Geometry, index: usize) -> (f64, f64) {
     let column = index % 2;
     let row = index / 2;
     (
         MARGIN + column as f64 * (COLUMN_WIDTH + COLUMN_GAP),
-        PRAYERS_TOP + row as f64 * PRAYER_ROW,
+        g.prayers_top + row as f64 * g.prayer_row,
     )
 }
 
+/// A cell at (x, top), `row` tall.
 fn prayer_cell(
     frame: &Frame,
-    x: f64,
-    top: f64,
+    (x, top, row): (f64, f64, f64),
     salah: Salah,
     at: DateTime<Utc>,
     weekday: Weekday,
@@ -184,16 +303,10 @@ fn prayer_cell(
         RowState::Later => "#000",
     };
     let right = x + COLUMN_WIDTH;
-    let line = baseline(top, PRAYER_ROW, 32.0);
+    let line = baseline(top, row, 32.0);
     let mut cell = String::new();
     if state == RowState::Next {
-        cell += &rect(
-            x - 8.0,
-            top + 3.0,
-            COLUMN_WIDTH + 16.0,
-            PRAYER_ROW - 8.0,
-            8.0,
-        );
+        cell += &rect(x - 8.0, top + 3.0, COLUMN_WIDTH + 16.0, row - 8.0, 8.0);
     }
     cell += &[
         text(x, line, 32, english)
@@ -233,10 +346,11 @@ impl RowState {
 }
 
 fn weather(frame: &Frame) -> String {
+    let g = frame.page.geometry();
     let Some(snapshot) = frame.weather else {
         return text(
             WIDTH as f64 / 2.0,
-            PRAYERS_BOTTOM + 120.0,
+            g.prayers_bottom() + 120.0,
             28,
             "Weather unavailable",
         )
@@ -244,10 +358,22 @@ fn weather(frame: &Frame) -> String {
         .fill(MUTED)
         .to_string();
     };
-    if frame.rain_expected() {
-        weather_rain(frame, snapshot)
+    // Laid out for the full page, then moved up as a whole: the rain line
+    // sits on the page's own footer.
+    let body = if frame.rain_expected() {
+        weather_rain(frame, snapshot, g.tomorrow)
     } else {
         weather_clear(frame, snapshot)
+    };
+    shift(g.body, &body) + &rain_line(frame, &snapshot.data, g.footer)
+}
+
+/// `content` moved down by `dy` (up if negative).
+fn shift(dy: f64, content: &str) -> String {
+    if dy == 0.0 {
+        content.to_string()
+    } else {
+        format!(r#"<g transform="translate(0 {dy})">{content}</g>"#)
     }
 }
 
@@ -295,8 +421,9 @@ impl Conditions {
     }
 }
 
-/// Rain is coming: the current conditions share the lower half with a radar card.
-fn weather_rain(frame: &Frame, snapshot: &Snapshot<Weather>) -> String {
+/// Rain is coming: the current conditions share the lower half with a radar
+/// card. Tomorrow, under the conditions, moves `tomorrow` more.
+fn weather_rain(frame: &Frame, snapshot: &Snapshot<Weather>, tomorrow: f64) -> String {
     let w = &snapshot.data;
     let c = Conditions::new(frame, w);
     let tz = frame.config.location.timezone;
@@ -323,8 +450,7 @@ fn weather_rain(frame: &Frame, snapshot: &Snapshot<Weather>) -> String {
         }),
     ]
     .concat();
-    body += &tomorrow_compact(w, frame.now, tz);
-    body += &rain_line(frame, w);
+    body += &shift(tomorrow, &tomorrow_compact(w, frame.now, tz));
     body += &radar_card(frame);
     body
 }
@@ -359,27 +485,24 @@ fn weather_clear(frame: &Frame, snapshot: &Snapshot<Weather>) -> String {
     .concat();
     body += &hline(840.0, 2.0);
     body += &tomorrow_wide(w, frame.now, tz);
-    body += &rain_line(frame, w);
     body
 }
 
-/// The rain outlook, with the data's age tucked into the right corner.
-fn rain_line(frame: &Frame, w: &Weather) -> String {
+/// The rain outlook on `baseline`, with the data's age tucked into the
+/// right corner.
+fn rain_line(frame: &Frame, w: &Weather, baseline: f64) -> String {
     let tz = frame.config.location.timezone;
     [
         text(
             MARGIN,
-            HEIGHT as f64 - 56.0,
+            baseline,
             24,
             &rain_outlook(&w.quarters, frame.now, tz, frame.config.display.clock),
         )
         .weight(600)
         .to_string(),
         stale_note(frame).map_or_else(String::new, |s| {
-            text(RIGHT, HEIGHT as f64 - 56.0, 18, &s)
-                .end()
-                .fill(MUTED)
-                .to_string()
+            text(RIGHT, baseline, 18, &s).end().fill(MUTED).to_string()
         }),
     ]
     .concat()
@@ -464,7 +587,8 @@ fn tomorrow_wide(w: &Weather, now: DateTime<Utc>, tz: Tz) -> String {
 }
 
 /// The radar card: a bordered square in the bottom-right corner, over the raster
-/// the renderer blits at [`RADAR_LEFT`], [`RADAR_TOP`].
+/// the renderer blits at [`RADAR_LEFT`], [`Page::radar_top`] (here at
+/// [`RADAR_TOP`], in the body [`weather`] moves up to there).
 fn radar_card(frame: &Frame) -> String {
     let (left, top) = (f64::from(RADAR_LEFT as i32), f64::from(RADAR_TOP as i32));
     let (width, height) = RADAR_SIZE;
@@ -917,13 +1041,68 @@ mod tests {
     #[test]
     fn prayer_cells_fill_two_columns_of_three() {
         // Six prayers, two columns: the third cell starts a new row.
-        assert_eq!(cell_position(0), (MARGIN, PRAYERS_TOP));
+        let g = Page::FULL.geometry();
+        assert_eq!(cell_position(&g, 0), (MARGIN, PRAYERS_TOP));
         assert_eq!(
-            cell_position(1).0,
+            cell_position(&g, 1).0,
             MARGIN + COLUMN_WIDTH + COLUMN_GAP,
             "the second column starts after the first"
         );
-        assert_eq!(cell_position(2), (MARGIN, PRAYERS_TOP + PRAYER_ROW));
-        assert_eq!(cell_position(5).1, PRAYERS_TOP + 2.0 * PRAYER_ROW);
+        assert_eq!(cell_position(&g, 2), (MARGIN, PRAYERS_TOP + PRAYER_ROW));
+        assert_eq!(cell_position(&g, 5).1, PRAYERS_TOP + 2.0 * PRAYER_ROW);
+    }
+
+    #[test]
+    fn a_full_page_is_laid_out_as_ever() {
+        let page = Page::default();
+        assert_eq!(page, Page::FULL);
+        assert_eq!(page, Page::below(0));
+        assert_eq!(page.height(), HEIGHT);
+        assert_eq!(page.header_height(), HEADER_HEIGHT);
+        assert_eq!(page.radar_top(), RADAR_TOP);
+        assert_eq!(
+            page.geometry(),
+            Geometry {
+                names: 0.0,
+                hero: 0.0,
+                prayers_top: PRAYERS_TOP,
+                prayer_row: PRAYER_ROW,
+                body: 0.0,
+                tomorrow: 0.0,
+                footer: HEIGHT as f64 - 56.0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_page_under_a_bar_tightens_the_spacing_to_fit() {
+        // kindil's status bar.
+        let page = Page::below(56);
+        assert_eq!(page.height(), 968);
+        assert_eq!(Page::below(80), page, "no shorter than everything fits in");
+        let g = page.geometry();
+        assert_eq!(page.header_height(), 282);
+        assert_eq!(
+            g.prayers_top, 284.0,
+            "the timetable starts under the header"
+        );
+        assert!(g.prayers_top + 3.0 > f64::from(page.header_height()));
+        assert_eq!(g.prayer_row, 44.0);
+        assert_eq!(g.prayers_bottom() + 8.0, PRAYERS_BOTTOM + 8.0 + g.body);
+        assert_eq!(g.body, -24.0);
+        assert_eq!(page.radar_top(), RADAR_TOP - 24);
+        // The radar card's border and the rain line under it fit on the page.
+        let card_bottom = page.radar_top() as f64 + f64::from(RADAR_SIZE.1) + 2.0;
+        assert!(card_bottom + 24.0 < g.footer, "{card_bottom} {}", g.footer);
+        assert_eq!(g.footer, 936.0);
+        // In between, every offset is a whole pixel, so a shifted element
+        // draws exactly as it did.
+        for inset in 0..=Page::MAX_INSET {
+            let page = Page::below(inset);
+            let g = page.geometry();
+            assert_eq!(g.body.fract(), 0.0);
+            assert_eq!(page.header_height() as f64, 300.0 + g.hero);
+            assert!(g.footer <= f64::from(page.height()) - 32.0);
+        }
     }
 }

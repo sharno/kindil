@@ -113,14 +113,17 @@ fn preview(cli: &Cli, dir: &std::path::Path) -> anyhow::Result<()> {
         now: chrono::Utc::now,
     })?;
     app.refresh_now();
-    if miqat_config.is_file() {
+    let rain = if miqat_config.is_file() {
         let miqat = miqat::config::Config::load(&miqat_config)?;
         let noon = chrono::DateTime::from_timestamp(1_794_398_400, 0)
             .ok_or_else(|| anyhow::anyhow!("fixture instant"))?;
         app.set_miqat(kindil::dashboards::preview(&miqat, noon)?);
-    }
+        Some(kindil::dashboards::preview_rain(&miqat, noon)?)
+    } else {
+        None
+    };
     app.window.show()?;
-    kindil::preview::screens(&app, &window, dir)?;
+    kindil::preview::screens(&app, &window, dir, rain)?;
     println!("previews: {}", dir.display());
     Ok(())
 }

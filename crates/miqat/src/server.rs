@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use tiny_http::{Header, Response, Server};
 
 use crate::config::Config;
-use crate::layout::Frame;
+use crate::layout::{Frame, Page};
 use crate::prayer::{self, DayTimes};
 use crate::render::Renderer;
 use crate::sources::Sources;
@@ -33,6 +33,7 @@ impl App {
             prayers: &prayers,
             weather: self.sources.weather(),
             radar: self.sources.radar(),
+            page: Page::FULL,
         })
     }
 }

@@ -163,61 +163,86 @@ impl Fixture {
     }
 }
 
-/// Whether any pixel in these rows differs from Miqat's frame.
+/// Whether any pixel in these rows differs from Miqat's frame, which the
+/// window shows under the status row.
 fn frame_differs(
     rendered: &[slint::Rgb8Pixel],
     expected: &[u8],
     rows: std::ops::Range<usize>,
 ) -> bool {
-    rows.flat_map(|y| (0..758).map(move |x| y * 758 + x))
-        .any(|i| rendered[i].r != expected[i])
+    rows.flat_map(|y| (0..758).map(move |x| (y, x)))
+        .any(|(y, x)| rendered[y * 758 + x].r != expected[(y - TOP) * 758 + x])
+}
+
+/// The status row's height, `dashboards::STATUS_BAR`: Miqat's page starts here.
+const TOP: usize = kindil::dashboards::STATUS_BAR as usize;
+
+/// Whether these rows and columns are all paper.
+fn blank(
+    frame: &[slint::Rgb8Pixel],
+    rows: std::ops::Range<usize>,
+    xs: std::ops::Range<usize>,
+) -> bool {
+    rows.flat_map(|y| xs.clone().map(move |x| y * 758 + x))
+        .all(|i| frame[i].r == 255)
 }
 
 #[test]
-fn miqat_is_pixel_exact_and_taps_reveal_both_bars() {
+fn miqat_is_pixel_exact_under_the_status_row_and_a_tap_reveals_the_tabs() {
     let f = Fixture::new(Arc::new(Simulated::default()));
     let miqat = miqat::config::Config::load(Path::new("examples/miqat.toml")).unwrap();
     let noon = chrono::DateTime::from_timestamp(1_794_398_400, 0).unwrap();
     let gray = kindil::dashboards::preview(&miqat, noon).unwrap();
+    assert_eq!(gray.height as usize, 1024 - TOP);
     let expected = gray.pixels.clone();
     f.app.set_miqat(gray);
     f.k().set_dashboard(DashboardKind::Miqat);
     let rendered = pixels(&f.window);
-    // Only the battery badge, in the strip between the clock and the prayer
-    // name, is drawn over the frame.
-    let outside_badge = |frame: &[slint::Rgb8Pixel]| {
-        frame.iter().enumerate().all(|(i, p)| {
-            let (x, y) = (i % 758, i / 758);
-            (300..460).contains(&x) && (4..48).contains(&y) || p.r == expected[i]
-        })
-    };
     assert!(
-        outside_badge(&rendered),
-        "the dashboard must be Miqat's frame, without chrome or scaling"
+        !frame_differs(&rendered, &expected, TOP..1024),
+        "under the status row, the dashboard must be Miqat's frame, without \
+         chrome, badge or scaling"
+    );
+    // The status row: Wi-Fi and battery on the right, no clock on the left
+    // (the dashboard has a big one).
+    assert!(
+        blank(&rendered, 0..TOP - 14, 0..300),
+        "no clock in the status row"
     );
     assert!(
-        frame_differs(&rendered, &expected, 8..44),
-        "the battery stays visible without a tap"
+        !blank(&rendered, 8..TOP - 8, 560..758),
+        "the status row shows the battery"
     );
+    assert!(!f.k().get_chrome_visible());
 
+    // A tap on the dashboard shows the tab bar, and only it.
     f.tap(380.0, 500.0);
     assert!(f.k().get_chrome_visible());
     assert!(
-        f.k().get_panel_open(),
-        "the tap opens the panel with the bars"
+        !f.k().get_panel_open(),
+        "the panel opens from the status row"
     );
     let revealed = pixels(&f.window);
     assert!(
-        frame_differs(&revealed, &expected, 0..56),
-        "the tap shows the status row"
-    );
-    assert!(
-        frame_differs(&revealed, &expected, 60..150),
-        "the tap shows the quick panel"
-    );
-    assert!(
         frame_differs(&revealed, &expected, 932..1024),
         "the tap shows the tab bar"
+    );
+    assert!(!frame_differs(&revealed, &expected, TOP..930));
+    assert!(
+        (0..TOP * 758).all(|i| revealed[i] == rendered[i]),
+        "the status row stays as it was"
+    );
+    // Again, and it goes.
+    f.tap(380.0, 500.0);
+    assert!(!f.k().get_chrome_visible());
+
+    // The status row drops the quick panel, as on every page.
+    f.tap(STATUS_ROW.0, STATUS_ROW.1);
+    assert!(f.k().get_panel_open());
+    let open = pixels(&f.window);
+    assert!(
+        frame_differs(&open, &expected, 60..150),
+        "the status row shows the quick panel"
     );
 
     // Dragging the slider sets the light once, on release, and the panel
@@ -243,17 +268,30 @@ fn miqat_is_pixel_exact_and_taps_reveal_both_bars() {
         "using the slider restarts the hide timer"
     );
 
-    // A tap outside puts away the panel, and the bars with it.
+    // A tap outside puts away the panel, and the tap goes no further.
     f.tap(380.0, 600.0);
     assert!(!f.k().get_panel_open());
     assert!(!f.k().get_chrome_visible());
-
-    f.tap(380.0, 500.0);
+    // The status row toggles it, as elsewhere.
+    f.tap(STATUS_ROW.0, STATUS_ROW.1);
     f.tap(STATUS_ROW.0, STATUS_ROW.1);
     assert!(!f.k().get_panel_open(), "the status row closes the panel");
-    assert!(f.k().get_chrome_visible());
+    f.tap(380.0, 500.0);
     f.tap(LIBRARY_TAB, TAB_Y);
     assert_eq!(f.k().get_page(), Page::Library);
+}
+
+#[test]
+fn only_other_pages_show_the_time_in_the_status_row() {
+    let f = Fixture::new(Arc::new(Simulated::default()));
+    let clock_area = |f: &Fixture| blank(&pixels(&f.window), 0..TOP - 14, 0..300);
+    f.k().set_dashboard(DashboardKind::Clock);
+    f.k().invoke_go(Page::Dashboard);
+    assert!(clock_area(&f), "the clock dashboard has its own big clock");
+    f.k().set_dashboard(DashboardKind::Miqat);
+    assert!(clock_area(&f));
+    f.k().invoke_go(Page::Library);
+    assert!(!clock_area(&f), "elsewhere the status row has the time");
 }
 
 #[test]
@@ -269,38 +307,49 @@ fn a_minute_tick_redraws_only_the_header_rows() {
     // As the Kindle backend renders: into the buffer the last frame left,
     // reporting the region that changed.
     let mut buffer = vec![slint::Rgb8Pixel::default(); 758 * 1024];
-    let mut render = || {
+    let render = |buffer: &mut [slint::Rgb8Pixel]| {
         let mut dirty = None;
         slint::platform::update_timers_and_animations();
         f.window.draw_if_needed(|renderer| {
             renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
-            let region = renderer.render(&mut buffer, 758);
+            let region = renderer.render(buffer, 758);
             dirty = Some((region.bounding_box_origin(), region.bounding_box_size()));
         });
         dirty
     };
     f.app.window.window().request_redraw();
-    render();
+    render(&mut buffer);
+    let status_row = buffer[..TOP * 758].to_vec();
+    // A tick: the minute moves on (the status row's clock with it) and the
+    // header is redrawn; the battery and Wi-Fi as they were.
+    f.k().set_clock("09:42".into());
+    f.app.refresh_now();
     f.app
         .set_miqat_header(kindil::dashboards::preview_header(&miqat, minute).unwrap());
     assert_eq!(
-        render(),
+        render(&mut buffer),
         Some((
-            slint::PhysicalPosition::new(0, 0),
-            slint::PhysicalSize::new(758, miqat::layout::HEADER_HEIGHT)
+            slint::PhysicalPosition::new(0, TOP as i32),
+            slint::PhysicalSize::new(758, kindil::dashboards::HEADER_HEIGHT)
         )),
-        "only the header's rows go to the panel"
+        "only the header's rows go to the panel, under the status row"
     );
+    assert_eq!(buffer[..TOP * 758], status_row[..]);
     // The header patched over the last page is the next minute's page.
     let expected = kindil::dashboards::preview(&miqat, minute).unwrap().pixels;
-    let badge = |i: usize| (300..460).contains(&(i % 758)) && (4..48).contains(&(i / 758));
     assert!(
-        buffer
-            .iter()
-            .enumerate()
-            .all(|(i, p)| badge(i) || p.r == expected[i]),
+        !frame_differs(&buffer, &expected, TOP..1024),
         "the patched frame is the next minute's page, pixel for pixel"
     );
+    // The battery changing redraws its corner of the status row alone.
+    f.k().set_battery_level(12);
+    f.k().set_battery_label("12%".into());
+    let (origin, size) = render(&mut buffer).unwrap();
+    assert!(
+        origin.y >= 0 && origin.y as u32 + size.height <= TOP as u32,
+        "{origin:?} {size:?}"
+    );
+    assert!(origin.x > 400, "{origin:?}");
 }
 
 /// Host timings of the window's share of a doze wake: `cargo test --release

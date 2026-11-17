@@ -4,7 +4,8 @@
 // - black on white, a few solid grays, no animation or translucency (each frame
 //   costs a panel update, and dithered grays look dirty);
 // - every tap target is at least 64 px tall, row targets span the full width;
-// - the prayer dashboard stays full-bleed: tap it to reveal the status row, quick panel and tab bar.
+// - the prayer dashboard fills the panel under the status row (no clock there: the
+//   dashboard has a big one); tap it to reveal the tab bar.
 import { VirtualKeyboard, VirtualKeyboardHandler } from "vendor/slint-keyboard/virtual_keyboard.slint";
 export { VirtualKeyboardHandler }
 import "../crates/miqat/assets/fonts/IBMPlexSansArabic-Regular.ttf";
@@ -92,7 +93,7 @@ export global Kindil {
     /// Settings → Location or one of its pages.
     out property <bool> in-location: page == Page.location || page == Page.place-search || page == Page.coordinates;
     in-out property <DashboardKind> dashboard: DashboardKind.miqat;
-    /// The status row and tab bar over the full-bleed dashboard; other pages always show them.
+    /// The tab bar over the prayer dashboard; other pages always show it.
     in-out property <bool> chrome-visible: false;
     /// The quick panel (front light, text size) dropped down from the status row.
     in-out property <bool> panel-open: false;
@@ -689,15 +690,19 @@ component BatteryStatus {
 }
 
 /// Clock on the left, Wi-Fi and battery on the right. A tap drops the quick
-/// panel down from it, or puts it away again.
+/// panel down from it, or puts it away again. Its height is
+/// `dashboards::STATUS_BAR`, the rows Miqat's page leaves it.
 component StatusRow inherits Rectangle {
+    /// Off on Home, whose dashboard has a big clock: the minute then changes
+    /// nothing here, so a tick redraws none of the row.
+    in property <bool> show-clock: true;
     height: 56px;
     background: Theme.paper;
     HorizontalLayout {
         padding-left: Theme.gutter;
         padding-right: Theme.gutter;
         spacing: 10px;
-        Text {
+        if root.show-clock: Text {
             text: Kindil.clock;
             font-size: 22px;
             font-weight: 700;
@@ -705,6 +710,7 @@ component StatusRow inherits Rectangle {
             vertical-alignment: center;
             horizontal-stretch: 1;
         }
+        if !root.show-clock: Rectangle { horizontal-stretch: 1; }
         if Kindil.wifi-bars >= 0: VerticalLayout {
             alignment: center;
             WifiBars { bars: Kindil.wifi-bars; }
@@ -2411,8 +2417,10 @@ export component AppWindow inherits Window {
     property <bool> immersive: Kindil.page == Page.dashboard && Kindil.dashboard == DashboardKind.miqat;
     property <length> usable-height: root.height - (root.keyboard-visible ? keyboard.height : 0px);
 
-    // Full-bleed and pixel-exact: Miqat renders for this exact panel.
+    // Pixel-exact under the status row: Miqat renders for the rest of the panel.
     if root.immersive: Rectangle {
+        y: 56px;
+        height: root.height - 56px;
         header := Image {
             x: 0;
             y: 0;
@@ -2439,29 +2447,19 @@ export component AppWindow inherits Window {
             horizontal-alignment: center;
             vertical-alignment: center;
         }
-        // The bars and the panel come and go together.
+        // A tap shows the tab bar, or puts it (and the panel) away; the
+        // status row above works as on every page.
         TouchArea {
             clicked => {
                 Kindil.chrome-visible = !Kindil.chrome-visible;
-                Kindil.panel-open = Kindil.chrome-visible;
+                Kindil.panel-open = false;
             }
         }
     }
 
-    // The dashboard has no bars until tapped, so the battery stays visible in
-    // the one empty strip of Miqat's frame, between the clock and the prayer name.
-    if root.immersive && !Kindil.chrome-visible: Rectangle {
-        x: (parent.width - self.width) / 2;
-        y: 8px;
-        width: 140px;
-        height: 36px;
-        background: Theme.paper;
-        BatteryStatus { }
-    }
-
     VerticalLayout {
         height: root.usable-height;
-        if !root.immersive || Kindil.chrome-visible: StatusRow { }
+        StatusRow { show-clock: Kindil.page != Page.dashboard; }
         Rectangle {
             vertical-stretch: 1;
             if Kindil.page == Page.dashboard && Kindil.dashboard == DashboardKind.clock: ClockPage { width: parent.width; height: parent.height; }
@@ -2483,22 +2481,17 @@ export component AppWindow inherits Window {
         if !root.immersive || Kindil.chrome-visible: TabBar { }
     }
 
-    // A tap outside the panel puts it away (and the bars with it, on the dashboard).
+    // A tap outside the panel puts it away.
     if Kindil.panel-open: TouchArea {
         y: 56px;
         height: root.usable-height - 56px - 92px;
-        clicked => {
-            Kindil.panel-open = false;
-            if root.immersive {
-                Kindil.chrome-visible = false;
-            }
-        }
+        clicked => { Kindil.panel-open = false; }
     }
     if Kindil.panel-open: QuickPanel {
         y: 56px;
     }
 
-    // Hide the revealed bars and the panel again so the wall dashboard stays
+    // Hide the revealed tab bar and the panel again so the wall dashboard stays
     // clean. Using a panel control starts the time over.
     property <int> activity: Kindil.activity;
     changed activity => { hide.restart(); }
