@@ -110,12 +110,26 @@ impl Maintenance {
     /// minute and not always the same one.
     pub fn online_wake(&mut self, now: DateTime<Utc>) -> bool {
         let minute = |t: DateTime<Utc>| t.duration_trunc(TimeDelta::minutes(1)).unwrap_or(t);
-        let due = minute(now) - minute(self.last) >= MAINTENANCE_EVERY;
+        let since = minute(now) - minute(self.last);
+        // A last window after now: the clock went back past it.
+        let due = since >= MAINTENANCE_EVERY || since < TimeDelta::zero();
         if due {
             self.last = now;
             self.opening = true;
         }
         due
+    }
+
+    /// The clock was stepped by `by` from network time: the times noted so
+    /// far were on the old clock.
+    pub fn clock_stepped(&mut self, by: TimeDelta) {
+        self.last += by;
+        if let Some(until) = &mut self.open_until {
+            *until += by;
+        }
+        for (_, since) in &mut self.seen {
+            *since += by;
+        }
     }
 
     /// Instead of a nap at `now`, with these SSH sessions open: whether to
@@ -130,6 +144,14 @@ impl Maintenance {
             if !self.seen.iter().any(|(seen, _)| seen == session) {
                 self.seen.push((*session, now));
             }
+        }
+        // Whatever the clock does, a window holds for at most its length
+        // from now, and a session for at most its own from now.
+        for (_, since) in &mut self.seen {
+            *since = (*since).min(now);
+        }
+        if let Some(until) = &mut self.open_until {
+            *until = (*until).min(now + MAINTENANCE_WINDOW);
         }
         if self.open_until.is_some_and(|until| now < until) {
             Some(Hold::Window)
@@ -228,6 +250,45 @@ mod tests {
         assert!(m.online_wake(wall(15, 30, 1)));
         assert!(!m.online_wake(wall(17, 0, 1)));
         assert!(m.online_wake(wall(17, 30, 1)));
+    }
+
+    #[test]
+    fn the_schedule_moves_with_a_step_of_network_time() {
+        let step = TimeDelta::seconds(724);
+        let mut m = Maintenance::new(wall(9, 0, 30));
+        // The clock was 724 s slow: the doze began at 9:12:34.
+        m.clock_stepped(step);
+        assert!(!m.online_wake(wall(11, 0, 1)));
+        assert!(m.online_wake(wall(11, 12, 1)));
+        // Set back past the last window: one opens rather than none for hours.
+        let mut m = Maintenance::new(wall(11, 0, 0));
+        assert!(m.online_wake(wall(9, 30, 1)));
+        // A window open when the clock goes forward with network time ends
+        // as it would have; set back, it still holds no longer than its length.
+        let mut m = Maintenance::new(wall(9, 0, 0));
+        assert!(m.online_wake(wall(11, 0, 1)));
+        assert_eq!(m.hold(wall(11, 0, 20), &[]), Some(Hold::Window));
+        m.clock_stepped(step);
+        assert_eq!(m.hold(wall(11, 14, 23), &[]), Some(Hold::Window));
+        assert_eq!(m.hold(wall(11, 14, 24), &[]), None);
+        let mut m = Maintenance::new(wall(9, 0, 0));
+        assert!(m.online_wake(wall(11, 0, 1)));
+        assert_eq!(m.hold(wall(11, 0, 20), &[]), Some(Hold::Window));
+        assert_eq!(m.hold(wall(10, 0, 0), &[]), Some(Hold::Window));
+        assert_eq!(m.hold(wall(10, 2, 0), &[]), None);
+    }
+
+    #[test]
+    fn a_session_holds_no_longer_for_a_clock_set_back() {
+        let one = Session {
+            local_port: 22,
+            remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)), 50_001),
+        };
+        let mut m = Maintenance::new(wall(9, 0, 0));
+        assert_eq!(m.hold(wall(10, 0, 0), &[one]), Some(Hold::Ssh));
+        // An hour back: half an hour from then, not an hour and a half.
+        assert_eq!(m.hold(wall(9, 0, 0), &[one]), Some(Hold::Ssh));
+        assert_eq!(m.hold(wall(9, 30, 0), &[one]), None);
     }
 
     #[test]

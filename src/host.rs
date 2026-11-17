@@ -224,6 +224,16 @@ pub trait Host: Send + Sync {
     /// Suspends to RAM with a timed wake; returns once awake, by the timer or
     /// the power button.
     fn nap(&self, wake_after: Duration) -> anyhow::Result<()>;
+    /// Back from a suspend or a nap: catches the clock up with the RTC if
+    /// the resume lost a second or more (src/clock.rs). Quick.
+    fn catch_up_clock(&self) -> Option<crate::clock::Correction> {
+        None
+    }
+    /// Online: sets the clock (and the RTC) from network time if it is off.
+    /// Blocks for a few seconds: call from a worker thread.
+    fn sync_clock(&self) -> anyhow::Result<Option<crate::clock::Correction>> {
+        Ok(None)
+    }
     fn restart(&self) -> anyhow::Result<()>;
     fn power_off(&self) -> anyhow::Result<()>;
     /// Asks GitHub for the latest release. Blocks: call from a worker thread.
@@ -264,6 +274,9 @@ struct SimulatedState {
     online: bool,
     lookups: u32,
     ssh_sessions: Vec<crate::maintenance::Session>,
+    /// Times the clock was synced, and the step the next sync reports.
+    clock_syncs: u32,
+    clock_off: Option<f64>,
 }
 
 /// The Simulated device's place search: well-known public places.
@@ -351,12 +364,25 @@ impl Default for Simulated {
                 online: true,
                 lookups: 0,
                 ssh_sessions: Vec::new(),
+                clock_syncs: 0,
+                clock_off: None,
             }),
         }
     }
 }
 
 impl Simulated {
+    /// How many times the clock was synced from network time.
+    pub fn clock_syncs(&self) -> u32 {
+        self.with(|s| s.clock_syncs)
+    }
+
+    /// The next sync finds the clock off by this many seconds (slow when
+    /// positive).
+    pub fn set_clock_off(&self, seconds: f64) {
+        self.with(|s| s.clock_off = Some(seconds));
+    }
+
     /// How many times the device was put to sleep.
     pub fn suspends(&self) -> u32 {
         self.with(|s| s.suspends)
@@ -549,6 +575,17 @@ impl Host for Simulated {
             s.parked_naps += u32::from(s.parked);
         });
         Ok(())
+    }
+    /// Reports the step set with [`Simulated::set_clock_off`], once; the
+    /// clock itself is the UI's to fake.
+    fn sync_clock(&self) -> anyhow::Result<Option<crate::clock::Correction>> {
+        self.with(|s| {
+            s.clock_syncs += 1;
+            Ok(s.clock_off.take().map(|seconds| crate::clock::Correction {
+                seconds,
+                source: crate::clock::Source::Ntp("time.example.org"),
+            }))
+        })
     }
     fn restart(&self) -> anyhow::Result<()> {
         anyhow::bail!("a simulated device cannot restart")

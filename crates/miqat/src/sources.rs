@@ -18,10 +18,11 @@ pub const WEATHER_EVERY: Duration = Duration::minutes(15);
 /// RainViewer publishes a frame every 10 minutes.
 pub const RADAR_EVERY: Duration = Duration::minutes(10);
 
+/// Due when missing, old, or fetched "after" `now`: the clock went back.
 fn is_due<T>(snapshot: &Option<Snapshot<T>>, now: DateTime<Utc>, every: Duration) -> bool {
     snapshot
         .as_ref()
-        .is_none_or(|s| now - s.fetched_at >= every)
+        .is_none_or(|s| now - s.fetched_at >= every || now < s.fetched_at)
 }
 
 pub struct Sources {
@@ -154,5 +155,7 @@ mod tests {
         });
         assert!(!is_due(&fresh, now, WEATHER_EVERY));
         assert!(is_due(&fresh, now + Duration::minutes(10), WEATHER_EVERY));
+        // The clock set back past the fetch: refetched, not kept for a day.
+        assert!(is_due(&fresh, now - Duration::minutes(10), WEATHER_EVERY));
     }
 }

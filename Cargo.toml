@@ -48,6 +48,8 @@ slint-backend-kindle = { version = "=0.7.1", optional = true }
 # Slint's font stack must not link a host fontconfig into the ARM binary.
 fontique = { version = "0.11", default-features = false, features = ["std", "fontconfig-dlopen"] }
 fontdb = { version = "0.24", default-features = false, features = ["std", "fs", "memmap"] }
+# Network time (src/clock.rs): the blocking SNTP client alone, no tokio.
+rsntp = { version = "4.1", default-features = false }
 
 [features]
 default = []

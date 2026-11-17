@@ -2968,6 +2968,7 @@ dependencies = [
  "minisign-verify",
  "miqat",
  "rbook",
+ "rsntp",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4725,6 +4726,12 @@ dependencies = [
  "spki",
  "zeroize",
 ]
+
+[[package]]
+name = "rsntp"
+version = "4.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc507d0efdc8ce91a17455b1efe9ada6a21e2414470b3f1d84aefc7ebcf247bd"
 
 [[package]]
 name = "rspolib"

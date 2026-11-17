@@ -22,6 +22,8 @@ use std::time::Duration;
 
 /// How long kindil keeps retrying its Wi-Fi at start (a slow driver).
 const WIFI_START: Duration = Duration::from_secs(180);
+/// How long the start's clock sync waits for Wi-Fi to have an address.
+const CLOCK_SYNC_WAIT: Duration = Duration::from_secs(120);
 /// The PW1's fuel gauge; it stalls while suspended and catches up on resume.
 const GAUGE_CHARGE: &str = "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_mAH";
 /// The gauge's average current in mA, negative on battery.
@@ -374,6 +376,7 @@ impl Host for KindleHost {
         let networks = self.networks.clone();
         std::thread::spawn(move || {
             start_wifi(&net, &networks);
+            sync_clock_once_online(&net);
         });
         // kindil's own SSH server (src/ssh.rs), beside USBNetwork's for now.
         crate::ssh::start();
@@ -395,6 +398,10 @@ impl Host for KindleHost {
             std::fs::write("/sys/power/state", b"mem")?;
             if let Some(alarm) = &alarm {
                 let _ = std::fs::write(alarm, "0");
+            }
+            // The resume lost time: back to the RTC's before reading it.
+            if let Some(correction) = crate::clock::catch_up() {
+                eprintln!("kindil: {correction}");
             }
             let now = epoch_seconds();
             let checking = check.is_some_and(|due| crate::power::alarm_woke(due, now));
@@ -419,6 +426,14 @@ impl Host for KindleHost {
         // The power button may have woken it first: never leave the alarm set.
         let _ = std::fs::write(&alarm, "0");
         Ok(slept?)
+    }
+
+    fn catch_up_clock(&self) -> Option<crate::clock::Correction> {
+        crate::clock::catch_up()
+    }
+
+    fn sync_clock(&self) -> anyhow::Result<Option<crate::clock::Correction>> {
+        crate::clock::sync()
     }
 
     fn restart(&self) -> anyhow::Result<()> {
@@ -578,6 +593,24 @@ fn start_wifi(net: &Arc<Net>, networks: &Mutex<Networks>) {
                 return;
             }
         }
+    }
+}
+
+/// At start: once Wi-Fi has an address, sets the clock from network time
+/// (Amazon's services, which did, are stopped). Later, each online doze
+/// wake and each wake from sleep does it again (src/ui.rs).
+fn sync_clock_once_online(net: &Net) {
+    let since = std::time::Instant::now();
+    while since.elapsed() < CLOCK_SYNC_WAIT && net.power() == Power::On {
+        if let Ok((Link::Associated { ip: Some(_), .. }, _)) = net.link() {
+            match crate::clock::sync() {
+                Ok(Some(correction)) => eprintln!("kindil: {correction}"),
+                Ok(None) => eprintln!("kindil: clock: right by network time"),
+                Err(error) => eprintln!("kindil: clock: {error:#}"),
+            }
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(2));
     }
 }
 

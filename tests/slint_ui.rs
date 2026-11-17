@@ -930,6 +930,33 @@ fn dozing_on_battery_measures_its_draw_each_online_window() {
 }
 
 #[test]
+fn waking_from_a_doze_sets_the_clock_once_wifi_is_back() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    f.app.device_event(Event::Doze);
+    (0..3).for_each(|_| f.app.fire_timers());
+    // Without a dashboard a doze never goes online: the RTC keeps its time.
+    assert_eq!(host.clock_syncs(), 0);
+    host.set_clock_off(724.0);
+    f.app.device_event(Event::PowerButton);
+    assert_eq!(
+        host.clock_syncs(),
+        1,
+        "the press brings Wi-Fi back, and the time"
+    );
+}
+
+#[test]
+fn waking_from_sleep_sets_the_clock_once_wifi_is_back() {
+    // The simulated suspend wakes at once.
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    f.app.device_event(Event::PowerButton);
+    f.app.fire_timers();
+    assert_eq!((host.suspends(), host.clock_syncs()), (1, 1));
+}
+
+#[test]
 fn an_open_ssh_session_keeps_a_dozing_kindil_awake_until_it_closes() {
     let host = Arc::new(Simulated::default());
     let f = Fixture::new(host.clone());
