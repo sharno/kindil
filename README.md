@@ -86,9 +86,9 @@ and a reboot always returns the Kindle to stock.
     redraws ended, the gauge, and the clock's corrections. The power button
     brings it back with the light restored, and Wi-Fi rejoins.
   - **Time keeping**: with Amazon's services stopped nothing else sets the
-    clock, and each resume from a nap loses a fraction of a second of it
-    (12 minutes slow after two days of dozing, while the SoC's RTC, `rtc0`,
-    stayed right). So after each nap or sleep kindil steps the clock up to
+    clock (Amazon's `updatetime` did), and each resume from a nap loses
+    about half a second of it (12 minutes slow after two days of dozing,
+    29 s more in the next hour, while the SoC's RTC, `rtc0`, stayed right). So after each nap or sleep kindil steps the clock up to
     `rtc0` once it is a whole second behind, and whenever it goes online
     (at start once Wi-Fi has an address, each doze fetch, each wake) it asks
     pool.ntp.org, time.google.com and time.cloudflare.com (SNTP) and sets

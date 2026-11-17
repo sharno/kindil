@@ -1,16 +1,18 @@
-//! Keeping time. Amazon's services set the clock while they run (tmd at
-//! first, then the time from Amazon's servers); kindil stops them, so it
-//! keeps the clock itself:
+//! Keeping time. Amazon's `updatetime` set the clock while its services
+//! ran (`ntpdate`, else the `Date` of kindle-time.amazon.com over HTTP, then
+//! `hwclock -u -w`); kindil stops them, so it keeps the clock itself:
 //!
 //! - Online, it asks a few SNTP servers ([`SERVERS`]) and steps the system
 //!   clock when at least two agree it is off; with UDP 123 blocked, the
 //!   `Date` of an HTTP answer does, more coarsely. Either way the
 //!   persistent RTC is written too, so a reboot keeps the time.
-//! - Each resume on the PW1's 2.6.31 kernel loses a fraction of a second
-//!   of system time, and dozing resumes once a minute: about 0.35 s each,
-//!   12 minutes in two days (measured, see the README). The SoC's RTC keeps
-//!   time through a suspend, to the second, so after each nap the system
-//!   clock catches up with it once it has fallen a whole second behind.
+//! - Each resume on the PW1's 2.6.31 kernel loses about half a second of
+//!   system time (the RTC it restores from counts whole seconds), and
+//!   dozing resumes once a minute: measured on 2026-11-17, the clock fell
+//!   from 726 s to 755 s behind `rtc0` in 55 minutes of naps, while `rtc0`
+//!   stayed within a second of real time. `rtc0` keeps time through a
+//!   suspend, so after each nap the system clock catches up with it once it
+//!   has fallen a whole second behind.
 use chrono::{DateTime, TimeDelta, Utc};
 use std::fmt;
 use std::path::Path;
