@@ -1,5 +1,5 @@
 //! The naps' flight recorder: a line for how each doze wake ended (what it
-//! drew, for which minute, the panel's frame count) and for each step of
+//! drew, for which minute, the panel's accepted updates) and for each step of
 //! every suspend (Wi-Fi parked, the alarm armed and read back, suspending,
 //! resumed),
 //! stamped and written before the step, so after a freeze the last line

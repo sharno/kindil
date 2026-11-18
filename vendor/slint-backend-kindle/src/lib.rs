@@ -277,3 +277,9 @@ pub fn install(font_data: &[u8]) -> Result<KindleBackend, slint::PlatformError> 
 pub fn wait_for_panel() -> std::io::Result<()> {
     framebuffer::wait_for_panel()
 }
+
+/// How many updates the panel's driver has accepted: a frame drawn after a
+/// change that sent nothing (or was refused) doesn't move it. kindil patch.
+pub fn updates_sent() -> u64 {
+    framebuffer::updates_sent()
+}
