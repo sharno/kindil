@@ -121,6 +121,35 @@ Released.check -> Checked
 Unmounted.verify -> Free
 ```
 
+## Suspend (naps and sleeps)
+
+src/suspend.rs: every suspend; the caller has parked Wi-Fi.
+
+`suspend::Suspend`: Awake, Armed, UntilButton, Resumed.
+
+```mermaid
+stateDiagram-v2
+    %% machine: suspend::Suspend
+    state "Awake" as s0
+    state "Armed" as s1
+    state "UntilButton" as s2
+    state "Resumed" as s3
+    s1 --> s3: suspend
+    s0 --> s1: arm
+    s0 --> s1: arm_or_button
+    s0 --> s2: arm_or_button
+    s0 --> s2: until_button
+    s2 --> s3: suspend
+```
+
+```text
+Armed.suspend -> Resumed
+Awake.arm -> Armed
+Awake.arm_or_button -> Armed | UntilButton
+Awake.until_button -> UntilButton
+UntilButton.suspend -> Resumed
+```
+
 <!-- kindil: end -->
 <!-- launcher: begin -->
 ## Launcher session

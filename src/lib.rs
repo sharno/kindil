@@ -35,6 +35,7 @@ pub mod ssh_keys;
 #[cfg(test)]
 mod state_machines;
 pub mod station;
+pub mod suspend;
 pub mod sync;
 pub mod system;
 pub mod uevent;

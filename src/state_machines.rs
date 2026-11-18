@@ -62,6 +62,11 @@ fn machines() -> Vec<(&'static str, &'static str, StableGraphMetadata)> {
             "src/drive.rs: the user storage to a computer and back.",
             crate::drive::graph(),
         ),
+        (
+            "Suspend (naps and sleeps)",
+            "src/suspend.rs: every suspend; the caller has parked Wi-Fi.",
+            crate::suspend::graph(),
+        ),
     ]
 }
 
@@ -93,6 +98,13 @@ fn each_transition_has_exactly_its_legal_targets() {
             "Mounted.unmount -> Unmounted",
             "Released.check -> Checked",
             "Unmounted.verify -> Free",
+        ],
+        &[
+            "Armed.suspend -> Resumed",
+            "Awake.arm -> Armed",
+            "Awake.arm_or_button -> Armed | UntilButton",
+            "Awake.until_button -> UntilButton",
+            "UntilButton.suspend -> Resumed",
         ],
     ];
     for ((title, _, graph), want) in machines().iter().zip(want) {
