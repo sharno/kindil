@@ -12,7 +12,8 @@ enum Expect {
     Holds,
     /// A finding on the current code: the model keeps the property, and
     /// the check fails until the code is fixed. Then it holds, and this
-    /// becomes `Holds`.
+    /// becomes `Holds`. (None is open now; the next one lands here.)
+    #[allow(dead_code)]
     Fails(&'static str),
 }
 
@@ -22,16 +23,12 @@ const CHECKS: &[(&str, &str, Expect)] = &[
     ("Sleep", "SleepDoze", Expect::Holds),
     ("Sleep", "SleepUsb", Expect::Holds),
     ("Sleep", "SleepOpen", Expect::Holds),
-    // Failed on 0.15.0; holds since lowbat and the charger check before powering off.
-    ("Sleep", "SleepCharger", Expect::Holds),
     // Failed on 0.15.0; holds since a nap or sleep the app left is cancelled.
     ("Sleep", "SleepRaces", Expect::Holds),
     // Failed on 0.15.0; holds since the press count decides alarm or button.
     ("Sleep", "SleepNearAlarm", Expect::Holds),
     // Failed on 0.15.0; holds since only an armed alarm can be the alarm.
     ("Sleep", "SleepAlarmFails", Expect::Holds),
-    // Holds since d674cfd: the battery's sleep powers off when it can't suspend.
-    ("Sleep", "SleepRefused", Expect::Holds),
     // Failed on 0.15.0; holds since power::sleep looks for a charger before powering off.
     ("Sleep", "SleepPowerOff", Expect::Holds),
     // Failed on 0.15.0; holds since a nap ends on a monotonic deadline.

@@ -147,9 +147,11 @@ against them: see [Formal models](DEVELOP.md#formal-models).
     stops volumd while kindil runs. Off by default, still to be tried with a
     cable: see [docs/USB-DRIVE-TEST.md](USB-DRIVE-TEST.md).
   - **Low battery**: at 5% and not charging, kindil sleeps with a screen that
-    asks for a charge. Suspended, the last few percent last for days; asleep
-    on battery it wakes every 6 hours to check, and at 1% powers off, as
-    Amazon's powerd would. Only the power button or a charger ends this
+    asks for a charge. Suspended, the last few percent last for days; any
+    sleep wakes every 6 hours to check (on a charger too, which may be
+    unplugged meanwhile), and at 1% on battery powers off, as Amazon's
+    powerd would, unless a charger turns up within 10 s. A press is told
+    from that check by the press itself, not the time. Only the power button or a charger ends this
     sleep: a charger's plug-in wakes the device seconds before its driver
     says it is connected, so a wake waits up to 10 s for either and
     otherwise sleeps on with the screen untouched; with a charger already
