@@ -285,10 +285,13 @@ async fn gives_a_shell_its_terminal_and_its_size() {
     channel.window_change(100, 30, 0, 0).await.unwrap();
     // The shell may read its next line before the resize reaches the
     // terminal: ask until it reports the new size.
-    let mut asked = 0;
+    let since = std::time::Instant::now();
     while !seen.contains("30 100") {
-        assert!(asked < 20, "never resized: {seen}");
-        asked += 1;
+        // As long as the other reads here: a loaded machine can be slow.
+        assert!(
+            since.elapsed() < Duration::from_secs(20),
+            "never resized: {seen}"
+        );
         channel.data(&b"stty size\n"[..]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         while let Ok(Some(msg)) =
