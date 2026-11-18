@@ -155,8 +155,9 @@ pub fn lifeline(deadline: Duration, test: i32) {
         std::thread::sleep(Duration::from_secs(2));
         signal(test, libc::SIGKILL);
     }
-    for n in 0..4 {
-        let _ = std::fs::write(format!("/sys/class/rtc/rtc{n}/wakealarm"), "0");
+    // Writing 0 would arm the PW1's alarm five minutes ahead (src/wakealarm.rs).
+    if let Ok(rtc) = crate::wakealarm::WakeRtc::find() {
+        let _ = rtc.disarm();
     }
     kindil_pids()
         .into_iter()

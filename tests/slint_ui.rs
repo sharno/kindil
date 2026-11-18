@@ -975,6 +975,23 @@ fn dozing_keeps_the_screen_and_naps_each_minute_until_a_press() {
 }
 
 #[test]
+fn a_refused_nap_keeps_dozing_and_napping_resumes_once_the_alarm_arms() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    f.app.device_event(Event::Doze);
+    host.set_refuse_naps(true);
+    (1..=2).for_each(|refused| {
+        f.app.fire_timers();
+        assert_eq!(host.refused_naps(), refused, "tried again after a redraw");
+    });
+    assert_eq!(host.naps(), 0);
+    assert_eq!(f.k().get_system(), System::App, "still the dashboard");
+    host.set_refuse_naps(false);
+    f.app.fire_timers();
+    assert_eq!(host.naps(), 1, "napping again");
+}
+
+#[test]
 fn sleeping_parks_wifi_and_waking_brings_it_back() {
     let host = Arc::new(Simulated::default());
     let f = Fixture::new(host.clone());
@@ -1142,8 +1159,8 @@ impl Host for Recording {
     fn power_off(&self) -> anyhow::Result<()> {
         self.device.power_off()
     }
-    fn nap(&self, wake_after: std::time::Duration) -> anyhow::Result<()> {
-        self.device.nap(wake_after)
+    fn nap(&self, until: chrono::DateTime<chrono::Utc>) -> anyhow::Result<()> {
+        self.device.nap(until)
     }
     fn check_update(&self) -> anyhow::Result<kindil::update::Check> {
         Ok(match &self.latest {

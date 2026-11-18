@@ -617,12 +617,7 @@ mod tests {
     /// time; the alarm wakes at `wake_phase` into each real second; a wake
     /// stays up 1.2 to 3.5 s; the kernel's resume moves the clock on by
     /// the whole seconds `rtc0` counted (drivers/rtc/class.c).
-    fn worst_error(
-        naps: u32,
-        rtc_ahead: f64,
-        wake_phase: f64,
-        catch_up: Option<CatchUp>,
-    ) -> f64 {
+    fn worst_error(naps: u32, rtc_ahead: f64, wake_phase: f64, catch_up: Option<CatchUp>) -> f64 {
         let mut jitter = Jitter(7);
         let rtc = |real: f64| (real + rtc_ahead).floor() as i64;
         // Measured as the sync does, on a right clock: a tick seen between

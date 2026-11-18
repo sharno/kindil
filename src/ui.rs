@@ -1767,7 +1767,7 @@ impl Ctx {
         }
         let left = (until - now).to_std().unwrap_or_default();
         let Some(hold) = hold else {
-            return self.nap(now, left);
+            return self.nap(now, until, left);
         };
         lock(&self.ledger).holding(now, hold);
         let Execution::Background = self.execution else {
@@ -1788,9 +1788,11 @@ impl Ctx {
         });
     }
 
-    /// Suspends for `left`, Wi-Fi parked; a nap too short to be worth it
-    /// waits awake instead.
-    fn nap(&self, now: DateTime<Utc>, left: Duration) {
+    /// Suspends until `until`, `left` from now, Wi-Fi parked; a nap too
+    /// short to be worth it waits awake instead. A nap the host refused (its
+    /// alarm couldn't be armed and read back) waits awake for the minute too,
+    /// rather than redrawing at once and trying again in a loop.
+    fn nap(&self, now: DateTime<Utc>, until: DateTime<Utc>, left: Duration) {
         lock(&self.ledger).napping(now, Instant::now());
         if left < MIN_NAP {
             return self.after(left, DeviceEvent::Resumed);
@@ -1798,10 +1800,13 @@ impl Ctx {
         lock(&self.ledger).wifi_off(now);
         self.state.borrow_mut().wifi_parked = true;
         let ledger = self.ledger.clone();
+        let clock = self.now;
+        // Previews and tests have no time to wait in.
+        let wait = matches!(self.execution, Execution::Background);
         self.device_later(move |host| {
             // Down until a fetch is due: nothing joins after the resume.
             host.park_wifi();
-            match host.nap(left) {
+            match host.nap(until) {
                 Ok(()) => {
                     // Before the wake reads the clock: the resume lost time.
                     if let Some(correction) = host.catch_up_clock() {
@@ -1810,7 +1815,11 @@ impl Ctx {
                     DeviceEvent::Resumed
                 }
                 Err(error) => {
-                    crate::log!("kindil: nap: {error}");
+                    crate::log!("kindil: nap: {error:#}; awake until the minute");
+                    if wait {
+                        let left = (until - clock()).to_std().unwrap_or_default();
+                        std::thread::sleep(left.min(Duration::from_secs(60)));
+                    }
                     DeviceEvent::SuspendFailed
                 }
             }

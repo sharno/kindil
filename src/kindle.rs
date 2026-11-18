@@ -179,9 +179,21 @@ impl Host for KindleHost {
     }
 
     fn park_wifi(&self) {
-        if let Err(error) = self.net.park() {
+        let since = std::time::Instant::now();
+        let parked = self.net.park();
+        let took = since.elapsed();
+        if let Err(error) = &parked {
             crate::log!("kindil: parking Wi-Fi: {error}");
         }
+        crate::flight::Recorder::device().note(&format!(
+            "Wi-Fi {} in {:.2} s",
+            if parked.is_ok() {
+                "parked"
+            } else {
+                "not parked"
+            },
+            took.as_secs_f64()
+        ));
     }
 
     fn ssh_sessions(&self) -> Vec<crate::maintenance::Session> {
@@ -387,25 +399,15 @@ impl Host for KindleHost {
     }
 
     fn suspend(&self) -> anyhow::Result<()> {
-        let alarm = wakealarm().ok();
+        let recorder = crate::flight::Recorder::device();
         loop {
             // A nap's alarm must not wake a sleep the user asked for; on
             // battery, a check of its own every few hours does (src/power.rs).
-            let check = match &alarm {
-                Some(alarm) => arm_check(alarm)?,
-                None => None,
-            };
-            std::fs::write("/sys/power/state", b"mem")?;
-            if let Some(alarm) = &alarm {
-                let _ = std::fs::write(alarm, "0");
-            }
-            // The resume lost time: back to the RTC's before reading it.
-            if let Some(correction) = crate::clock::catch_up() {
-                crate::log!("kindil: {correction}");
-            }
+            let check = (!plugged().unwrap_or(false)).then_some(crate::power::CHECK_ASLEEP);
+            let due = check.map(|after| epoch_seconds() + after.as_secs() as i64);
+            sleep_once(&recorder, "sleep", check)?;
             let now = epoch_seconds();
-            let checking = check.is_some_and(|due| crate::power::alarm_woke(due, now));
-            if !checking {
+            if !due.is_some_and(|due| crate::power::alarm_woke(due, now)) {
                 // The power button: the app wakes.
                 return Ok(());
             }
@@ -417,19 +419,21 @@ impl Host for KindleHost {
         }
     }
 
-    fn nap(&self, wake_after: Duration) -> anyhow::Result<()> {
-        let alarm = wakealarm()?;
-        // Writing a new alarm over a pending one fails: clear it first.
-        std::fs::write(&alarm, "0")?;
-        std::fs::write(&alarm, format!("+{}", wake_after.as_secs().max(1)))?;
-        let slept = std::fs::write("/sys/power/state", b"mem");
-        // The power button may have woken it first: never leave the alarm set.
-        let _ = std::fs::write(&alarm, "0");
-        Ok(slept?)
+    fn nap(&self, until: chrono::DateTime<chrono::Utc>) -> anyhow::Result<()> {
+        let recorder = crate::flight::Recorder::device();
+        // Measured now, after parking Wi-Fi and right before arming: the
+        // time it took doesn't make the nap overshoot its minute.
+        let left = (until - chrono::Utc::now()).to_std().unwrap_or_default();
+        if left < Duration::from_secs(1) {
+            recorder.note(&format!("nap: {left:?} left; not suspending"));
+            return Ok(());
+        }
+        sleep_once(&recorder, "nap", Some(left))
     }
 
+    /// [`sleep_once`] caught up already, before anything read the clock.
     fn catch_up_clock(&self) -> Option<crate::clock::Correction> {
-        crate::clock::catch_up()
+        lock(&CAUGHT_UP).take()
     }
 
     fn sync_clock(&self) -> anyhow::Result<Option<crate::clock::Correction>> {
@@ -476,31 +480,75 @@ impl Host for KindleHost {
     }
 }
 
-/// Arms `alarm` for the next battery check when on battery; returns when
-/// it is due, in seconds since the epoch. Plugged in, no alarm.
-fn arm_check(alarm: &Path) -> anyhow::Result<Option<i64>> {
-    std::fs::write(alarm, "0")?;
-    if plugged().unwrap_or(false) {
-        return Ok(None);
+/// The last suspend's clock correction, for the doze's ledger.
+static CAUGHT_UP: Mutex<Option<crate::clock::Correction>> = Mutex::new(None);
+
+/// Every suspend goes through here: the wake alarm armed `after` from now
+/// (or moved out of the way, for a sleep only the power button ends) as the
+/// very last thing before the suspend, read back from the RTC's registers,
+/// and no suspend at all if that fails: a suspend without a trusted alarm
+/// could last until someone presses the button. Each step is noted in the
+/// flight recorder first. Back awake, the alarm is moved out of the way and
+/// the clock put back within the RTC's second.
+fn sleep_once(
+    recorder: &crate::flight::Recorder,
+    what: &str,
+    after: Option<Duration>,
+) -> anyhow::Result<()> {
+    let rtc = crate::wakealarm::WakeRtc::find();
+    let armed = match (after, &rtc) {
+        (Some(after), Ok(rtc)) => Some(rtc.arm(after)),
+        (Some(_), Err(error)) => Some(Err(anyhow::anyhow!("{error}"))),
+        (None, Ok(rtc)) => {
+            rtc.disarm()?;
+            None
+        }
+        // No wake alarm at all: only the button can wake it anyway.
+        (None, Err(_)) => None,
+    };
+    let armed = match armed.transpose() {
+        Ok(armed) => armed,
+        Err(error) => {
+            recorder.note(&format!("{what}: not suspending: {error:#}"));
+            return Err(error.context("arming the wake alarm"));
+        }
+    };
+    let rtc_name = rtc.as_ref().map(|rtc| rtc.name()).unwrap_or_default();
+    recorder.note(&match armed {
+        Some(armed) => format!("{what}: suspending, {rtc_name} {armed}"),
+        None => format!("{what}: suspending until the power button"),
+    });
+    let since = epoch_seconds();
+    let slept = std::fs::write("/sys/power/state", b"mem");
+    // The power button may have woken it first: the alarm must not wake a
+    // later suspend that didn't ask for it.
+    let rtc_now = rtc.as_ref().ok().and_then(|rtc| rtc.now().ok());
+    if let Ok(rtc) = &rtc {
+        if let Err(error) = rtc.disarm() {
+            recorder.note(&format!("{what}: moving the alarm away: {error:#}"));
+        }
     }
-    let after = crate::power::CHECK_ASLEEP.as_secs();
-    std::fs::write(alarm, format!("+{after}"))?;
-    Ok(Some(epoch_seconds() + after as i64))
+    let correction = crate::clock::catch_up();
+    recorder.note(&format!(
+        "{what}: {} after {} s by the clock, {rtc_name} at {}{}",
+        match &slept {
+            Ok(()) => "resumed".to_owned(),
+            Err(error) => format!("suspend refused ({error})"),
+        },
+        epoch_seconds() - since,
+        rtc_now.map_or_else(|| "?".to_owned(), |n| n.to_string()),
+        correction.map_or_else(String::new, |c| format!("; {c}")),
+    ));
+    if let Some(correction) = correction {
+        *lock(&CAUGHT_UP) = Some(correction);
+    }
+    Ok(slept?)
 }
 
 fn epoch_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
-}
-
-/// The RTC that can wake the device: on the PW1 the PMIC's (`rtc1`); the
-/// SoC's own RTC has no wake alarm.
-fn wakealarm() -> anyhow::Result<std::path::PathBuf> {
-    (0..4)
-        .map(|n| std::path::PathBuf::from(format!("/sys/class/rtc/rtc{n}/wakealarm")))
-        .find(|path| path.exists())
-        .ok_or_else(|| anyhow::anyhow!("no RTC wake alarm"))
 }
 
 fn run(command: &mut Command) -> anyhow::Result<()> {

@@ -16,6 +16,11 @@ pub fn set_zone(zone: chrono_tz::Tz) {
     let _ = ZONE.set(zone);
 }
 
+/// The zone [`set_zone`] was told, if any.
+pub fn zone() -> Option<chrono_tz::Tz> {
+    ZONE.get().copied()
+}
+
 /// `now` as a stamp: `2026-11-17 22:18:04.512`, in `zone`, or in UTC with a
 /// `Z` without one.
 pub fn stamp(now: DateTime<Utc>, zone: Option<chrono_tz::Tz>) -> String {
@@ -28,7 +33,7 @@ pub fn stamp(now: DateTime<Utc>, zone: Option<chrono_tz::Tz>) -> String {
 
 /// One stamped line on stderr, in one write; never panics.
 pub fn line(args: std::fmt::Arguments<'_>) {
-    let text = format!("{} {args}\n", stamp(Utc::now(), ZONE.get().copied()));
+    let text = format!("{} {args}\n", stamp(Utc::now(), zone()));
     let _ = std::io::stderr().lock().write_all(text.as_bytes());
 }
 
