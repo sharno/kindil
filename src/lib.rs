@@ -35,6 +35,7 @@ pub mod ssh_keys;
 pub mod station;
 pub mod sync;
 pub mod system;
+pub mod trace;
 pub mod uevent;
 pub mod ui;
 pub mod update;

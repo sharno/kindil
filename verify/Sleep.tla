@@ -39,7 +39,9 @@ EXTENDS Naturals, Sequences
 
 CONSTANTS
     OpenWorld,       \* any event at any time, the reducer alone (for recorded traces)
-    Power,           \* cables and the gauge's low end: else on battery, never below 2%
+    ExternalOpen,    \* the button, the idle timer, the battery and volumd at any time; the
+                     \* app's own timers and workers as modelled (for the UI tests' traces)
+    Power,           \* chargers and the gauge's low end: else on battery, never below 2%
     Drawing,         \* the doze wake's frame, worker, panel and waiter: else its ceiling only
     Holds,           \* maintenance windows and SSH sessions hold naps off (nap_or_hold)
     Usb,             \* computers and USB drive mode
@@ -66,12 +68,13 @@ Ignored == {"none", "WakingPress", "InUsbDrive", "Stale"}
 Kinds == {"PowerButton", "BatteryEmpty", "LightOff", "PanelSettled", "Resumed",
           "SuspendFailed", "DriveComputer", "DriveKindle",
           "DriveSettledCur", "DriveSettledOld"}
+(* What comes from outside the app: with ExternalOpen, at any time. *)
+ExternalKinds == {"PowerButton", "BatteryEmpty", "DriveComputer", "DriveKindle"}
 (* The timers and workers that finish within seconds. *)
 ShortKinds == {"LightOff", "PanelSettled", "Resumed", "SuspendFailed",
                "DriveSettledCur", "DriveSettledOld"}
 
-Cables == IF ~Power THEN {"none"}
-          ELSE IF Usb THEN {"none", "charger", "computer"} ELSE {"none", "charger"}
+Cables == {"none"} \cup (IF Power THEN {"charger"} ELSE {}) \cup (IF Usb THEN {"computer"} ELSE {})
 (* The gauge: above 5%, 2-5% (BATTERY_EMPTY), at most 1% (CRITICAL_PERCENT). *)
 Levels == IF ~LowBattery THEN {"ok"}
           ELSE IF Power THEN {"ok", "low", "critical"} ELSE {"ok", "low"}
@@ -83,6 +86,7 @@ VARIABLES
     fresh,       \* Awake for less than WAKING_PRESS
     effects,     \* the effects of the last step
     ignored,     \* why the last event changed nothing (`Ignored`), or "none"
+    handled,     \* events handled, modulo 4: a trace's unlogged steps are never events
     \* The app around it.
     sleepWhy,    \* what put the app to sleep: "button", "idle", "battery"; "none" out of sleep
     screen,      \* "app", "sleep" or "usb" (`show_system`)
@@ -117,7 +121,7 @@ VARIABLES
     longNap,     \* a nap was armed on a clock stepped back since its minute was taken
     misjudged    \* a sleep took a press (or a cable) for its check alarm
 
-observed == <<mode, light, fresh, effects, ignored>>
+observed == <<mode, light, fresh, effects, ignored, handled>>
 app == <<sleepWhy, screen, pend, autoSleep, dashboard>>
 draw == <<wakeOn, tick, shown, accepted, waiter, ceiling, stuck, syncing>>
 host == <<cpu, alarm, wokeBy, due, napper, sleeper, holdTimer>>
@@ -125,8 +129,8 @@ world == <<cable, connected, level>>
 ghosts == <<pressWaiting, overlap, badClaim, longNap, misjudged>>
 vars == <<observed, app, draw, host, world, ghosts>>
 
-(* What the next steps can do depends on all but the last step's effects  *)
-(* and why it was ignored, which are there for traces.                    *)
+(* What the next steps can do depends on all but the last step's effects, *)
+(* why it was ignored and the count, which are there for traces.          *)
 View == <<mode, light, fresh, app, draw, host, world, ghosts>>
 
 -----------------------------------------------------------------------------
@@ -191,10 +195,12 @@ Init ==
     /\ fresh = FALSE
     /\ effects = <<>>
     /\ ignored = "none"
+    /\ handled = 0
     /\ sleepWhy = "none"
     /\ screen = "app"
     /\ pend = [k \in Kinds |-> 0]
-    /\ autoSleep \in (IF IdleSleeps THEN {"Doze", "Minutes"} ELSE {"Doze"})
+    \* With ExternalOpen the settings, the cable and the gauge make no difference.
+    /\ autoSleep \in (IF IdleSleeps /\ ~ExternalOpen THEN {"Doze", "Minutes"} ELSE {"Doze"})
     /\ dashboard \in (IF Drawing THEN BOOLEAN ELSE {FALSE})
     /\ wakeOn = FALSE
     /\ tick = "none"
@@ -211,9 +217,9 @@ Init ==
     /\ napper = "idle"
     /\ sleeper = "idle"
     /\ holdTimer = FALSE
-    /\ cable \in Cables
+    /\ cable \in (IF ExternalOpen THEN {"none"} ELSE Cables)
     /\ connected = (cable # "none")
-    /\ level \in Levels
+    /\ level \in (IF ExternalOpen THEN {"ok"} ELSE Levels)
     /\ pressWaiting = FALSE
     /\ overlap = FALSE
     /\ badClaim = FALSE
@@ -293,6 +299,7 @@ Handle(e, p, before) ==
     LET r == Step(mode, light, fresh, e, p) IN
     /\ effects' = r.fx
     /\ ignored' = r.why
+    /\ handled' = (handled + 1) % 4
     /\ IF r.ok
        THEN /\ mode' = r.next
             /\ light' = r.light
@@ -313,7 +320,7 @@ Handle(e, p, before) ==
 
 (* An event of kind `k` on its way is delivered. *)
 Deliver(k, e, p) ==
-    IF OpenWorld THEN Handle(e, p, pend)
+    IF OpenWorld \/ (ExternalOpen /\ k \in ExternalKinds) THEN Handle(e, p, pend)
     ELSE /\ pend[k] > 0
          /\ Handle(e, p, [pend EXCEPT ![k] = @ - 1])
 
@@ -340,10 +347,10 @@ NoRace == \/ Races \/ OpenWorld
 PowerButton == cpu = "up" /\ NoRace /\ Deliver("PowerButton", "PowerButton", FALSE)
 (* `check_idle` calls `Ctx::device` itself, once a minute while Awake. *)
 Idle == /\ cpu = "up"
-        /\ OpenWorld \/ mode = "Awake" /\ autoSleep = "Minutes" /\ Quiet
+        /\ OpenWorld \/ ExternalOpen \/ (mode = "Awake" /\ autoSleep = "Minutes" /\ Quiet)
         /\ Handle("Idle", FALSE, pend)
 Doze == /\ cpu = "up"
-        /\ OpenWorld \/ mode = "Awake" /\ autoSleep = "Doze" /\ Quiet
+        /\ OpenWorld \/ ExternalOpen \/ (mode = "Awake" /\ autoSleep = "Doze" /\ Quiet)
         /\ Handle("Doze", FALSE, pend)
 BatteryEmpty == cpu = "up" /\ Deliver("BatteryEmpty", "BatteryEmpty", FALSE)
 LightOff(saved) == cpu = "up" /\ (Lights \/ OpenWorld \/ ~saved) /\ Deliver("LightOff", "LightOff", saved)
@@ -371,7 +378,7 @@ FreshExpires ==
     /\ mode = "Awake" /\ fresh
     /\ OpenWorld \/ pend["PowerButton"] = 0
     /\ fresh' = FALSE
-    /\ UNCHANGED <<mode, light, effects, ignored, app, draw, host, world, ghosts>>
+    /\ UNCHANGED <<mode, light, effects, ignored, handled, app, draw, host, world, ghosts>>
 
 (* The user presses the power button: the kernel resumes a suspended       *)
 (* device and reports the press (`power_button`).                          *)
@@ -379,7 +386,8 @@ PressButton ==
     /\ ~OpenWorld
     /\ cpu # "off"
     /\ pend["PowerButton"] < MaxPending
-    /\ pend' = Add(pend, "PowerButton", 1)
+    /\ ~ExternalOpen \/ cpu = "suspended"
+    /\ pend' = IF ExternalOpen THEN pend ELSE Add(pend, "PowerButton", 1)
     /\ IF cpu = "suspended" THEN cpu' = "up" /\ wokeBy' = "press" ELSE UNCHANGED <<cpu, wokeBy>>
     /\ pressWaiting' = (pressWaiting \/ mode \in AsleepModes \cup DozeModes)
     /\ UNCHANGED <<observed, sleepWhy, screen, autoSleep, dashboard, draw,
@@ -393,7 +401,7 @@ CableWake ==
 (* A charger or a computer is plugged in; the charger driver makes         *)
 (* `connected` a little later. volumd hands the storage to a computer.     *)
 Plug(c) ==
-    /\ ~OpenWorld
+    /\ ~OpenWorld /\ ~ExternalOpen
     /\ cable = "none" /\ cpu # "off"
     /\ cable' = c
     /\ pend' = IF c = "computer" THEN Add(pend, "DriveComputer", 1) ELSE pend
@@ -402,7 +410,7 @@ Plug(c) ==
                    alarm, due, napper, sleeper, holdTimer, connected, level, ghosts>>
 
 Unplug ==
-    /\ ~OpenWorld
+    /\ ~OpenWorld /\ ~ExternalOpen
     /\ cable # "none" /\ cpu # "off"
     /\ cable' = "none"
     /\ connected' = FALSE
@@ -412,7 +420,7 @@ Unplug ==
                    alarm, due, napper, sleeper, holdTimer, level, ghosts>>
 
 ConnectedAppears ==
-    /\ ~OpenWorld
+    /\ ~OpenWorld /\ ~ExternalOpen
     /\ cable # "none" /\ ~connected
     /\ connected' = TRUE
     /\ UNCHANGED <<observed, app, draw, host, cable, level, ghosts>>
@@ -420,7 +428,7 @@ ConnectedAppears ==
 (* The gauge moves: around the 5% threshold either way, down to 1% only on *)
 (* battery, back up from it only on a charger.                             *)
 Gauge ==
-    /\ ~OpenWorld
+    /\ ~OpenWorld /\ ~ExternalOpen
     /\ cpu # "off"
     /\ \E to \in Levels :
         /\ to # level
@@ -440,7 +448,7 @@ AlarmFires ==
 (* The minute clock (`arm_clock`, not while dozing) or a page refreshes    *)
 (* the status bar, reading the battery.                                    *)
 RefreshStatus ==
-    /\ ~OpenWorld
+    /\ ~OpenWorld /\ ~ExternalOpen
     /\ cpu = "up" /\ mode \notin DozeModes
     /\ Empty /\ pend["BatteryEmpty"] = 0
     /\ pend' = Read(pend)

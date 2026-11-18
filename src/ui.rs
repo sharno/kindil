@@ -1353,7 +1353,7 @@ impl Ctx {
 
     fn device(&self, event: DeviceEvent) {
         let mode = self.state.borrow().system;
-        match mode.step(event, Instant::now()) {
+        match crate::trace::step(mode, event, mode.step(event, Instant::now())) {
             Err(ignored) => crate::log!("kindil: {event:?} ignored: {ignored:?}"),
             Ok(Step { next, effects }) => {
                 self.state.borrow_mut().system = next;
