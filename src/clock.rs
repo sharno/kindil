@@ -6,13 +6,16 @@
 //!   clock when at least two agree it is off; with UDP 123 blocked, the
 //!   `Date` of an HTTP answer does, more coarsely. Either way the
 //!   persistent RTC is written too, so a reboot keeps the time.
-//! - Each resume on the PW1's 2.6.31 kernel loses about half a second of
-//!   system time (the RTC it restores from counts whole seconds), and
-//!   dozing resumes once a minute: measured on 2026-11-17, the clock fell
-//!   from 726 s to 755 s behind `rtc0` in 55 minutes of naps, while `rtc0`
-//!   stayed within a second of real time. `rtc0` keeps time through a
-//!   suspend, so after each nap the system clock catches up with it once it
-//!   has fallen a whole second behind.
+//! - Each resume on the PW1's 2.6.31 kernel moves the system clock on by
+//!   the whole seconds `rtc0` counted (drivers/rtc/class.c `rtc_resume`):
+//!   off by up to a second either way per resume, and not at random, since
+//!   the nap's alarm (`rtc1`) wakes at the same point of `rtc0`'s second
+//!   each time. On 2026-11-17 the clock fell 29 s behind in 55 minutes of
+//!   naps; that night, with `rtc0` written again, it ran 20 to 40 s an hour
+//!   fast instead. `rtc0` keeps time through a suspend, so after each nap
+//!   the system clock is put back within `rtc0`'s second, either way
+//!   ([`catch_up_by`]); where that second begins on a right clock is
+//!   measured after each network sync ([`RtcOffset`]).
 use chrono::{DateTime, TimeDelta, Utc};
 use std::fmt;
 use std::path::Path;
@@ -22,6 +25,13 @@ use std::time::Duration;
 pub const SERVERS: [&str; 3] = ["pool.ntp.org", "time.google.com", "time.cloudflare.com"];
 /// How long each SNTP server has to answer.
 pub const NTP_TIMEOUT: Duration = Duration::from_secs(2);
+/// The most the servers are waited for, name lookups included.
+pub const NTP_DEADLINE: Duration = Duration::from_secs(4);
+/// A clock set from a `Date` (whole seconds) writes the RTC only when it is
+/// off by this many seconds.
+pub const HTTP_RTC_WRITE: f64 = 5.0;
+/// The most the `Date` over HTTP is waited for, name lookup included.
+pub const HTTP_DEADLINE: Duration = Duration::from_secs(5);
 /// Answers within this many seconds of each other agree.
 pub const AGREE: f64 = 1.0;
 /// Network time steps the clock only when it is off by this many seconds.
@@ -158,20 +168,77 @@ pub fn http_date_offset(date: &str, sent: DateTime<Utc>, received: DateTime<Utc>
 }
 
 /// After a resume: how far to step a clock reading `system` (seconds since
-/// the epoch) forward, given the persistent RTC reads `rtc` (whole seconds).
-/// Only when it has fallen a whole second behind, so the step is never back:
-/// to the middle of the RTC's second.
-pub fn catch_up_by(rtc: i64, system: f64) -> Option<f64> {
-    let behind = rtc as f64 - system;
-    (1.0..=MAX_CATCH_UP)
-        .contains(&behind)
-        .then_some(behind + 0.5)
+/// the epoch), given the persistent RTC reads `rtc` (whole seconds) and, on
+/// a right clock, reads `rtc` from `rtc + offset` to `rtc + offset + 1`
+/// ([`RtcOffset`]). None while the clock is within that second; otherwise
+/// to its middle, forward or back. A step of over [`MAX_CATCH_UP`] says the
+/// RTC is wrong itself: network time settles that.
+pub fn catch_up_by(rtc: i64, system: f64, offset: f64) -> Option<f64> {
+    let begins = rtc as f64 + offset;
+    if (begins..begins + 1.0).contains(&system) {
+        return None;
+    }
+    let step = begins + 0.5 - system;
+    (step.abs() <= MAX_CATCH_UP).then_some(step)
 }
 
-/// Whether the RTC (whole seconds) should be written to match a clock that
-/// is right: when it is off by more than its own resolution.
-pub fn rtc_disagrees(rtc: i64, system: f64) -> bool {
-    (rtc - system.floor() as i64).abs() >= 2
+/// Whether the RTC (whole seconds, read from `rtc + offset` on a right
+/// clock) should be written to match a clock that is right: when it is off
+/// by more than its own resolution.
+pub fn rtc_disagrees(rtc: i64, system: f64, offset: f64) -> bool {
+    (rtc as f64 + offset + 0.5 - system).abs() >= 1.5
+}
+
+/// Where `rtc0`'s second begins, against a right clock: it reads `n` from
+/// `n + offset` to `n + offset + 1` (a fraction of a second either way once
+/// written). A write sets only its seconds register (drivers/rtc/
+/// rtc-mxc_v2.c writes LPSCMR, not the sub-second LPSCLR), so where its
+/// second begins isn't the write's to choose. Measured after each sync
+/// from SNTP, kept as microseconds; zero until then.
+#[derive(Debug, Default)]
+pub struct RtcOffset(std::sync::atomic::AtomicI64);
+
+impl RtcOffset {
+    pub fn get(&self) -> f64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
+    }
+
+    pub fn set(&self, seconds: f64) {
+        self.0.store(
+            (seconds * 1e6).round() as i64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// The offset of `rtc0` against the system clock.
+pub static RTC_OFFSET: RtcOffset = RtcOffset(std::sync::atomic::AtomicI64::new(0));
+
+/// How often [`measure_rtc_offset`] looks at the RTC.
+const RTC_POLL: Duration = Duration::from_millis(10);
+
+/// The offset from a tick seen between system times `before` and `after`,
+/// the RTC reading `rtc` from then on: the tick was within, at its middle.
+pub fn offset_of_tick(rtc: i64, before: f64, after: f64) -> f64 {
+    (before + after) / 2.0 - rtc as f64
+}
+
+/// Watches `rtc0` turn a second (up to a second awake, polling every
+/// [`RTC_POLL`]): where its second begins against the system clock.
+fn measure_rtc_offset() -> std::io::Result<f64> {
+    let from = read_rtc()?;
+    let since = std::time::Instant::now();
+    let mut before = system_seconds();
+    while since.elapsed() < Duration::from_millis(1_500) {
+        std::thread::sleep(RTC_POLL);
+        let rtc = read_rtc()?;
+        let after = system_seconds();
+        if rtc != from {
+            return Ok(offset_of_tick(rtc, before, after));
+        }
+        before = after;
+    }
+    Err(std::io::Error::other("the RTC didn't turn a second"))
 }
 
 /// The system clock, in seconds since the epoch.
@@ -256,11 +323,11 @@ fn write_rtc() -> std::io::Result<()> {
     Err(std::io::Error::other("no RTC here"))
 }
 
-/// Back from a suspend: steps the clock up to the persistent RTC if it has
-/// fallen a second behind.
+/// Back from a suspend: steps the clock back within the persistent RTC's
+/// second if the resume left it outside, either way.
 pub fn catch_up() -> Option<Correction> {
     let rtc = read_rtc().ok()?;
-    let seconds = catch_up_by(rtc, system_seconds())?;
+    let seconds = catch_up_by(rtc, system_seconds(), RTC_OFFSET.get())?;
     match step(seconds) {
         Ok(()) => Some(Correction {
             seconds,
@@ -273,37 +340,48 @@ pub fn catch_up() -> Option<Correction> {
     }
 }
 
-/// Asks each of [`SERVERS`], together.
+/// Asks each of [`SERVERS`], together, and waits at most [`NTP_DEADLINE`]
+/// for them all: a lookup stuck in the resolver is left behind, its
+/// answer dropped, rather than waited for.
 fn ask_servers() -> Vec<Reading> {
-    std::thread::scope(|scope| {
-        let asks: Vec<_> = SERVERS
-            .iter()
-            .map(|&server| {
-                scope.spawn(move || {
-                    let mut client = rsntp::SntpClient::new();
-                    client.set_timeout(NTP_TIMEOUT);
-                    client
-                        .synchronize(server)
-                        .map(|result| Reading {
-                            server,
-                            offset: result.clock_offset().as_secs_f64(),
-                            delay: result.round_trip_delay().as_secs_f64(),
-                        })
-                        .map_err(|error| crate::log!("kindil: clock: {server}: {error}"))
-                        .ok()
+    let (answers, heard) = std::sync::mpsc::channel();
+    for &server in &SERVERS {
+        let answers = answers.clone();
+        std::thread::spawn(move || {
+            let mut client = rsntp::SntpClient::new();
+            client.set_timeout(NTP_TIMEOUT);
+            let reading = client
+                .synchronize(server)
+                .map(|result| Reading {
+                    server,
+                    offset: result.clock_offset().as_secs_f64(),
+                    delay: result.round_trip_delay().as_secs_f64(),
                 })
-            })
-            .collect();
-        asks.into_iter()
-            .filter_map(|ask| ask.join().ok().flatten())
-            .collect()
-    })
+                .map_err(|error| crate::log!("kindil: clock: {server}: {error}"))
+                .ok();
+            let _ = answers.send(reading);
+        });
+    }
+    drop(answers);
+    let deadline = std::time::Instant::now() + NTP_DEADLINE;
+    let mut readings = Vec::new();
+    for _ in SERVERS {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match heard.recv_timeout(left) {
+            Ok(reading) => readings.extend(reading),
+            Err(_) => {
+                crate::log!("kindil: clock: time servers still unanswered after {NTP_DEADLINE:?}");
+                break;
+            }
+        }
+    }
+    readings
 }
 
 /// The offset by [`HTTP_DATE_URL`]'s `Date`.
 fn ask_http_date() -> anyhow::Result<f64> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(10)))
+        .timeout_global(Some(HTTP_DEADLINE))
         .http_status_as_error(false)
         .build()
         .into();
@@ -326,18 +404,22 @@ fn http_date_host() -> &'static str {
 }
 
 /// Online: sets the clock from network time if it is off, and the RTC to
-/// match. Ok(None) when the clock was right; an error when no source
-/// answered, or only an unbelievable one did.
+/// match when it is off by more than its resolution. Ok(None) when the
+/// clock was right; an error when no source answered, or only an
+/// unbelievable one did. Bounded: [`NTP_DEADLINE`], then [`HTTP_DEADLINE`],
+/// then up to two seconds with the RTC. Holds no lock.
 pub fn sync() -> anyhow::Result<Option<Correction>> {
+    let since = std::time::Instant::now();
     let readings = ask_servers();
     let (offset, min_step, source) = match consensus(&readings) {
         Some(reading) => (reading.offset, NTP_MIN_STEP, Source::Ntp(reading.server)),
         None => {
             crate::log!(
-                "kindil: clock: {} of {} time servers answered, not two agreeing; \
+                "kindil: clock: {} of {} time servers answered in {:.1} s, not two agreeing; \
                  trying {HTTP_DATE_URL}",
                 readings.len(),
-                SERVERS.len()
+                SERVERS.len(),
+                since.elapsed().as_secs_f64()
             );
             (
                 ask_http_date()?,
@@ -354,17 +436,31 @@ pub fn sync() -> anyhow::Result<Option<Correction>> {
             Some(correction)
         }
     };
-    let rtc = read_rtc();
-    let stale = match &rtc {
-        Ok(rtc) => correction.is_some() || rtc_disagrees(*rtc, system_seconds()),
-        Err(_) => false,
+    keep_rtc(matches!(source, Source::Ntp(_)));
+    Ok(correction)
+}
+
+/// With the clock right by network time: writes the RTC if it is off by
+/// more than its resolution, and, `precise`ly right (SNTP, not a `Date`'s
+/// whole seconds), measures where its second begins.
+fn keep_rtc(precise: bool) {
+    let Ok(rtc) = read_rtc() else { return };
+    let off = match precise {
+        true => rtc_disagrees(rtc, system_seconds(), RTC_OFFSET.get()),
+        false => (rtc as f64 + 0.5 - system_seconds()).abs() >= HTTP_RTC_WRITE,
     };
-    if stale {
-        if let Err(error) = write_rtc() {
-            crate::log!("kindil: clock: writing the RTC: {error}");
+    if off {
+        match write_rtc() {
+            Ok(()) => crate::log!("kindil: clock: RTC was {rtc}; written"),
+            Err(error) => crate::log!("kindil: clock: writing the RTC: {error}"),
         }
     }
-    Ok(correction)
+    if precise {
+        match measure_rtc_offset() {
+            Ok(offset) => RTC_OFFSET.set(offset),
+            Err(error) => crate::log!("kindil: clock: measuring the RTC: {error}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -472,17 +568,119 @@ mod tests {
     }
 
     #[test]
-    fn the_clock_catches_up_with_the_rtc_only_a_whole_second_behind() {
+    fn the_clock_is_put_back_within_the_rtcs_second_either_way() {
         let rtc = 1_794_887_551;
         // Measured: 726 s behind after two days of naps.
-        assert_eq!(catch_up_by(rtc, 1_794_886_825.0), Some(726.5));
-        assert_eq!(catch_up_by(rtc, rtc as f64 - 1.0), Some(1.5));
-        // Within the RTC's second, or ahead of it: never stepped back.
-        assert_eq!(catch_up_by(rtc, rtc as f64 - 0.9), None);
-        assert_eq!(catch_up_by(rtc, rtc as f64 + 0.7), None);
-        assert_eq!(catch_up_by(rtc, rtc as f64 + 3_600.0), None);
-        // An RTC days ahead is wrong itself: network time settles it.
-        assert_eq!(catch_up_by(rtc, rtc as f64 - 2.0 * 86_400.0), None);
+        assert_eq!(catch_up_by(rtc, 1_794_886_825.0, 0.0), Some(726.5));
+        assert_eq!(catch_up_by(rtc, rtc as f64 - 1.0, 0.0), Some(1.5));
+        // Within the RTC's second: kept.
+        assert_eq!(catch_up_by(rtc, rtc as f64 + 0.9, 0.0), None);
+        assert_eq!(catch_up_by(rtc, rtc as f64, 0.0), None);
+        // Ahead of it: back, to its middle (the night of 2026-11-17).
+        let back = catch_up_by(rtc, rtc as f64 + 1.7, 0.0).unwrap();
+        assert!((back + 1.2).abs() < 1e-6, "{back}");
+        // Its second begins 0.4 s early on a right clock.
+        assert_eq!(catch_up_by(rtc, rtc as f64 - 0.3, -0.4), None);
+        let step = catch_up_by(rtc, rtc as f64 + 0.7, -0.4).unwrap();
+        assert!((step + 0.6).abs() < 1e-6, "{step}");
+        // An RTC days away is wrong itself: network time settles it.
+        assert_eq!(catch_up_by(rtc, rtc as f64 - 2.0 * 86_400.0, 0.0), None);
+        assert_eq!(catch_up_by(rtc, rtc as f64 + 2.0 * 86_400.0, 0.0), None);
+    }
+
+    #[test]
+    fn a_tick_seen_between_two_reads_is_taken_at_their_middle() {
+        let offset = offset_of_tick(100, 99.62, 99.64);
+        assert!((offset + 0.37).abs() < 1e-9, "{offset}");
+    }
+
+    /// How far to step after a resume: rtc0, the clock, rtc0's offset.
+    type CatchUp = fn(i64, f64, f64) -> Option<f64>;
+
+    /// A small deterministic generator for the simulation's jitter.
+    struct Jitter(u64);
+
+    impl Jitter {
+        /// Uniform in [0, 1).
+        fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// The error of the system clock against real time over `naps` minute
+    /// naps, worst after any wake, with `catch_up` applied after each
+    /// resume (or not). Modelled on the PW1: `rtc0` runs `rtc_ahead` of real
+    /// time; the alarm wakes at `wake_phase` into each real second; a wake
+    /// stays up 1.2 to 3.5 s; the kernel's resume moves the clock on by
+    /// the whole seconds `rtc0` counted (drivers/rtc/class.c).
+    fn worst_error(
+        naps: u32,
+        rtc_ahead: f64,
+        wake_phase: f64,
+        catch_up: Option<CatchUp>,
+    ) -> f64 {
+        let mut jitter = Jitter(7);
+        let rtc = |real: f64| (real + rtc_ahead).floor() as i64;
+        // Measured as the sync does, on a right clock: a tick seen between
+        // two reads 10 ms apart.
+        let tick = (1_000.0 + rtc_ahead).ceil() - rtc_ahead;
+        let offset = offset_of_tick(rtc(tick + 0.006), tick - 0.004, tick + 0.006);
+        let mut real = 1_000.0 + wake_phase;
+        let mut system = real;
+        let mut worst: f64 = 0.0;
+        for _ in 0..naps {
+            let awake = 1.2 + 2.3 * jitter.next();
+            real += awake;
+            system += awake;
+            let rtc_at_suspend = rtc(real);
+            // The next minute's alarm, at the same point of a second.
+            real = (real / 60.0).floor() * 60.0 + 61.0 + wake_phase;
+            system += (rtc(real) - rtc_at_suspend) as f64;
+            if let Some(catch_up) = catch_up {
+                if let Some(step) = catch_up(rtc(real), system, offset) {
+                    system += step;
+                }
+            }
+            worst = worst.max((system - real).abs());
+        }
+        worst
+    }
+
+    /// The old catch-up: forward only, a whole second behind.
+    fn forward_only(rtc: i64, system: f64, _: f64) -> Option<f64> {
+        let behind = rtc as f64 - system;
+        (1.0..=MAX_CATCH_UP)
+            .contains(&behind)
+            .then_some(behind + 0.5)
+    }
+
+    #[test]
+    fn over_a_night_of_naps_the_clock_stays_within_a_second() {
+        let naps = 12 * 60;
+        for rtc_ahead in [0.0, 0.05, 0.37, 0.5, 0.93, -0.2, -0.71] {
+            for wake_phase in [0.0, 0.02, 0.3, 0.5, 0.64, 0.97] {
+                let worst = worst_error(naps, rtc_ahead, wake_phase, Some(catch_up_by));
+                assert!(
+                    worst < 1.0,
+                    "{worst:.2} s off with rtc0 {rtc_ahead} s ahead, waking {wake_phase} into a second"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn without_the_catch_up_back_the_kernels_resume_runs_the_clock_fast() {
+        // Waking just after rtc0's tick, each resume gains most of a second;
+        // the old forward-only catch-up never takes it back.
+        let worst = worst_error(30, 0.0, 0.02, Some(forward_only));
+        assert!(worst > 9.0, "{worst:.1}");
+        assert!(worst_error(30, 0.0, 0.02, None) > 9.0);
+        // Waking just before it, each loses most of one.
+        assert!(worst_error(30, 0.0, 0.97, None) > 9.0);
     }
 
     /// Asks the real servers; sets nothing.
@@ -500,9 +698,12 @@ mod tests {
     #[test]
     fn the_rtc_is_written_only_when_off_by_more_than_its_resolution() {
         let rtc = 1_794_887_551;
-        assert!(!rtc_disagrees(rtc, rtc as f64 + 0.9));
-        assert!(!rtc_disagrees(rtc, rtc as f64 - 0.1));
-        assert!(rtc_disagrees(rtc, rtc as f64 + 2.0));
-        assert!(rtc_disagrees(rtc, rtc as f64 - 726.0));
+        assert!(!rtc_disagrees(rtc, rtc as f64 + 0.9, 0.0));
+        assert!(!rtc_disagrees(rtc, rtc as f64 - 0.1, 0.0));
+        assert!(!rtc_disagrees(rtc, rtc as f64 + 1.5, 0.0));
+        assert!(rtc_disagrees(rtc, rtc as f64 + 2.0, 0.0));
+        assert!(rtc_disagrees(rtc, rtc as f64 - 726.0, 0.0));
+        // Its second begins 0.9 s late: 2 s on the clock is in it.
+        assert!(!rtc_disagrees(rtc, rtc as f64 + 2.0, 0.9));
     }
 }
