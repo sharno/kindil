@@ -951,6 +951,57 @@ fn an_empty_battery_sleeps_with_a_charge_screen() {
 }
 
 #[test]
+fn a_charger_plugged_into_the_empty_battery_sleep_brings_the_app_back_once() {
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    host.set_battery(Battery::Known {
+        percent: 4,
+        charge: Charge::Discharging,
+    });
+    host.plug_in_asleep();
+    f.k().invoke_navigated(Page::Settings);
+    f.k().invoke_device_events();
+    assert_eq!(f.k().get_system(), System::Asleep);
+    assert!(f.k().get_battery_empty());
+    // The sleep ends with the charger connected: the app reads "charging"
+    // and stays, with no charge screen.
+    (0..3).for_each(|_| {
+        f.app.fire_timers();
+        f.k().invoke_device_events();
+    });
+    assert_eq!(host.suspends(), 1, "one sleep, one wake");
+    assert_eq!(f.k().get_system(), System::App);
+    assert!(!f.k().get_battery_empty());
+}
+
+#[test]
+fn an_empty_battery_charged_before_its_sleep_begins_never_sleeps() {
+    // The sleep was decided on a reading from before the charger was in
+    // (0.15.0 then slept until the power button, charging, on the charge
+    // screen).
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::new(host.clone());
+    host.set_battery(Battery::Known {
+        percent: 4,
+        charge: Charge::Discharging,
+    });
+    f.k().invoke_navigated(Page::Settings);
+    f.k().invoke_device_events();
+    assert_eq!(f.k().get_system(), System::Asleep);
+    host.set_battery(Battery::Known {
+        percent: 4,
+        charge: Charge::Charging,
+    });
+    (0..3).for_each(|_| {
+        f.app.fire_timers();
+        f.k().invoke_device_events();
+    });
+    assert_eq!(host.suspends(), 0);
+    assert_eq!(f.k().get_system(), System::App);
+    assert!(!f.k().get_battery_empty());
+}
+
+#[test]
 fn dozing_keeps_the_screen_and_naps_each_minute_until_a_press() {
     let host = Arc::new(Simulated::default());
     let f = Fixture::new(host.clone());
@@ -1150,8 +1201,8 @@ impl Host for Recording {
     fn listen(&self, deliver: kindil::host::Deliver) {
         self.device.listen(deliver)
     }
-    fn suspend(&self) -> anyhow::Result<()> {
-        self.device.suspend()
+    fn suspend(&self, why: kindil::system::Why) -> anyhow::Result<()> {
+        self.device.suspend(why)
     }
     fn restart(&self) -> anyhow::Result<()> {
         self.device.restart()

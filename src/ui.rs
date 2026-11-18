@@ -1635,9 +1635,9 @@ impl Ctx {
             Effect::AwaitPanel => self.after(PANEL_SETTLE, DeviceEvent::PanelSettled),
             Effect::AwaitDrive(since) => self.after(DRIVE_SETTLE, DeviceEvent::DriveSettled(since)),
             // Parked first: wpa_supplicant would join again after the resume.
-            Effect::Suspend => self.device_later(|host| {
+            Effect::Suspend(why) => self.device_later(move |host| {
                 host.park_wifi();
-                match host.suspend() {
+                match host.suspend(why) {
                     Ok(()) => DeviceEvent::Resumed,
                     Err(error) => {
                         crate::log!("kindil: suspend: {error}");
