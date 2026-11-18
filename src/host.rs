@@ -231,13 +231,13 @@ pub trait Host: Send + Sync {
         why: crate::system::Why,
         ticket: &crate::suspend::Ticket,
     ) -> anyhow::Result<()>;
-    /// Suspends to RAM with a timed wake at `until` (on the wall clock, taken
-    /// right before arming); returns once awake, by the timer or the power
-    /// button. An error means it didn't suspend; nor does it once the app
-    /// voided `ticket`.
+    /// Suspends to RAM with a timed wake at `deadline` (on the monotonic
+    /// clock, measured right before arming: no wall-clock step moves it);
+    /// returns once awake, by the timer or the power button. An error means
+    /// it didn't suspend; nor does it once the app voided `ticket`.
     fn nap(
         &self,
-        until: chrono::DateTime<chrono::Utc>,
+        deadline: std::time::Instant,
         ticket: &crate::suspend::Ticket,
     ) -> anyhow::Result<()>;
     /// Back from a suspend or a nap: catches the clock up with the RTC if
@@ -636,11 +636,7 @@ impl Host for Simulated {
         Ok(())
     }
     /// Wakes at once, as if the minute were up.
-    fn nap(
-        &self,
-        _: chrono::DateTime<chrono::Utc>,
-        ticket: &crate::suspend::Ticket,
-    ) -> anyhow::Result<()> {
+    fn nap(&self, _: std::time::Instant, ticket: &crate::suspend::Ticket) -> anyhow::Result<()> {
         if !ticket.valid() {
             return Ok(());
         }

@@ -1216,10 +1216,10 @@ impl Host for Recording {
     }
     fn nap(
         &self,
-        until: chrono::DateTime<chrono::Utc>,
+        deadline: std::time::Instant,
         ticket: &kindil::suspend::Ticket,
     ) -> anyhow::Result<()> {
-        self.device.nap(until, ticket)
+        self.device.nap(deadline, ticket)
     }
     fn check_update(&self) -> anyhow::Result<kindil::update::Check> {
         Ok(match &self.latest {

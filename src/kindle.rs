@@ -422,13 +422,14 @@ impl Host for KindleHost {
 
     fn nap(
         &self,
-        until: chrono::DateTime<chrono::Utc>,
+        deadline: std::time::Instant,
         ticket: &crate::suspend::Ticket,
     ) -> anyhow::Result<()> {
         let recorder = crate::flight::Recorder::device();
         // Measured now, after parking Wi-Fi and right before arming: the
-        // time it took doesn't make the nap overshoot its minute.
-        let left = (until - chrono::Utc::now()).to_std().unwrap_or_default();
+        // time it took doesn't make the nap overshoot its minute. On the
+        // monotonic clock: the wall clock may have been stepped meanwhile.
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left < Duration::from_secs(1) {
             recorder.note(&format!("nap: {left:?} left; not suspending"));
             return Ok(());

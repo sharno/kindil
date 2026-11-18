@@ -34,11 +34,8 @@ const CHECKS: &[(&str, &str, Expect)] = &[
     ("Sleep", "SleepRefused", Expect::Holds),
     // Failed on 0.15.0; holds since power::sleep looks for a charger before powering off.
     ("Sleep", "SleepPowerOff", Expect::Holds),
-    (
-        "Sleep",
-        "SleepNapClock",
-        Expect::Fails("a clock step back under a nap being armed"),
-    ),
+    // Failed on 0.15.0; holds since a nap ends on a monotonic deadline.
+    ("Sleep", "SleepNapClock", Expect::Holds),
     // Whether a cable wakes a suspended PW1 is unmeasured; since the check alarm
     // is armed on a charger too, it holds either way.
     ("Sleep", "SleepCableQuiet", Expect::Holds),

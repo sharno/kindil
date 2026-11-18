@@ -657,15 +657,16 @@ WorkerHangs ==
                    host, world, ghosts>>
 
 (* The `online` worker ends: Wi-Fi back, then the clock from network time, *)
-(* which may step it back (a nap set out on the old clock then sleeps that *)
-(* much longer), then the fetch's tick: Fetch, or Draw without Wi-Fi. Or   *)
-(* it never ends (the join or the fetch hangs).                            *)
+(* which may step it, then the fetch's tick: Fetch, or Draw without Wi-Fi. *)
+(* Or it never ends (the join or the fetch hangs).                         *)
 SyncDone ==
     /\ ~OpenWorld
     /\ cpu = "up" /\ syncing
     /\ syncing' = FALSE
     /\ tick' = IF tick = "fetching" THEN "queued" ELSE tick
-    /\ \E stepBack \in BOOLEAN : longNap' = (longNap \/ (stepBack /\ napper = "park"))
+    \* A step of the wall clock no longer reaches a nap being armed: its end is
+    \* a monotonic deadline fixed when it was planned (`nap_deadline`).
+    /\ longNap' = longNap
     /\ UNCHANGED <<observed, app, wakeOn, shown, accepted, waiter, ceiling, stuck,
                    host, world, pressWaiting, overlap, badClaim, misjudged>>
 

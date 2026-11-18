@@ -1691,7 +1691,8 @@ impl Ctx {
                     state.naps += 1;
                     state.naps
                 };
-                self.nap_or_hold(now, until, nap);
+                let deadline = crate::system::nap_deadline(now, until, Instant::now());
+                self.nap_or_hold(now, deadline, nap);
             }
             Effect::Redraw => self.redraw_doze(),
             Effect::Rouse => {
@@ -1818,12 +1819,12 @@ impl Ctx {
         });
     }
 
-    /// Naps until `until` (the next minute), unless a maintenance window or
+    /// Naps until `deadline` (the next minute), unless a maintenance window or
     /// an SSH session holds the device awake: then Wi-Fi stays up, the
     /// sessions are looked at every [`HOLD_CHECK`], and the minute's wake
     /// comes without a suspend. `nap` is the nap under way; a hold's timer
     /// stops once another nap, or the end of the doze, has replaced it.
-    fn nap_or_hold(&self, now: DateTime<Utc>, until: DateTime<Utc>, nap: u64) {
+    fn nap_or_hold(&self, now: DateTime<Utc>, deadline: Instant, nap: u64) {
         self.apply_clock_steps();
         let sessions = self.host.ssh_sessions();
         let (hold, was) = {
@@ -1841,9 +1842,9 @@ impl Ctx {
                 }
             );
         }
-        let left = (until - now).to_std().unwrap_or_default();
+        let left = deadline.saturating_duration_since(Instant::now());
         let Some(hold) = hold else {
-            return self.nap(now, until, left, nap);
+            return self.nap(now, deadline, left, nap);
         };
         lock(&self.ledger).holding(now, hold);
         let Execution::Background = self.execution else {
@@ -1859,16 +1860,16 @@ impl Ctx {
             match (current, last) {
                 (false, _) => {}
                 (true, true) => ctx.device(DeviceEvent::Resumed),
-                (true, false) => ctx.nap_or_hold((ctx.now)(), until, nap),
+                (true, false) => ctx.nap_or_hold((ctx.now)(), deadline, nap),
             }
         });
     }
 
-    /// Suspends until `until`, `left` from now, Wi-Fi parked; a nap too
+    /// Suspends until `deadline`, `left` from now, Wi-Fi parked; a nap too
     /// short to be worth it waits awake instead. A nap the host refused (its
     /// alarm couldn't be armed and read back) waits awake for the minute too,
     /// rather than redrawing at once and trying again in a loop.
-    fn nap(&self, now: DateTime<Utc>, until: DateTime<Utc>, left: Duration, nap: u64) {
+    fn nap(&self, now: DateTime<Utc>, deadline: Instant, left: Duration, nap: u64) {
         lock(&self.ledger).napping(now, Instant::now());
         if left < MIN_NAP {
             return self.after_nap(left, nap);
@@ -1877,13 +1878,12 @@ impl Ctx {
         lock(&self.ledger).wifi_off(now);
         self.state.borrow_mut().wifi_parked = true;
         let ledger = self.ledger.clone();
-        let clock = self.now;
         // Previews and tests have no time to wait in.
         let wait = matches!(self.execution, Execution::Background);
         self.device_later_if(move |host| {
             // Down until a fetch is due: nothing joins after the resume.
             host.park_wifi();
-            match host.nap(until, &ticket) {
+            match host.nap(deadline, &ticket) {
                 Ok(()) => {
                     // Before the wake reads the clock: the resume lost time.
                     if let Some(correction) = host.catch_up_clock() {
@@ -1895,7 +1895,7 @@ impl Ctx {
                 Err(error) => {
                     crate::log!("kindil: nap: {error:#}; awake until the minute");
                     if wait {
-                        let left = (until - clock()).to_std().unwrap_or_default();
+                        let left = deadline.saturating_duration_since(Instant::now());
                         std::thread::sleep(left.min(Duration::from_secs(60)));
                     }
                     ticket.valid().then_some(DeviceEvent::SuspendFailed)
