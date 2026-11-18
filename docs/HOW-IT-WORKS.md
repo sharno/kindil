@@ -12,6 +12,11 @@ then for Amazon's UI. It never flashes or replaces init or the bootloader.
 Unless you opt into [start at boot](#start-at-boot), it changes no system file
 and a reboot always returns the Kindle to stock.
 
+Sleeping, dozing and the battery, the launcher's session and update trial,
+and start at boot are also written as formal models (TLA+, in `verify/`),
+checked in every order of events, with the app's recorded runs checked
+against them: see [Formal models](DEVELOP.md#formal-models).
+
 ## What it does
 
 - **Home**: the [Miqat](https://github.com/sharno/miqat) prayer dashboard,

@@ -13,6 +13,7 @@ nix develop
 cargo xtask sim       # every screen → dist/sim/*.png, simulated device
 cargo xtask desktop   # interactive window, simulated device
 cargo xtask check     # fmt, clippy, every test suite
+cargo xtask verify    # the formal models, and the tests' traces against them
 cargo xtask test-arm  # tests on ARM under qemu-arm
 ```
 
@@ -74,6 +75,7 @@ someone nearby to press the power button, or must end on their own first.
 | `sync.rs` | Syncthing as a typed state machine |
 | `update.rs` | Over-the-air updates: GitHub releases, signature check, trial and commit |
 | `system.rs` | Sleep, wake and USB drive mode as a state machine |
+| `trace.rs` | The state machine's steps as JSON lines, for the formal model (see [Formal models](#formal-models)) |
 | `drive.rs`, `usb.rs` | USB drive mode run by kindil: the state machine and sequences, and the device under them |
 | `reader.rs`, `files.rs`, `prefs.rs` | Books, Trash, persisted choices |
 | `location.rs` | Settings → Location: city search, IP lookup, typed coordinates, written into `miqat.toml` and `kindil.toml` |
@@ -90,6 +92,67 @@ someone nearby to press the power button, or must end on their own first.
 The build pins Slint 1.18.1 with its software renderer and full font shaping
 (Arabic joins correctly). IBM Plex Sans Arabic, from Miqat, is the only font.
 The device binary is static ARMv7 musl, linked by Zig for the 2.6.31 kernel.
+
+## Formal models
+
+`verify/` holds TLA+ models of the designs whose bugs hide in the order of
+events: sleeping, dozing and the battery, the launcher's session and update
+trial, and start at boot. [everystate](https://github.com/mattzcarey/everystate)
+(a TLA+ model checker in Rust, TLC's language and output; in the dev shell)
+checks every reachable state of each, and checks recorded runs of the code
+against the model. `cargo xtask verify` runs it all, in under two minutes,
+and CI runs it after `cargo xtask check`; without everystate it says so and
+skips.
+
+| Model | What it holds | Configurations |
+|---|---|---|
+| `Sleep.tla` | `Mode::step` (src/system.rs) arm for arm, the effects `Ctx::apply` runs (src/ui.rs: timers, workers, a doze wake ended by its frame on the panel or its ceiling), the host's nap and sleep loop with its 6-hourly check (src/kindle.rs, src/power.rs), and the world: the button, the charger and its `connected` file appearing late, the gauge around 5%, the RTC alarm, volumd | `Sleep`: sleep, the battery, the charger; `SleepDoze`: dozing in detail; `SleepUsb`: USB drive mode; `SleepOpen`: the reducer alone, any event at any time; `SleepTrace`: for the UI tests' traces |
+| `Launcher.tla` | The session (launcher/src/session.rs): every way out restores what it stopped; crash limits; the update trial and `Slots::commit` (src/update.rs) | `Launcher` |
+| `Boot.tla` | `launcher boot` (launcher/src/boot.rs, overlay.rs) and bin/boot.sh, boot after boot: the guard's tries and limit, the standalone boot's way back, overlays skipped after an unproven boot | `Boot` |
+
+Actions are named after the code's events and functions, with a comment
+saying which function each stands for. Each property is an `INVARIANT` or a
+`PROPERTY` (liveness, under the fairness written in `Spec`) in the module;
+the timing the models abstract away is written there as named assumptions
+(the idle timer comes after the short timers; the charger's `connected`
+appears within seconds; Sleep's `Races`).
+
+Some configurations fail on purpose: each reproduces a finding on the code
+as it is (the header of the .cfg says which), and `xtask/src/verify.rs`
+lists it as `Expect::Fails`. Once the code is fixed it holds, `verify` says
+so and fails, and the entry becomes `Expect::Holds`: a fixed bug stays
+checked. A configuration that should hold and doesn't fails the task with
+everystate's counterexample: read it as a story in the code's words (the
+actions are the events, in order) and decide against the code which side is
+wrong.
+
+To check one by hand, from `verify/`:
+
+```sh
+everystate -workers auto -config SleepDoze.cfg Sleep.tla   # safety on every core
+everystate -config Sleep.cfg Sleep.tla                     # with PROPERTIES: one thread
+everystate -json -config SleepCharger.cfg Sleep.tla        # the counterexample as JSON
+```
+
+**Traces.** src/trace.rs writes every event `Ctx::device` handles as a JSON
+line named as the model's actions, with the mode after it, its effects, why
+it was ignored and a count of the events (so the checker's unlogged steps
+can't be events). `verify` runs the reducer's seeded random runs
+(`trace::tests::random_events`) and the UI tests (tests/slint_ui.rs) with
+`KINDIL_TRACE=target/verify/traces`, a file per test, then `everystate
+conform` checks each against `Sleep.tla`: the random runs against
+`SleepOpen` (any event at any time), the UI tests against `SleepTrace` (the
+app's own timers and workers and the host's naps as modelled, up to 3
+unlogged steps of theirs before each event). A change to `Mode::step` or to
+what an effect starts that the model doesn't share fails here. On the
+Kindle, `touch /var/local/kindil/trace` records the next start's events to
+`/var/local/kindil/trace.jsonl` (up to 1 MiB), to check against the model
+the same way.
+
+A pass covers the models at their bounds, under their assumptions; the
+models were last confirmed against the code at 0.15.0. Change `system.rs`,
+the effects in `ui.rs`, `kindle.rs`'s nap or suspend, or the launcher, and
+`verify` says whether the model still describes it.
 
 ## Install over SSH
 

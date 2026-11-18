@@ -50,6 +50,18 @@
             chmod +x $out/bin/armv7l-unknown-linux-gnueabihf-gcc
           '';
           target = "armv7-unknown-linux-musleabihf";
+          # The TLA+ model checker `cargo xtask verify` runs (verify/), from
+          # crates.io: not in nixpkgs.
+          everystate = platform.buildRustPackage rec {
+            pname = "everystate";
+            version = "0.4.0";
+            src = pkgs.fetchCrate {
+              inherit pname version;
+              hash = "sha256-j6T1hgQtYAZCWRolTuM4iRh4cii6CThD9OcKWEClN9s=";
+            };
+            cargoHash = "sha256-uY/kWX4pCX4RSCMI7WUGnyqkJ6pqnOIF+3A20Tp2Bwg=";
+            doCheck = false;
+          };
           # kindil's own wpa_supplicant: nixpkgs' pinned upstream source, built
           # with the same Zig cross compiler into one static binary. Only what
           # the PW1 needs: its wireless-extensions driver, WPA/WPA2 personal,
@@ -149,6 +161,7 @@
             kindil-device = device;
             armv7-linker = linker;
             wpa-supplicant-device = wpaSupplicant;
+            inherit everystate;
           };
           checks = {
             host = host;
@@ -161,6 +174,7 @@
                 pkgs.binutils
                 pkgs.pkg-config
                 pkgs.shellcheck
+                everystate
               ]
               # qemu-arm, user-mode emulation, is Linux only: macOS's qemu
               # has system emulators alone, so ARM tests run on Linux.

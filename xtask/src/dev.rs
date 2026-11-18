@@ -8,7 +8,7 @@ const TARGET: &str = "armv7-unknown-linux-musleabihf";
 /// kindil's installed binary on the Kindle's user storage.
 const INSTALLED: &str = "/mnt/us/extensions/kindil/bin/kindil";
 
-fn run(command: &mut Command) -> anyhow::Result<()> {
+pub(crate) fn run(command: &mut Command) -> anyhow::Result<()> {
     let status = command
         .status()
         .with_context(|| format!("running {command:?}"))?;
@@ -24,7 +24,7 @@ fn output(command: &mut Command) -> anyhow::Result<String> {
     Ok(String::from_utf8(out.stdout)?.trim().to_owned())
 }
 
-fn cargo() -> Command {
+pub(crate) fn cargo() -> Command {
     Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
 }
 

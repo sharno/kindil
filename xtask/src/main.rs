@@ -5,6 +5,7 @@
 mod dev;
 mod device;
 mod release;
+mod verify;
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,8 @@ enum Task {
     Check,
     /// The test suites on the host
     Test,
+    /// The formal models in verify/, and the tests' traces against them
+    Verify,
     /// The test suites on the ARM target under qemu-arm
     TestArm,
     /// dist/kindil: the static ARMv7 binary
@@ -76,6 +79,7 @@ fn main() -> anyhow::Result<()> {
     match Cli::parse().task {
         Task::Check => dev::check(),
         Task::Test => dev::test(),
+        Task::Verify => verify::verify(),
         Task::TestArm => dev::test_arm(),
         Task::Device => dev::device().map(drop),
         Task::Sim => dev::sim(),
