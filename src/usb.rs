@@ -212,7 +212,12 @@ impl Ops for Device {
         run("umount", &[mount.path()])
     }
 
-    fn mount(&self, mount: Mount, read_only: bool) -> std::io::Result<()> {
+    fn mount(
+        &self,
+        mount: Mount,
+        read_only: bool,
+        _: &drive::proof::LunEmpty,
+    ) -> std::io::Result<()> {
         match mount {
             Mount::Base => self.mount_base(read_only),
             // fsp forks into the background once mounted, and outlives
@@ -272,8 +277,12 @@ impl Ops for Device {
         }
     }
 
-    fn set_lun(&self, file: &str) -> std::io::Result<()> {
-        std::fs::write(LUN, format!("{file}\n"))
+    fn export_lun(&self, _: &drive::proof::NotMounted) -> std::io::Result<()> {
+        std::fs::write(LUN, format!("{}\n", drive::DEVICE))
+    }
+
+    fn clear_lun(&self) -> std::io::Result<()> {
+        std::fs::write(LUN, "\n")
     }
 
     fn flush(&self) {
