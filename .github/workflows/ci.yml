@@ -30,6 +30,7 @@ jobs:
           nix build --no-link .#kindil
           nix develop --command bash -euo pipefail -c '
             cargo xtask check
+            cargo xtask verify
           '
       - name: ARM runtime tests and static device artifact
         if: matrix.kind == 'arm'
