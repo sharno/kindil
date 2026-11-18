@@ -130,7 +130,11 @@ pub fn sleep(device: &impl Sleeper, why: crate::system::Why) -> anyhow::Result<S
             if why == Why::BatteryEmpty {
                 // Without its check alarm, nothing would power the Kindle off
                 // at 1% and the cell would drain flat: off now, as powerd
-                // would at a critical battery.
+                // would at a critical battery; unless a charger is on its way.
+                if charger_comes(device) {
+                    device.note("sleep: can't sleep, but a charger is connected");
+                    return Ok(Slept::Charging);
+                }
                 device.note(&format!(
                     "sleep: can't sleep with the battery check ({error:#}); powering off"
                 ));
@@ -141,6 +145,12 @@ pub fn sleep(device: &impl Sleeper, why: crate::system::Why) -> anyhow::Result<S
         if due.is_some_and(|due| alarm_woke(due, device.now())) {
             let battery = device.battery()?;
             if critical(battery) {
+                // A charger plugged in as the alarm fired isn't connected
+                // yet: the gauge read "discharging".
+                if charger_comes(device) {
+                    device.note("sleep: battery critical, but a charger is connected");
+                    continue;
+                }
                 device.note(&format!("sleep: battery critical ({battery:?})"));
                 return Ok(Slept::Critical);
             }
@@ -161,6 +171,21 @@ pub fn sleep(device: &impl Sleeper, why: crate::system::Why) -> anyhow::Result<S
             },
         }
     }
+}
+
+/// Whether a charger is connected within [`CHARGER_DETECT`]: asked before
+/// powering off, which a charger plugged in moments ago makes needless.
+fn charger_comes(device: &impl Sleeper) -> bool {
+    let polls = CHARGER_DETECT.as_millis() / CHARGER_POLL.as_millis();
+    for poll in 0..=polls {
+        if device.plugged() {
+            return true;
+        }
+        if poll < polls {
+            device.wait(CHARGER_POLL);
+        }
+    }
+    false
 }
 
 /// Watches for [`CHARGER_DETECT`] after a wake: the power button, pressed
@@ -335,6 +360,27 @@ mod tests {
         device = Device::new(&[six_hours], None, &[]);
         device.percent = 1;
         assert_eq!(sleep(&device, Why::BatteryEmpty).unwrap(), Slept::Critical);
+    }
+
+    /// verify/SleepPowerOff.cfg's counterexample: at 1%, the check alarm
+    /// fires and a charger is plugged in as it does, before its driver
+    /// says it is connected. 0.15.0 powered off on the charger.
+    #[test]
+    fn a_charger_plugged_in_as_the_check_finds_one_percent_keeps_it_on() {
+        let six_hours = CHECK_ASLEEP.as_millis() as u64;
+        let mut device = Device::new(&[six_hours], Some(six_hours + 2_500), &[]);
+        device.percent = 1;
+        assert_eq!(sleep(&device, Why::BatteryEmpty).unwrap(), Slept::Charging);
+        assert_eq!(
+            *device.notes.borrow(),
+            [
+                "sleep: battery critical, but a charger is connected",
+                "sleep: a charger is connected; no sleep for the battery"
+            ]
+        );
+        // And when its suspend fails, the same charger keeps it on.
+        let device = Device::new(&[], Some(2_500), &[]);
+        assert_eq!(sleep(&device, Why::BatteryEmpty).unwrap(), Slept::Charging);
     }
 
     #[test]

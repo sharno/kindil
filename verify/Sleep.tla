@@ -517,7 +517,9 @@ SleeperSuspends ==
             /\ UNCHANGED <<cpu, alarm, wokeBy, due, pressed>>
        ELSE \E armed \in (IF AlarmCanFail /\ ~connected THEN BOOLEAN ELSE {TRUE}) :
             IF ~connected /\ ~armed /\ sleepFor = "battery"
-            THEN /\ cpu' = "off" /\ sleeper' = "idle"
+            \* `charger_comes`: off only once no charger turned up in CHARGER_DETECT.
+            THEN /\ ChargerSettled
+                 /\ cpu' = "off" /\ sleeper' = "idle"
                  /\ UNCHANGED <<alarm, wokeBy, due, pressed, pend>>
             ELSE \* `due` is taken from the alarm asked for, armed or not.
                  /\ due' = ~connected
@@ -529,7 +531,8 @@ SleeperSuspends ==
                    holdTimer, world, ghosts>>
 
 (* The kernel refuses the suspend: the battery's sleep powers off (its     *)
-(* check would never come); one the user asked for reports SuspendFailed.  *)
+(* check would never come) unless a charger turns up within CHARGER_DETECT *)
+(* (`charger_comes`); one the user asked for reports SuspendFailed.        *)
 SleeperRefused ==
     /\ ~OpenWorld
     /\ cpu = "up" /\ sleeper = "park"
@@ -538,7 +541,9 @@ SleeperRefused ==
     /\ ~(connected /\ sleepFor = "battery")
     /\ sleeper' = "idle"
     /\ IF sleepFor = "battery"
-       THEN cpu' = "off" /\ pend' = pend
+       THEN /\ ChargerSettled
+            /\ IF connected THEN cpu' = cpu /\ pend' = Add(pend, "Resumed", 1)
+                            ELSE cpu' = "off" /\ pend' = pend
        ELSE cpu' = cpu /\ pend' = Add(pend, "SuspendFailed", 1)
     /\ UNCHANGED <<observed, sleepWhy, screen, autoSleep, dashboard, draw,
                    alarm, wokeBy, due, napper, holdTimer, sleepFor, pressed, world, ghosts>>
@@ -580,10 +585,12 @@ SleeperDetects ==
                    cpu, alarm, wokeBy, due, napper, holdTimer, sleepFor, pressed, world, ghosts>>
 
 (* Woken by its alarm: at 1% on battery (`power::critical`, by            *)
-(* `connected`) it powers off; otherwise it sleeps again.                  *)
+(* `connected`) and with no charger within CHARGER_DETECT (`charger_comes`) *)
+(* it powers off; otherwise it sleeps again.                               *)
 SleeperChecks ==
     /\ ~OpenWorld
     /\ cpu = "up" /\ sleeper = "check"
+    /\ ChargerSettled
     /\ IF level = "critical" /\ ~connected
        THEN cpu' = "off" /\ sleeper' = "idle"
        ELSE cpu' = cpu /\ sleeper' = "park"
@@ -721,7 +728,7 @@ Fairness ==
     /\ WF_vars(NapperSuspends) /\ WF_vars(NapperResumes)
     /\ WF_vars(Aborts /\ NapperRefused) /\ SF_vars(Aborts /\ SleeperRefused)
     \* A cable going in and out can't hold the sleep's thread back for ever.
-    /\ SF_vars(SleeperSuspends) /\ WF_vars(SleeperResumes) /\ WF_vars(SleeperChecks)
+    /\ SF_vars(SleeperSuspends) /\ WF_vars(SleeperResumes) /\ SF_vars(SleeperChecks)
     \* CHARGER_DETECT is time passing: it ends, even with a cable going in and out.
     /\ SF_vars(SleeperDetects)
     /\ WF_vars(AlarmFires) /\ WF_vars(ConnectedAppears)
