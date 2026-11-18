@@ -44,9 +44,13 @@ fn wait_for(os: &dyn Os, check: impl Fn() -> bool) -> bool {
 }
 
 pub fn boot(paths: &Paths, os: &dyn Os) {
+    // Counted before the overlays: a boot they hang counts as one kindil
+    // didn't stay up in, or a standalone Kindle could boot to neither
+    // kindil nor Amazon's UI LIMIT times and once more.
+    let start = count(paths);
     let mut say = |line: String| log(&format!("overlays: {line}"));
     let applied = crate::overlay::apply(paths, os, crate::overlay::OVERLAYS, &mut say);
-    guard(paths, os);
+    guard(paths, os, start);
     if let Some(applied) = applied {
         let since = os.now().saturating_sub(applied.at);
         os.sleep(SETTLE.saturating_sub(Duration::from_secs(since)));
@@ -54,10 +58,22 @@ pub fn boot(paths: &Paths, os: &dyn Os) {
     }
 }
 
-/// The start-at-boot guard.
-fn guard(paths: &Paths, os: &dyn Os) {
+/// What this boot does about kindil, decided (and counted) at its start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Start {
+    /// Nothing: start at boot is off, or this boot already started kindil.
+    Nothing,
+    /// LIMIT boots in a row didn't see it stay up: Amazon's UI.
+    Over,
+    /// Start it: this boot is counted among the tries until it stays up.
+    Try,
+}
+
+/// Counts this boot among the tries, if kindil is to start in it, before
+/// anything (the overlays, Amazon's UI, kindil) can hang it.
+fn count(paths: &Paths) -> Start {
     if !paths.flag.exists() {
-        return;
+        return Start::Nothing;
     }
     let _ = std::fs::create_dir_all(&paths.run);
     // The boot kindil last started in: the job running again later in that
@@ -66,20 +82,32 @@ fn guard(paths: &Paths, os: &dyn Os) {
     let booted = paths.run.join("booted");
     let boot = read(&paths.boot_id);
     if read(&booted) == boot {
-        return;
+        return Start::Nothing;
     }
     let _ = std::fs::write(&booted, format!("{boot}\n"));
     let tries_file = paths.run.join("boot-tries");
     let tries: u32 = read(&tries_file).parse().unwrap_or(0);
     if tries >= LIMIT {
-        log(&format!(
-            "kindil didn't stay up for {LIMIT} boots; staying with Amazon's UI \
-             (turn start at boot on again in KUAL)"
-        ));
-        amazon_ui(paths, os);
-        return;
+        return Start::Over;
     }
     let _ = std::fs::write(&tries_file, format!("{}\n", tries + 1));
+    Start::Try
+}
+
+/// The start-at-boot guard.
+fn guard(paths: &Paths, os: &dyn Os, start: Start) {
+    match start {
+        Start::Nothing => return,
+        Start::Over => {
+            log(&format!(
+                "kindil didn't stay up for {LIMIT} boots; staying with Amazon's UI \
+                 (turn start at boot on again in KUAL)"
+            ));
+            return amazon_ui(paths, os);
+        }
+        Start::Try => {}
+    }
+    let tries_file = paths.run.join("boot-tries");
     if paths.skip.exists() {
         // kindil draws to the framebuffer itself: X, about 9 s of the boot,
         // and all that waits for it go unused.
@@ -403,6 +431,29 @@ pub mod tests {
         env.boot("a");
         assert_eq!(env.starts(), 1, "which starts nothing more in that boot");
         assert_eq!(env.os.upstart(), "stop x,stop early_progress,start x,");
+    }
+
+    /// verify/BootDark.cfg's counterexample: a standalone Kindle whose boot
+    /// the overlays hang, then two boots that hang with kindil starting.
+    /// 0.15.0 counted only the last two: a fourth boot came up with neither
+    /// kindil nor Amazon's UI. Now the third gets Amazon's UI.
+    #[test]
+    fn a_boot_the_overlays_hang_counts_among_kindils_tries() {
+        let env = Env::new();
+        env.overlays();
+        env.flag("standalone");
+        env.touch(&env.paths.skip);
+        // Boots that hang right after the guard's count: the overlays',
+        // then one with kindil on its way up.
+        for id in ["a", "b"] {
+            std::fs::write(&env.paths.boot_id, format!("{id}\n")).unwrap();
+            assert_eq!(count(&env.paths), Start::Try, "{id}");
+            let mut say = |_| {};
+            crate::overlay::apply(&env.paths, &env.os, crate::overlay::OVERLAYS, &mut say);
+        }
+        env.boot("c");
+        assert_eq!(env.starts(), 0, "not started a third time");
+        assert_eq!(env.skip(), "framework", "Amazon's UI with its framework");
     }
 
     #[test]

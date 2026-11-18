@@ -43,11 +43,8 @@ const CHECKS: &[(&str, &str, Expect)] = &[
     // Failed on 0.15.0; holds since the commit copies, then renames over.
     ("Launcher", "LauncherCommitCut", Expect::Holds),
     ("Boot", "Boot", Expect::Holds),
-    (
-        "Boot",
-        "BootDark",
-        Expect::Fails("a boot the overlays hang isn't counted by the guard"),
-    ),
+    // Failed on 0.15.0; holds since the guard counts a boot before the overlays.
+    ("Boot", "BootDark", Expect::Holds),
 ];
 
 /// Where the tests record their traces.
