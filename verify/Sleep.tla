@@ -502,12 +502,11 @@ NapperResumes ==
                    cpu, due, sleeper, holdTimer, sleepFor, pressed, world, ghosts>>
 
 (* `power::sleep`'s loop, after parking Wi-Fi (src/power.rs, through     *)
-(* src/suspend.rs). On battery (by `connected`) the check alarm,           *)
-(* CHECK_ASLEEP ahead: a sleep the user asked for still sleeps if it can't *)
-(* be armed (`Wake::AlarmOrButton`), until the button; the battery's       *)
-(* doesn't (`Wake::Alarm`): no alarm, no suspend, and it powers off. On a  *)
-(* charger, a sleep the user asked for has no alarm (`Wake::Button`); the  *)
-(* battery's isn't a sleep at all (`Slept::Charging`: Resumed).            *)
+(* src/suspend.rs): the check alarm, CHECK_ASLEEP ahead, on a charger too. *)
+(* A sleep the user asked for still sleeps if it can't be armed            *)
+(* (`Wake::AlarmOrButton`), until the button; the battery's doesn't        *)
+(* (`Wake::Alarm`): no alarm, no suspend, and it powers off. On a charger  *)
+(* the battery's isn't a sleep at all (`Slept::Charging`: Resumed).        *)
 SleeperSuspends ==
     /\ ~OpenWorld
     /\ cpu = "up" /\ sleeper = "park"
@@ -515,15 +514,15 @@ SleeperSuspends ==
     /\ IF connected /\ sleepFor = "battery"
        THEN /\ sleeper' = "idle" /\ pend' = Add(pend, "Resumed", 1)
             /\ UNCHANGED <<cpu, alarm, wokeBy, due, pressed>>
-       ELSE \E armed \in (IF AlarmCanFail /\ ~connected THEN BOOLEAN ELSE {TRUE}) :
+       ELSE \E armed \in (IF AlarmCanFail THEN BOOLEAN ELSE {TRUE}) :
             IF ~connected /\ ~armed /\ sleepFor = "battery"
             \* `charger_comes`: off only once no charger turned up in CHARGER_DETECT.
             THEN /\ ChargerSettled
                  /\ cpu' = "off" /\ sleeper' = "idle"
                  /\ UNCHANGED <<alarm, wokeBy, due, pressed, pend>>
             ELSE \* Only an armed alarm can wake it (`Back::armed`).
-                 /\ due' = (~connected /\ armed)
-                 /\ alarm' = IF ~connected /\ armed THEN "check" ELSE "none"
+                 /\ due' = armed
+                 /\ alarm' = IF armed THEN "check" ELSE "none"
                  /\ sleeper' = "suspended" /\ cpu' = "suspended" /\ wokeBy' = "none"
                  /\ pressed' = FALSE
                  /\ UNCHANGED pend

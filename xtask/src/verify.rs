@@ -42,11 +42,9 @@ const CHECKS: &[(&str, &str, Expect)] = &[
         "SleepNapClock",
         Expect::Fails("a clock step back under a nap being armed"),
     ),
-    (
-        "Sleep",
-        "SleepCableQuiet",
-        Expect::Fails("unplugged asleep, if a cable doesn't wake the PW1"),
-    ),
+    // Whether a cable wakes a suspended PW1 is unmeasured; since the check alarm
+    // is armed on a charger too, it holds either way.
+    ("Sleep", "SleepCableQuiet", Expect::Holds),
     ("Launcher", "Launcher", Expect::Holds),
     (
         "Launcher",

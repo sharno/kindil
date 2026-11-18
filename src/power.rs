@@ -119,13 +119,14 @@ pub fn sleep(device: &impl Sleeper, why: crate::system::Why) -> anyhow::Result<S
     use crate::system::Why;
     loop {
         let plugged = device.plugged();
-        // A nap's alarm must not wake a sleep the user asked for; on
-        // battery, a check of its own every few hours does. Only a sleep
-        // the user asked for may go without it: the battery's must check.
+        // A nap's alarm must not wake a sleep the user asked for; a check of
+        // its own every few hours does, on a charger too: one unplugged
+        // while the Kindle is suspended may not wake it, and on battery
+        // only the check powers it off at 1%. Only a sleep the user asked
+        // for may go without it: the battery's must check.
         let wake = match (plugged, Asked::of(why)) {
-            (false, Some(asked)) => Wake::AlarmOrButton(CHECK_ASLEEP, asked),
+            (_, Some(asked)) => Wake::AlarmOrButton(CHECK_ASLEEP, asked),
             (false, None) => Wake::Alarm(CHECK_ASLEEP),
-            (true, Some(asked)) => Wake::Button(asked),
             (true, None) => {
                 device.note("sleep: a charger is connected; no sleep for the battery");
                 return Ok(Slept::Charging);
@@ -271,6 +272,8 @@ mod tests {
         clock: std::cell::Cell<u64>,
         wakes: std::cell::RefCell<std::collections::VecDeque<u64>>,
         connected: Option<u64>,
+        /// The charger goes from then on.
+        unplugged: Option<u64>,
         presses: Vec<u64>,
         percent: u8,
         /// Whether its RTC arms the alarms asked for.
@@ -286,6 +289,7 @@ mod tests {
                 clock: std::cell::Cell::new(0),
                 wakes: std::cell::RefCell::new(wakes.iter().copied().collect()),
                 connected,
+                unplugged: None,
                 presses: presses.to_vec(),
                 percent: 4,
                 arms: true,
@@ -303,6 +307,7 @@ mod tests {
     impl Sleeper for Device {
         fn plugged(&self) -> bool {
             self.connected.is_some_and(|at| self.clock.get() >= at)
+                && self.unplugged.is_none_or(|at| self.clock.get() < at)
         }
         fn presses(&self) -> u64 {
             self.presses
@@ -439,10 +444,10 @@ mod tests {
         let device = Device::new(&[45_000], None, &[]);
         assert_eq!(sleep(&device, Why::Asked).unwrap(), Slept::Woken);
         assert_eq!(device.suspends(), 1);
-        // Plugged in, it sleeps until the button, with no check.
+        // Plugged in, it keeps its check (see below).
         let device = Device::new(&[45_000], Some(0), &[]);
         assert_eq!(sleep(&device, Why::Asked).unwrap(), Slept::Woken);
-        assert_eq!(*device.alarms.borrow(), [None]);
+        assert_eq!(*device.alarms.borrow(), [Some(CHECK_ASLEEP)]);
     }
 
     /// The battery's sleep never goes without its check's alarm: no alarm,
@@ -462,6 +467,20 @@ mod tests {
             [Wake::AlarmOrButton(CHECK_ASLEEP, asked)]
         );
         assert_eq!(Asked::of(Why::BatteryEmpty), None);
+    }
+
+    /// verify/SleepCableQuiet.cfg's counterexample, if unplugging doesn't
+    /// wake a suspended PW1 (not measured yet): a sleep the user asked for
+    /// on a charger, unplugged while suspended. 0.15.0 slept with no alarm
+    /// then, and the 1% power-off never came.
+    #[test]
+    fn a_sleep_on_a_charger_keeps_its_check_for_when_it_is_unplugged() {
+        let six_hours = CHECK_ASLEEP.as_millis() as u64;
+        let mut device = Device::new(&[six_hours], Some(0), &[]);
+        device.unplugged = Some(60_000);
+        device.percent = 1;
+        assert_eq!(sleep(&device, Why::Asked).unwrap(), Slept::Critical);
+        assert_eq!(device.suspends(), 1);
     }
 
     /// verify/SleepNearAlarm.cfg's counterexample: the power button pressed
