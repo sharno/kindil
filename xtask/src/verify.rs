@@ -24,11 +24,8 @@ const CHECKS: &[(&str, &str, Expect)] = &[
     ("Sleep", "SleepOpen", Expect::Holds),
     // Failed on 0.15.0; holds since lowbat and the charger check before powering off.
     ("Sleep", "SleepCharger", Expect::Holds),
-    (
-        "Sleep",
-        "SleepRaces",
-        Expect::Fails("a nap or sleep that the app left still suspends"),
-    ),
+    // Failed on 0.15.0; holds since a nap or sleep the app left is cancelled.
+    ("Sleep", "SleepRaces", Expect::Holds),
     // Failed on 0.15.0; holds since the press count decides alarm or button.
     ("Sleep", "SleepNearAlarm", Expect::Holds),
     // Failed on 0.15.0; holds since only an armed alarm can be the alarm.

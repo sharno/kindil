@@ -85,6 +85,9 @@ pub trait Sleeper {
     fn wait(&self, time: Duration);
     /// A line for the flight recorder.
     fn note(&self, line: &str);
+    /// Whether the app has woken meanwhile (its ticket is void,
+    /// src/suspend.rs): the sleep is over, whatever woke it.
+    fn cancelled(&self) -> bool;
 }
 
 /// How a [`sleep`] ended.
@@ -137,6 +140,11 @@ pub fn sleep(device: &impl Sleeper, why: crate::system::Why) -> anyhow::Result<S
             .map(|after| device.now() + after.as_secs() as i64);
         let presses = device.presses();
         let armed = match device.suspend(wake) {
+            // A press handled while Wi-Fi parked (or since): the app is up.
+            Ok(_) if device.cancelled() => {
+                device.note("sleep: the app woke meanwhile");
+                return Ok(Slept::Woken);
+            }
             Ok(armed) => armed,
             Err(error) if why == Why::BatteryEmpty => {
                 // Without its check alarm, nothing would power the Kindle off
@@ -278,6 +286,8 @@ mod tests {
         percent: u8,
         /// Whether its RTC arms the alarms asked for.
         arms: bool,
+        /// The app wakes (voids the sleep's ticket) from then on.
+        cancelled_at: Option<u64>,
         alarms: std::cell::RefCell<Vec<Option<Duration>>>,
         wakes_asked: std::cell::RefCell<Vec<crate::suspend::Wake>>,
         notes: std::cell::RefCell<Vec<String>>,
@@ -293,6 +303,7 @@ mod tests {
                 presses: presses.to_vec(),
                 percent: 4,
                 arms: true,
+                cancelled_at: None,
                 alarms: std::cell::RefCell::default(),
                 wakes_asked: std::cell::RefCell::default(),
                 notes: std::cell::RefCell::default(),
@@ -350,6 +361,9 @@ mod tests {
         }
         fn note(&self, line: &str) {
             self.notes.borrow_mut().push(line.to_owned());
+        }
+        fn cancelled(&self) -> bool {
+            self.cancelled_at.is_some_and(|at| self.clock.get() >= at)
         }
     }
 
@@ -467,6 +481,19 @@ mod tests {
             [Wake::AlarmOrButton(CHECK_ASLEEP, asked)]
         );
         assert_eq!(Asked::of(Why::BatteryEmpty), None);
+    }
+
+    /// verify/SleepRaces.cfg's counterexample, for the sleep: the battery's
+    /// sleep woken by its check, then a press handled by the app before the
+    /// sleep suspends again (its ticket void): no second suspend.
+    #[test]
+    fn a_sleep_the_app_has_left_doesnt_suspend_again() {
+        let six_hours = CHECK_ASLEEP.as_millis() as u64;
+        let mut device = Device::new(&[six_hours], None, &[]);
+        device.cancelled_at = Some(six_hours);
+        assert_eq!(sleep(&device, Why::BatteryEmpty).unwrap(), Slept::Woken);
+        assert_eq!(device.suspends(), 1);
+        assert_eq!(*device.notes.borrow(), ["sleep: the app woke meanwhile"]);
     }
 
     /// verify/SleepCableQuiet.cfg's counterexample, if unplugging doesn't

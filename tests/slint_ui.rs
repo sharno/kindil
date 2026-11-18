@@ -1201,8 +1201,12 @@ impl Host for Recording {
     fn listen(&self, deliver: kindil::host::Deliver) {
         self.device.listen(deliver)
     }
-    fn suspend(&self, why: kindil::system::Why) -> anyhow::Result<()> {
-        self.device.suspend(why)
+    fn suspend(
+        &self,
+        why: kindil::system::Why,
+        ticket: &kindil::suspend::Ticket,
+    ) -> anyhow::Result<()> {
+        self.device.suspend(why, ticket)
     }
     fn restart(&self) -> anyhow::Result<()> {
         self.device.restart()
@@ -1210,8 +1214,12 @@ impl Host for Recording {
     fn power_off(&self) -> anyhow::Result<()> {
         self.device.power_off()
     }
-    fn nap(&self, until: chrono::DateTime<chrono::Utc>) -> anyhow::Result<()> {
-        self.device.nap(until)
+    fn nap(
+        &self,
+        until: chrono::DateTime<chrono::Utc>,
+        ticket: &kindil::suspend::Ticket,
+    ) -> anyhow::Result<()> {
+        self.device.nap(until, ticket)
     }
     fn check_update(&self) -> anyhow::Result<kindil::update::Check> {
         Ok(match &self.latest {

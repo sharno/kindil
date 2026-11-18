@@ -115,7 +115,10 @@ VARIABLES
                  \* "check" (woken by its alarm), "detect" (watching for the button or a charger)
     sleepFor,    \* the sleep's `Why`: "asked" or "battery"
     pressed,     \* the power button was pressed since the sleep last suspended (`presses`)
-    holdTimer,   \* a hold's timer (nap_or_hold) is armed
+    holdTimer,   \* a hold's timer (nap_or_hold), or a short nap's (`after_nap`):
+                 \* "none", "hold", "short"
+    napVoid,     \* the app left the nap under way: its ticket is void (src/suspend.rs)
+    sleepVoid,   \* the app left the sleep under way: its ticket is void
     \* The world.
     cable,       \* "none", "charger", "computer"
     connected,   \* the charger's `connected` file reads 1
@@ -130,7 +133,7 @@ VARIABLES
 observed == <<mode, light, fresh, effects, ignored, handled>>
 app == <<sleepWhy, screen, pend, autoSleep, dashboard>>
 draw == <<wakeOn, tick, shown, accepted, waiter, ceiling, stuck, syncing>>
-host == <<cpu, alarm, wokeBy, due, napper, sleeper, sleepFor, pressed, holdTimer>>
+host == <<cpu, alarm, wokeBy, due, napper, sleeper, sleepFor, pressed, holdTimer, napVoid, sleepVoid>>
 world == <<cable, connected, level>>
 ghosts == <<pressWaiting, overlap, badClaim, longNap, misjudged>>
 vars == <<observed, app, draw, host, world, ghosts>>
@@ -224,7 +227,9 @@ Init ==
     /\ sleeper = "idle"
     /\ sleepFor = "asked"
     /\ pressed = FALSE
-    /\ holdTimer = FALSE
+    /\ holdTimer = "none"
+    /\ napVoid = FALSE
+    /\ sleepVoid = FALSE
     /\ cable \in (IF ExternalOpen THEN {"none"} ELSE Cables)
     /\ connected = (cable # "none")
     /\ level \in (IF ExternalOpen THEN {"ok"} ELSE Levels)
@@ -275,14 +280,14 @@ DrawEffects(fx, win) ==
 (* short to suspend (`after(left, Resumed)`), or a nap (`Ctx::nap`).       *)
 NapWays == {"nap", "short"} \cup (IF Holds THEN {"hold"} ELSE {})
 
-Apply(fx, before) ==
+Apply(fx, before, leaving) ==
     \E win \in (IF dashboard THEN {"Draw", "Online"} ELSE {"Draw"}),
        full \in BOOLEAN,
        how \in NapWays :
     LET reads == (Has(fx, "Redraw") /\ (full \/ win = "Online")) \/ Has(fx, "Wake") \/ Has(fx, "Rouse")
         p1 == IF Has(fx, "LightOff") THEN Add(before, "LightOff", 1) ELSE before
         p2 == IF Has(fx, "AwaitPanel") THEN Add(p1, "PanelSettled", 1) ELSE p1
-        p3 == IF Has(fx, "Nap") /\ how = "short" THEN Add(p2, "Resumed", 1) ELSE p2
+        p3 == p2
         \* AwaitDrive: the timers armed before carry another instant.
         p4 == IF Has(fx, "AwaitDrive")
               THEN [Add(p3, "DriveSettledOld", p3["DriveSettledCur"]) EXCEPT !["DriveSettledCur"] = 1]
@@ -294,14 +299,21 @@ Apply(fx, before) ==
                  ELSE IF Has(fx, "Wake") THEN "app"
                  ELSE screen
     /\ napper' = IF Has(fx, "Nap") /\ how = "nap" THEN "park" ELSE napper
-    /\ holdTimer' = IF Has(fx, "Nap") THEN how = "hold" ELSE holdTimer
+    /\ holdTimer' = IF Has(fx, "Nap") THEN (IF how = "nap" THEN "none" ELSE how) ELSE holdTimer
     /\ sleeper' = IF Has(fx, "Suspend") THEN "park" ELSE sleeper
+    \* `leaves_suspend` voids the tickets taken so far; a nap or sleep set out
+    \* now takes a good one.
+    /\ napVoid' = IF Has(fx, "Nap") /\ how = "nap" THEN FALSE ELSE napVoid \/ leaving
+    /\ sleepVoid' = IF Has(fx, "Suspend") THEN FALSE ELSE sleepVoid \/ leaving
     \* Effect::Suspend(why): the sleep's `Why`.
     /\ sleepFor' = IF Has(fx, "Suspend")
                    THEN (IF sleepWhy = "battery" THEN "battery" ELSE "asked")
                    ELSE sleepFor
-    /\ overlap' = (overlap \/ (Has(fx, "Nap") /\ how = "nap" /\ napper # "idle")
-                           \/ (Has(fx, "Suspend") /\ sleeper # "idle"))
+    \* A thread whose ticket is void ends without suspending: it can overlap.
+    /\ overlap' = (overlap \/ (Has(fx, "Nap") /\ how = "nap" /\ napper # "idle"
+                                 /\ ~(napVoid \/ leaving))
+                           \/ (Has(fx, "Suspend") /\ sleeper # "idle"
+                                 /\ ~(sleepVoid \/ leaving)))
     /\ DrawEffects(fx, win)
 
 host_rest == <<cpu, alarm, wokeBy, due, pressed>>
@@ -322,10 +334,12 @@ Handle(e, p, before) ==
                                   [] e = "Idle" -> "idle"
                                   [] OTHER -> "battery"
             /\ pressWaiting' = (pressWaiting /\ r.next \notin AwakeModes)
-            /\ Apply(r.fx, before)
+            /\ Apply(r.fx, before,
+                     mode \in {"DozeNapping", "AsleepSuspended"}
+                     /\ r.next \notin {"DozeNapping", "AsleepSuspended"})
        ELSE /\ pend' = before
             /\ UNCHANGED <<mode, light, fresh, sleepWhy, pressWaiting, screen, napper,
-                           holdTimer, sleeper, sleepFor, overlap, wakeOn, tick, shown, accepted,
+                           holdTimer, napVoid, sleepVoid, sleeper, sleepFor, overlap, wakeOn, tick, shown, accepted,
                            waiter, ceiling, syncing>>
     /\ UNCHANGED <<autoSleep, dashboard, stuck, host_rest, world, badClaim, longNap, misjudged>>
 
@@ -405,7 +419,7 @@ PressButton ==
     \* The listener counts the press (`PRESSES`).
     /\ pressed' = (pressed \/ sleeper \in {"suspended", "check", "detect"})
     /\ UNCHANGED <<observed, sleepWhy, screen, autoSleep, dashboard, draw,
-                   alarm, due, napper, sleeper, holdTimer, sleepFor, world, overlap, badClaim, longNap,
+                   alarm, due, napper, sleeper, holdTimer, napVoid, sleepVoid, sleepFor, world, overlap, badClaim, longNap,
                    misjudged>>
 
 CableWake ==
@@ -421,7 +435,7 @@ Plug(c) ==
     /\ pend' = IF c = "computer" THEN Add(pend, "DriveComputer", 1) ELSE pend
     /\ CableWake
     /\ UNCHANGED <<observed, sleepWhy, screen, autoSleep, dashboard, draw,
-                   alarm, due, napper, sleeper, holdTimer, sleepFor, pressed, connected, level, ghosts>>
+                   alarm, due, napper, sleeper, holdTimer, napVoid, sleepVoid, sleepFor, pressed, connected, level, ghosts>>
 
 Unplug ==
     /\ ~OpenWorld /\ ~ExternalOpen
@@ -431,7 +445,7 @@ Unplug ==
     /\ pend' = IF cable = "computer" THEN Add(pend, "DriveKindle", 1) ELSE pend
     /\ CableWake
     /\ UNCHANGED <<observed, sleepWhy, screen, autoSleep, dashboard, draw,
-                   alarm, due, napper, sleeper, holdTimer, sleepFor, pressed, level, ghosts>>
+                   alarm, due, napper, sleeper, holdTimer, napVoid, sleepVoid, sleepFor, pressed, level, ghosts>>
 
 ConnectedAppears ==
     /\ ~OpenWorld /\ ~ExternalOpen
@@ -457,7 +471,7 @@ AlarmFires ==
     /\ cpu = "suspended" /\ alarm # "none"
     /\ ChargerSettled
     /\ cpu' = "up" /\ wokeBy' = "alarm"
-    /\ UNCHANGED <<observed, app, draw, alarm, due, napper, sleeper, holdTimer, sleepFor, pressed, world, ghosts>>
+    /\ UNCHANGED <<observed, app, draw, alarm, due, napper, sleeper, holdTimer, napVoid, sleepVoid, sleepFor, pressed, world, ghosts>>
 
 (* The minute clock (`arm_clock`, not while dozing) or a page refreshes    *)
 (* the status bar, reading the battery.                                    *)
@@ -475,31 +489,35 @@ Aborts == ~Races /\ Waking
 
 (* `Ctx::nap`'s thread, after parking Wi-Fi: `KindleHost::nap` arms the    *)
 (* required alarm, reads it back and suspends; or refuses (no alarm, or    *)
-(* the kernel said no), and SuspendFailed comes after the minute.          *)
+(* the kernel said no), and SuspendFailed comes after the minute. With its *)
+(* ticket void (the app left the nap) it doesn't suspend, and what it says *)
+(* is dropped.                                                             *)
 NapperSuspends ==
     /\ ~OpenWorld
     /\ cpu = "up" /\ napper = "park"
     /\ Races \/ ~Waking
-    /\ napper' = "suspended" /\ cpu' = "suspended" /\ alarm' = "nap" /\ wokeBy' = "none"
-    /\ UNCHANGED <<observed, app, draw, due, sleeper, holdTimer, sleepFor, pressed, world, ghosts>>
+    /\ IF napVoid
+       THEN napper' = "idle" /\ UNCHANGED <<cpu, alarm, wokeBy>>
+       ELSE napper' = "suspended" /\ cpu' = "suspended" /\ alarm' = "nap" /\ wokeBy' = "none"
+    /\ UNCHANGED <<observed, app, draw, due, sleeper, holdTimer, napVoid, sleepVoid, sleepFor, pressed, world, ghosts>>
 
 NapperRefused ==
     /\ ~OpenWorld
     /\ cpu = "up" /\ napper = "park"
     /\ Refusal
     /\ napper' = "idle"
-    /\ pend' = Add(pend, "SuspendFailed", 1)
+    /\ pend' = IF napVoid THEN pend ELSE Add(pend, "SuspendFailed", 1)
     /\ UNCHANGED <<observed, sleepWhy, screen, autoSleep, dashboard, draw,
-                   cpu, alarm, wokeBy, due, sleeper, holdTimer, sleepFor, pressed, world, ghosts>>
+                   cpu, alarm, wokeBy, due, sleeper, holdTimer, napVoid, sleepVoid, sleepFor, pressed, world, ghosts>>
 
 (* Back from the nap, whatever woke it: the alarm moved away, Resumed. *)
 NapperResumes ==
     /\ ~OpenWorld
     /\ cpu = "up" /\ napper = "suspended"
     /\ napper' = "idle" /\ alarm' = "none" /\ wokeBy' = "none"
-    /\ pend' = Add(pend, "Resumed", 1)
+    /\ pend' = IF napVoid THEN pend ELSE Add(pend, "Resumed", 1)
     /\ UNCHANGED <<observed, sleepWhy, screen, autoSleep, dashboard, draw,
-                   cpu, due, sleeper, holdTimer, sleepFor, pressed, world, ghosts>>
+                   cpu, due, sleeper, holdTimer, napVoid, sleepVoid, sleepFor, pressed, world, ghosts>>
 
 (* `power::sleep`'s loop, after parking Wi-Fi (src/power.rs, through     *)
 (* src/suspend.rs): the check alarm, CHECK_ASLEEP ahead, on a charger too. *)
@@ -520,6 +538,10 @@ SleeperSuspends ==
             THEN /\ ChargerSettled
                  /\ cpu' = "off" /\ sleeper' = "idle"
                  /\ UNCHANGED <<alarm, wokeBy, due, pressed, pend>>
+            \* A void ticket: no suspend (`Back::cancelled`), and nothing said.
+            ELSE IF sleepVoid
+            THEN /\ sleeper' = "idle"
+                 /\ UNCHANGED <<cpu, alarm, wokeBy, due, pressed, pend>>
             ELSE \* Only an armed alarm can wake it (`Back::armed`).
                  /\ due' = armed
                  /\ alarm' = IF armed THEN "check" ELSE "none"
@@ -527,7 +549,7 @@ SleeperSuspends ==
                  /\ pressed' = FALSE
                  /\ UNCHANGED pend
     /\ UNCHANGED <<observed, sleepWhy, screen, autoSleep, dashboard, draw, napper, sleepFor,
-                   holdTimer, world, ghosts>>
+                   holdTimer, napVoid, sleepVoid, world, ghosts>>
 
 (* The kernel refuses the suspend: the battery's sleep powers off (its     *)
 (* check would never come) unless a charger turns up within CHARGER_DETECT *)
@@ -538,6 +560,8 @@ SleeperRefused ==
     /\ Refusal
     \* The battery's sleep looks for a charger first: then there is no suspend.
     /\ ~(connected /\ sleepFor = "battery")
+    \* A void ticket never reaches the kernel.
+    /\ ~sleepVoid
     /\ sleeper' = "idle"
     /\ IF sleepFor = "battery"
        THEN /\ ChargerSettled
@@ -545,7 +569,7 @@ SleeperRefused ==
                             ELSE cpu' = "off" /\ pend' = pend
        ELSE cpu' = cpu /\ pend' = Add(pend, "SuspendFailed", 1)
     /\ UNCHANGED <<observed, sleepWhy, screen, autoSleep, dashboard, draw,
-                   alarm, wokeBy, due, napper, holdTimer, sleepFor, pressed, world, ghosts>>
+                   alarm, wokeBy, due, napper, holdTimer, napVoid, sleepVoid, sleepFor, pressed, world, ghosts>>
 
 (* Back from a sleep: it was the alarm if one was armed (`due`), it is its *)
 (* time by `alarm_woke` (from 2 s before), and the power button wasn't     *)
@@ -558,7 +582,9 @@ SleeperResumes ==
     /\ ~OpenWorld
     /\ cpu = "up" /\ sleeper = "suspended"
     /\ alarm' = "none" /\ wokeBy' = "none" /\ due' = FALSE
-    /\ \E late \in (IF wokeBy = "alarm" THEN {TRUE}
+    \* Left by the app meanwhile (`cancelled`): over, and nothing said.
+    /\ IF sleepVoid THEN sleeper' = "idle" /\ pend' = pend /\ UNCHANGED misjudged ELSE
+       \E late \in (IF wokeBy = "alarm" THEN {TRUE}
                     ELSE IF alarm = "none" \/ PressNearAlarm THEN BOOLEAN
                     ELSE {FALSE}) :
          /\ IF due /\ late /\ ~pressed
@@ -569,7 +595,7 @@ SleeperResumes ==
             ELSE sleeper' = "idle" /\ pend' = Add(pend, "Resumed", 1)
          /\ misjudged' = (misjudged \/ (due /\ late /\ ~pressed /\ wokeBy = "press"))
     /\ UNCHANGED <<observed, sleepWhy, screen, autoSleep, dashboard, draw,
-                   cpu, napper, holdTimer, sleepFor, pressed, world, pressWaiting, overlap,
+                   cpu, napper, holdTimer, napVoid, sleepVoid, sleepFor, pressed, world, pressWaiting, overlap,
                    badClaim, longNap>>
 
 (* `woke`: for CHARGER_DETECT, a press since the suspend or a connected     *)
@@ -580,10 +606,10 @@ SleeperDetects ==
     /\ cpu = "up" /\ sleeper = "detect"
     /\ ChargerSettled
     /\ IF pressed \/ connected
-       THEN sleeper' = "idle" /\ pend' = Add(pend, "Resumed", 1)
+       THEN sleeper' = "idle" /\ pend' = IF sleepVoid THEN pend ELSE Add(pend, "Resumed", 1)
        ELSE sleeper' = "park" /\ pend' = pend
     /\ UNCHANGED <<observed, sleepWhy, screen, autoSleep, dashboard, draw,
-                   cpu, alarm, wokeBy, due, napper, holdTimer, sleepFor, pressed, world, ghosts>>
+                   cpu, alarm, wokeBy, due, napper, holdTimer, napVoid, sleepVoid, sleepFor, pressed, world, ghosts>>
 
 (* Woken by its alarm: at 1% on battery (`power::critical`, by            *)
 (* `connected`) and with no charger within CHARGER_DETECT (`charger_comes`) *)
@@ -595,22 +621,24 @@ SleeperChecks ==
     /\ IF level = "critical" /\ ~connected
        THEN cpu' = "off" /\ sleeper' = "idle"
        ELSE cpu' = cpu /\ sleeper' = "park"
-    /\ UNCHANGED <<observed, app, draw, alarm, wokeBy, due, napper, holdTimer, sleepFor, pressed,
+    /\ UNCHANGED <<observed, app, draw, alarm, wokeBy, due, napper, holdTimer, napVoid, sleepVoid, sleepFor, pressed,
                    world, ghosts>>
 
-(* A hold's timer (nap_or_hold, every HOLD_CHECK): if its nap is the one   *)
-(* under way and the app is Napping, the minute's wake comes (Resumed) or, *)
-(* the hold over, it naps; otherwise it stops.                             *)
+(* A hold's timer (nap_or_hold, every HOLD_CHECK), or a short nap's       *)
+(* (`after_nap`): if its nap is the one under way and the app is Napping,  *)
+(* the minute's wake comes (Resumed) or, the hold over, it naps (with a    *)
+(* ticket of its own); otherwise it stops.                                 *)
 HoldTimerFires ==
     /\ ~OpenWorld
-    /\ cpu = "up" /\ holdTimer
-    /\ holdTimer' = FALSE
+    /\ cpu = "up" /\ holdTimer # "none"
+    /\ holdTimer' = "none"
     /\ IF mode = "DozeNapping"
-       THEN \/ pend' = Add(pend, "Resumed", 1) /\ napper' = napper
-            \/ pend' = pend /\ napper = "idle" /\ napper' = "park"
-       ELSE pend' = pend /\ napper' = napper
+       THEN \/ pend' = Add(pend, "Resumed", 1) /\ napper' = napper /\ napVoid' = napVoid
+            \/ /\ holdTimer = "hold"
+               /\ pend' = pend /\ napper = "idle" /\ napper' = "park" /\ napVoid' = FALSE
+       ELSE pend' = pend /\ napper' = napper /\ napVoid' = napVoid
     /\ UNCHANGED <<observed, sleepWhy, screen, autoSleep, dashboard, draw,
-                   cpu, alarm, wokeBy, due, sleeper, sleepFor, pressed, world, ghosts>>
+                   cpu, alarm, wokeBy, due, sleeper, sleepFor, pressed, sleepVoid, world, ghosts>>
 
 (* The dashboard worker renders the wake's tagged tick and hands the frame *)
 (* to the window (`dashboard_shown`); or it hangs, for good.               *)
@@ -757,10 +785,11 @@ TypeOK ==
     /\ napper \in {"idle", "park", "suspended"}
     /\ sleeper \in {"idle", "park", "suspended", "check", "detect"}
     /\ sleepFor \in {"asked", "battery"}
+    /\ holdTimer \in {"none", "hold", "short"}
     /\ cable \in Cables /\ level \in Levels
     /\ connected => cable # "none"
 
-(* No nap or sleep thread starts while the last is still running.         *)
+(* No nap or sleep thread starts while the last, still good, is running.  *)
 OneSuspendAtATime == ~overlap
 
 (* The device suspends only while the app sleeps or naps, never behind an *)
