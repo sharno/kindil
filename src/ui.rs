@@ -1473,10 +1473,14 @@ impl Ctx {
         let steps = self.clock_steps.clone();
         self.background(
             move |host| {
+                let since = Instant::now();
                 let up = match reconnect {
+                    // Returns once the lease is applied: the sync finds
+                    // the route and the name servers.
                     true => host.reconnect_wifi(),
                     false => Ok(()),
                 };
+                let rejoined = since.elapsed();
                 if up.is_ok() {
                     match host.sync_clock() {
                         Ok(Some(correction)) => {
@@ -1488,6 +1492,16 @@ impl Ctx {
                         Err(error) => crate::log!("kindil: clock: {error:#}"),
                     }
                 }
+                crate::log!(
+                    "kindil: online: Wi-Fi {} in {:.1} s, clock {:.1} s more",
+                    match (reconnect, &up) {
+                        (false, _) => "was up",
+                        (true, Ok(())) => "back",
+                        (true, Err(_)) => "not back",
+                    },
+                    rejoined.as_secs_f64(),
+                    (since.elapsed() - rejoined).as_secs_f64()
+                );
                 up
             },
             move |_, result| {
@@ -1704,6 +1718,12 @@ impl Ctx {
             move |settle: Settle| {
                 let won = draw_wake.claim(wake);
                 if won {
+                    if window == Window::Online {
+                        crate::log!(
+                            "kindil: online wake ended after {:.1} s ({settle:?})",
+                            since.elapsed().as_secs_f64()
+                        );
+                    }
                     lock(&ledger).settled(settle);
                     deliver(DeviceEvent::PanelSettled);
                 }
