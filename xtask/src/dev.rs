@@ -89,11 +89,14 @@ fn arm_linker() -> anyhow::Result<String> {
 }
 
 fn arm_cargo(cc: &str) -> Command {
+    let flags = format!("-C linker={cc} -C target-feature=+crt-static -C link-self-contained=no");
     let mut command = cargo();
-    command.env("CC_armv7_unknown_linux_musleabihf", cc).env(
-        "RUSTFLAGS",
-        format!("-C linker={cc} -C target-feature=+crt-static -C link-self-contained=no"),
-    );
+    // rustdoc doesn't read RUSTFLAGS: without its own copy, doctests link
+    // Rust's musl start files on top of the linker's (duplicate _start).
+    command
+        .env("CC_armv7_unknown_linux_musleabihf", cc)
+        .env("RUSTFLAGS", &flags)
+        .env("RUSTDOCFLAGS", &flags);
     command
 }
 
