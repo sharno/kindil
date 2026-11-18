@@ -203,7 +203,7 @@ mod socket {
                             // The buffer overflowed and some events were
                             // dropped; the socket itself still works.
                             Some(libc::ENOBUFS) => {
-                                eprintln!("kindil: uevents overflowed; some were missed")
+                                crate::log!("kindil: uevents overflowed; some were missed")
                             }
                             _ => return Err(error),
                         }

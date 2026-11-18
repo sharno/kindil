@@ -86,17 +86,34 @@ and a reboot always returns the Kindle to stock.
     redraws ended, the gauge, and the clock's corrections. The power button
     brings it back with the light restored, and Wi-Fi rejoins.
   - **Time keeping**: with Amazon's services stopped nothing else sets the
-    clock (Amazon's `updatetime` did), and each resume from a nap loses
-    about half a second of it (12 minutes slow after two days of dozing,
-    29 s more in the next hour, while the SoC's RTC, `rtc0`, stayed right). So after each nap or sleep kindil steps the clock up to
-    `rtc0` once it is a whole second behind, and whenever it goes online
-    (at start once Wi-Fi has an address, each doze fetch, each wake) it asks
-    pool.ntp.org, time.google.com and time.cloudflare.com (SNTP) and sets
-    the clock and `rtc0` when two agree it is off by a quarter second or
-    more; with UDP 123 blocked, the `Date` of Open-Meteo's HTTP answer does,
-    to within 2 s. A step of over a year is refused unless the clock is
-    before 2026. Each step is logged ("clock was 724 s slow; set from
-    time.google.com").
+    clock (Amazon's `updatetime` did). Each resume from a nap moves the
+    clock on by the whole seconds the SoC's RTC, `rtc0`, counted (2.6.31's
+    `rtc_resume`); since the alarm wakes at the same point of `rtc0`'s
+    second every minute, the rounding is one-sided: the clock fell 29 s
+    behind in an hour of naps on 2026-11-17, and ran 20 to 40 s an hour
+    fast that night. So after each nap or sleep kindil puts the clock back
+    within `rtc0`'s second, forward or back, where that second begins being
+    measured (to 10 ms) after each SNTP sync. Whenever it goes online (at
+    start once Wi-Fi has an address, each doze fetch once the renewed lease
+    has set the route and name servers, each wake) it asks pool.ntp.org,
+    time.google.com and time.cloudflare.com (SNTP, at most 4 s in all) and
+    sets the clock when two agree it is off by a quarter second or more;
+    with UDP 123 blocked, the `Date` of Open-Meteo's HTTP answer does (at
+    most 5 s), to within 2 s. `rtc0` is written only when it is off by more
+    than its resolution. A step of over a year is refused unless the clock
+    is before 2026. Each step is logged ("clock was 724 s slow; set from
+    time.google.com"), and every log line carries the wall time.
+  - **Suspending**: every nap and sleep goes through one step that arms
+    the PMIC's wake alarm (`rtc1`) with an absolute time last, reads it back
+    from the alarm registers (`RTC_ALM_READ`; the driver never reports it
+    through sysfs), and doesn't suspend if that fails: a refused nap waits
+    awake for its minute and tries again. Writing `0` to `wakealarm` arms
+    an alarm 5 minutes ahead on this driver rather than disarming it, so
+    kindil moves the alarm a year ahead instead. Each step (Wi-Fi parked,
+    the alarm armed and read back, suspending, resumed) is noted before it
+    is taken in `/var/local/kindil/naps.log` (96 KiB, and the file before
+    it as `naps.log.1`): after a freeze its last line says where the device
+    stopped.
   - **Wi-Fi of its own**: kindil runs Wi-Fi itself with the networks joined
     in it, saved in `/var/local/kindil/networks.toml` (plain text, readable
     by root only; a network is saved once it has joined). It loads the

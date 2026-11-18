@@ -76,7 +76,7 @@ impl KindleHost {
         // Amazon's UI, which ran until now, widened them (src/perms.rs):
         // narrowed before anything is read or run.
         for line in crate::perms::narrow_own(Path::new(crate::perms::RUN)) {
-            eprintln!("kindil: {line}");
+            crate::log!("kindil: {line}");
         }
         Self {
             frontlight: Frontlight::open().map_err(|e| e.to_string()),
@@ -126,7 +126,7 @@ fn guard_charging() -> anyhow::Result<()> {
     if pause != paused {
         std::fs::write(CHARGER, if pause { "0" } else { "1" })?;
         CHARGING_PAUSED.store(pause, Ordering::Relaxed);
-        eprintln!(
+        crate::log!(
             "kindil: charging {} at {temperature} °F",
             if pause { "paused" } else { "resumed" }
         );
@@ -179,9 +179,21 @@ impl Host for KindleHost {
     }
 
     fn park_wifi(&self) {
-        if let Err(error) = self.net.park() {
-            eprintln!("kindil: parking Wi-Fi: {error}");
+        let since = std::time::Instant::now();
+        let parked = self.net.park();
+        let took = since.elapsed();
+        if let Err(error) = &parked {
+            crate::log!("kindil: parking Wi-Fi: {error}");
         }
+        crate::flight::Recorder::device().note(&format!(
+            "Wi-Fi {} in {:.2} s",
+            if parked.is_ok() {
+                "parked"
+            } else {
+                "not parked"
+            },
+            took.as_secs_f64()
+        ));
     }
 
     fn ssh_sessions(&self) -> Vec<crate::maintenance::Session> {
@@ -337,7 +349,7 @@ impl Host for KindleHost {
     fn info(&self) -> DeviceInfo {
         // Read each minute and each doze wake: the charging guard rides along.
         if let Err(error) = guard_charging() {
-            eprintln!("kindil: charging guard: {error}");
+            crate::log!("kindil: charging guard: {error}");
         }
         DeviceInfo {
             battery: gauge_battery().unwrap_or_else(|_| crate::battery::read(Path::new("/sys"))),
@@ -365,7 +377,7 @@ impl Host for KindleHost {
             // Without it the power button does nothing: never give up on it.
             loop {
                 if let Err(error) = power_button(|| power(Event::PowerButton)) {
-                    eprintln!("kindil: power button: {error}; listening again");
+                    crate::log!("kindil: power button: {error}; listening again");
                 }
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -387,49 +399,43 @@ impl Host for KindleHost {
     }
 
     fn suspend(&self) -> anyhow::Result<()> {
-        let alarm = wakealarm().ok();
+        let recorder = crate::flight::Recorder::device();
         loop {
             // A nap's alarm must not wake a sleep the user asked for; on
             // battery, a check of its own every few hours does (src/power.rs).
-            let check = match &alarm {
-                Some(alarm) => arm_check(alarm)?,
-                None => None,
-            };
-            std::fs::write("/sys/power/state", b"mem")?;
-            if let Some(alarm) = &alarm {
-                let _ = std::fs::write(alarm, "0");
-            }
-            // The resume lost time: back to the RTC's before reading it.
-            if let Some(correction) = crate::clock::catch_up() {
-                eprintln!("kindil: {correction}");
-            }
+            let check = (!plugged().unwrap_or(false)).then_some(crate::power::CHECK_ASLEEP);
+            let due = check.map(|after| epoch_seconds() + after.as_secs() as i64);
+            // The user asked for this sleep: without its check's alarm it
+            // still sleeps, until the button, rather than stay up.
+            sleep_once(&recorder, "sleep", check.map(Alarm::Wanted))?;
             let now = epoch_seconds();
-            let checking = check.is_some_and(|due| crate::power::alarm_woke(due, now));
-            if !checking {
+            if !due.is_some_and(|due| crate::power::alarm_woke(due, now)) {
                 // The power button: the app wakes.
                 return Ok(());
             }
             let battery = gauge_battery()?;
             if crate::power::critical(battery) {
-                eprintln!("kindil: battery critical ({battery:?}); powering off");
+                crate::log!("kindil: battery critical ({battery:?}); powering off");
                 return self.power_off();
             }
         }
     }
 
-    fn nap(&self, wake_after: Duration) -> anyhow::Result<()> {
-        let alarm = wakealarm()?;
-        // Writing a new alarm over a pending one fails: clear it first.
-        std::fs::write(&alarm, "0")?;
-        std::fs::write(&alarm, format!("+{}", wake_after.as_secs().max(1)))?;
-        let slept = std::fs::write("/sys/power/state", b"mem");
-        // The power button may have woken it first: never leave the alarm set.
-        let _ = std::fs::write(&alarm, "0");
-        Ok(slept?)
+    fn nap(&self, until: chrono::DateTime<chrono::Utc>) -> anyhow::Result<()> {
+        let recorder = crate::flight::Recorder::device();
+        // Measured now, after parking Wi-Fi and right before arming: the
+        // time it took doesn't make the nap overshoot its minute.
+        let left = (until - chrono::Utc::now()).to_std().unwrap_or_default();
+        if left < Duration::from_secs(1) {
+            recorder.note(&format!("nap: {left:?} left; not suspending"));
+            return Ok(());
+        }
+        sleep_once(&recorder, "nap", Some(Alarm::Required(left)))
     }
 
+    /// [`sleep_once`] caught up already, before anything read the clock.
     fn catch_up_clock(&self) -> Option<crate::clock::Correction> {
-        crate::clock::catch_up()
+        lock(&CAUGHT_UP).take()
     }
 
     fn sync_clock(&self) -> anyhow::Result<Option<crate::clock::Correction>> {
@@ -460,9 +466,9 @@ impl Host for KindleHost {
         // Up for two minutes: this version's launcher is the one that starts
         // kindil from now on (src/launcher.rs).
         match crate::launcher::install(Path::new(crate::launcher::PATH)) {
-            Ok(true) => eprintln!("kindil: launcher updated"),
+            Ok(true) => crate::log!("kindil: launcher updated"),
             Ok(false) => {}
-            Err(error) => eprintln!("kindil: writing the launcher: {error:#}"),
+            Err(error) => crate::log!("kindil: writing the launcher: {error:#}"),
         }
         Ok(commit)
     }
@@ -476,31 +482,101 @@ impl Host for KindleHost {
     }
 }
 
-/// Arms `alarm` for the next battery check when on battery; returns when
-/// it is due, in seconds since the epoch. Plugged in, no alarm.
-fn arm_check(alarm: &Path) -> anyhow::Result<Option<i64>> {
-    std::fs::write(alarm, "0")?;
-    if plugged().unwrap_or(false) {
-        return Ok(None);
+/// The last suspend's clock correction, for the doze's ledger.
+static CAUGHT_UP: Mutex<Option<crate::clock::Correction>> = Mutex::new(None);
+
+/// A suspend's wake alarm, this far ahead.
+#[derive(Clone, Copy, Debug)]
+enum Alarm {
+    /// No suspend without it: a nap's.
+    Required(Duration),
+    /// Without it the suspend lasts until the power button: a sleep's.
+    Wanted(Duration),
+}
+
+/// Every suspend goes through here: the wake alarm armed (or moved out of
+/// the way, for a sleep only the power button ends) as the very last thing
+/// before the suspend, read back from the RTC's registers, and no suspend
+/// at all if a [`Alarm::Required`] one fails: such a suspend could last
+/// until someone presses the button. Each step is noted in the flight
+/// recorder first. Back awake, the alarm is moved out of the way and the
+/// clock put back within the RTC's second.
+fn sleep_once(
+    recorder: &crate::flight::Recorder,
+    what: &str,
+    alarm: Option<Alarm>,
+) -> anyhow::Result<()> {
+    let rtc = crate::wakealarm::WakeRtc::find();
+    let arm = |after| match &rtc {
+        Ok(rtc) => rtc.arm(after),
+        Err(error) => Err(anyhow::anyhow!("{error}")),
+    };
+    let armed = match alarm {
+        Some(Alarm::Required(after)) => match arm(after) {
+            Ok(armed) => Some(armed),
+            Err(error) => {
+                recorder.note(&format!("{what}: not suspending: {error:#}"));
+                return Err(error.context("arming the wake alarm"));
+            }
+        },
+        Some(Alarm::Wanted(after)) => match arm(after) {
+            Ok(armed) => Some(armed),
+            Err(error) => {
+                crate::log!("kindil: {what}: no wake alarm ({error:#}); until the power button");
+                disarm(&rtc, recorder, what);
+                None
+            }
+        },
+        None => {
+            disarm(&rtc, recorder, what);
+            None
+        }
+    };
+    let rtc_name = rtc.as_ref().map(|rtc| rtc.name()).unwrap_or_default();
+    recorder.note(&match armed {
+        Some(armed) => format!("{what}: suspending, {rtc_name} {armed}"),
+        None => format!("{what}: suspending until the power button"),
+    });
+    let since = epoch_seconds();
+    let slept = std::fs::write("/sys/power/state", b"mem");
+    // The power button may have woken it first: the alarm must not wake a
+    // later suspend that didn't ask for it.
+    let rtc_now = rtc.as_ref().ok().and_then(|rtc| rtc.now().ok());
+    disarm(&rtc, recorder, what);
+    let correction = crate::clock::catch_up();
+    recorder.note(&format!(
+        "{what}: {} after {} s by the clock, {rtc_name} at {}{}",
+        match &slept {
+            Ok(()) => "resumed".to_owned(),
+            Err(error) => format!("suspend refused ({error})"),
+        },
+        epoch_seconds() - since,
+        rtc_now.map_or_else(|| "?".to_owned(), |n| n.to_string()),
+        correction.map_or_else(String::new, |c| format!("; {c}")),
+    ));
+    if let Some(correction) = correction {
+        *lock(&CAUGHT_UP) = Some(correction);
     }
-    let after = crate::power::CHECK_ASLEEP.as_secs();
-    std::fs::write(alarm, format!("+{after}"))?;
-    Ok(Some(epoch_seconds() + after as i64))
+    Ok(slept?)
+}
+
+/// Moves the alarm out of the way, if there is one; a failure is noted.
+fn disarm(
+    rtc: &anyhow::Result<crate::wakealarm::WakeRtc>,
+    recorder: &crate::flight::Recorder,
+    what: &str,
+) {
+    if let Ok(rtc) = rtc {
+        if let Err(error) = rtc.disarm() {
+            recorder.note(&format!("{what}: moving the alarm away: {error:#}"));
+        }
+    }
 }
 
 fn epoch_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
-}
-
-/// The RTC that can wake the device: on the PW1 the PMIC's (`rtc1`); the
-/// SoC's own RTC has no wake alarm.
-fn wakealarm() -> anyhow::Result<std::path::PathBuf> {
-    (0..4)
-        .map(|n| std::path::PathBuf::from(format!("/sys/class/rtc/rtc{n}/wakealarm")))
-        .find(|path| path.exists())
-        .ok_or_else(|| anyhow::anyhow!("no RTC wake alarm"))
 }
 
 fn run(command: &mut Command) -> anyhow::Result<()> {
@@ -528,20 +604,20 @@ fn power_button(pressed: impl Fn()) -> std::io::Result<()> {
 fn usb_drive(deliver: &(dyn Fn(Event) + Send + Sync), released: &crate::usb::Released) {
     let follow_volumd = || {
         if let Err(error) = volumd(deliver) {
-            eprintln!("kindil: USB drive mode: {error}");
+            crate::log!("kindil: USB drive mode: {error}");
         }
     };
     match crate::drive::Owner::read(Path::new(crate::drive::SWITCH)) {
         crate::drive::Owner::Amazon => follow_volumd(),
         crate::drive::Owner::Kindil => {
-            eprintln!("kindil: USB drive mode is kindil's; waiting for volumd to stop");
+            crate::log!("kindil: USB drive mode is kindil's; waiting for volumd to stop");
             if !crate::usb::volumd_gone() {
-                eprintln!("kindil: volumd still runs; USB drive mode stays volumd's");
+                crate::log!("kindil: volumd still runs; USB drive mode stays volumd's");
                 return follow_volumd();
             }
             loop {
                 if let Err(error) = crate::usb::run_drive(deliver, released) {
-                    eprintln!("kindil: USB drive: {error}; starting again");
+                    crate::log!("kindil: USB drive: {error}; starting again");
                 }
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -573,23 +649,23 @@ fn start_wifi(net: &Arc<Net>, networks: &Mutex<Networks>) {
         // Asked each time: switched off meanwhile, it stays off. Off still
         // takes Wi-Fi from Amazon: no Wi-Fi at all while kindil runs.
         if Net::wanted() == Power::Off {
-            eprintln!("kindil: Wi-Fi is switched off");
+            crate::log!("kindil: Wi-Fi is switched off");
             if let Err(error) = net.set(Power::Off, &saved) {
-                eprintln!("kindil: Wi-Fi off: {error}");
+                crate::log!("kindil: Wi-Fi off: {error}");
             }
             return;
         }
         match net.set(Power::On, &saved) {
             Ok(()) => {
-                eprintln!("kindil: Wi-Fi up with {} saved networks", saved.len());
+                crate::log!("kindil: Wi-Fi up with {} saved networks", saved.len());
                 return;
             }
             Err(error) if since.elapsed() < WIFI_START => {
-                eprintln!("kindil: Wi-Fi start: {error}; trying again");
+                crate::log!("kindil: Wi-Fi start: {error}; trying again");
                 std::thread::sleep(Duration::from_secs(5));
             }
             Err(error) => {
-                eprintln!("kindil: Wi-Fi start: {error}; switch Wi-Fi on to try again");
+                crate::log!("kindil: Wi-Fi start: {error}; switch Wi-Fi on to try again");
                 return;
             }
         }
@@ -604,9 +680,9 @@ fn sync_clock_once_online(net: &Net) {
     while since.elapsed() < CLOCK_SYNC_WAIT && net.power() == Power::On {
         if let Ok((Link::Associated { ip: Some(_), .. }, _)) = net.link() {
             match crate::clock::sync() {
-                Ok(Some(correction)) => eprintln!("kindil: {correction}"),
-                Ok(None) => eprintln!("kindil: clock: right by network time"),
-                Err(error) => eprintln!("kindil: clock: {error:#}"),
+                Ok(Some(correction)) => crate::log!("kindil: {correction}"),
+                Ok(None) => crate::log!("kindil: clock: right by network time"),
+                Err(error) => crate::log!("kindil: clock: {error:#}"),
             }
             return;
         }

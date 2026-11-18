@@ -421,9 +421,7 @@ fn record(event: &Event, on_interface: Option<Ipv4Addr>, shared: &Shared) {
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn log(line: &str) {
-    // Never panics, unlike eprintln!: a full /var/local.
-    let line = format!("kindil: DHCP: {line}\n");
-    let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+    crate::log!("kindil: DHCP: {line}");
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

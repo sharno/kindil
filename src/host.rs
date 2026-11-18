@@ -221,9 +221,10 @@ pub trait Host: Send + Sync {
     fn storage_released(&self) {}
     /// Suspends to RAM; returns once the device is awake again.
     fn suspend(&self) -> anyhow::Result<()>;
-    /// Suspends to RAM with a timed wake; returns once awake, by the timer or
-    /// the power button.
-    fn nap(&self, wake_after: Duration) -> anyhow::Result<()>;
+    /// Suspends to RAM with a timed wake at `until` (on the wall clock, taken
+    /// right before arming); returns once awake, by the timer or the power
+    /// button. An error means it didn't suspend.
+    fn nap(&self, until: chrono::DateTime<chrono::Utc>) -> anyhow::Result<()>;
     /// Back from a suspend or a nap: catches the clock up with the RTC if
     /// the resume lost a second or more (src/clock.rs). Quick.
     fn catch_up_clock(&self) -> Option<crate::clock::Correction> {
@@ -277,6 +278,9 @@ struct SimulatedState {
     /// Times the clock was synced, and the step the next sync reports.
     clock_syncs: u32,
     clock_off: Option<f64>,
+    /// Naps fail as when the wake alarm can't be armed; how many did.
+    refuse_naps: bool,
+    refused_naps: u32,
 }
 
 /// The Simulated device's place search: well-known public places.
@@ -366,6 +370,8 @@ impl Default for Simulated {
                 ssh_sessions: Vec::new(),
                 clock_syncs: 0,
                 clock_off: None,
+                refuse_naps: false,
+                refused_naps: 0,
             }),
         }
     }
@@ -394,6 +400,16 @@ impl Simulated {
 
     pub fn set_charge(&self, charge: crate::drain::MilliampHours) {
         self.with(|s| s.charge = Some(charge));
+    }
+
+    /// From now on naps fail, as when the wake alarm can't be armed.
+    pub fn set_refuse_naps(&self, refuse: bool) {
+        self.with(|s| s.refuse_naps = refuse);
+    }
+
+    /// How many naps failed.
+    pub fn refused_naps(&self) -> u32 {
+        self.with(|s| s.refused_naps)
     }
 
     /// How many times the device napped while dozing.
@@ -569,7 +585,13 @@ impl Host for Simulated {
         Ok(())
     }
     /// Wakes at once, as if the minute were up.
-    fn nap(&self, _: Duration) -> anyhow::Result<()> {
+    fn nap(&self, _: chrono::DateTime<chrono::Utc>) -> anyhow::Result<()> {
+        if self.with(|s| {
+            s.refused_naps += u32::from(s.refuse_naps);
+            s.refuse_naps
+        }) {
+            anyhow::bail!("the wake alarm reads back 0");
+        }
         self.with(|s| {
             s.naps += 1;
             s.parked_naps += u32::from(s.parked);

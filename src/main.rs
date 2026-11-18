@@ -79,6 +79,7 @@ enum StartAtBoot {
 impl Cli {
     fn config(&self) -> anyhow::Result<Config> {
         let config = Config::load(self.config.as_deref())?;
+        kindil::logging::set_zone(config.timezone);
         Ok(Config {
             miqat_config: self.miqat_config.clone().unwrap_or(config.miqat_config),
             books: self.books.clone().unwrap_or(config.books),
@@ -219,7 +220,7 @@ fn main() -> std::process::ExitCode {
     // makes), so it is told apart from kindil.
     if called == Some(std::ffi::OsStr::new(kindil::lifeline::NAME)) {
         let Some((deadline, pid)) = kindil::lifeline::parse(&args.collect::<Vec<_>>()) else {
-            eprintln!("usage: {} DEADLINE PID", kindil::lifeline::NAME);
+            kindil::log!("usage: {} DEADLINE PID", kindil::lifeline::NAME);
             return std::process::ExitCode::from(2);
         };
         kindil::lifeline::lifeline(deadline, pid);
@@ -273,7 +274,7 @@ fn main() -> std::process::ExitCode {
         Ok(Exit::Quit) => std::process::ExitCode::SUCCESS,
         Ok(Exit::Restart) => std::process::ExitCode::from(kindil::update::RESTART_EXIT_CODE),
         Err(error) => {
-            eprintln!("kindil: {error:#}");
+            kindil::log!("kindil: {error:#}");
             std::process::ExitCode::FAILURE
         }
     }

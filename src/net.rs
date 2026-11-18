@@ -76,6 +76,12 @@ const SCAN_FRESH: Duration = Duration::from_secs(120);
 const SCAN_LIMIT: Duration = Duration::from_secs(60);
 /// How often udhcpc's supervisor looks whether it still runs.
 const DHCP_POLL: Duration = Duration::from_millis(500);
+/// After a resume's rejoin, the most kindil waits for udhcpc's hook to
+/// apply the renewed lease (the default route, the name servers) before
+/// anything goes online: the resume took the route with the interface.
+const LEASE_APPLIED_WAIT: Duration = Duration::from_secs(8);
+/// A wait for the lifecycle lock longer than this is logged.
+const SLOW_LOCK: Duration = Duration::from_secs(1);
 
 /// A scan's access points, or why it failed.
 type Scanned = Result<Vec<Bss>, String>;
@@ -177,13 +183,13 @@ impl Net {
 
     /// Switches kindil's Wi-Fi, with `saved` loaded, and remembers it.
     pub fn set(self: &Arc<Self>, power: Power, saved: &[Credentials]) -> anyhow::Result<()> {
-        let _transition = lock(&self.lifecycle);
+        let _transition = self.transition("switching Wi-Fi");
         self.switch(power, saved)
     }
 
     /// Gives the running Wi-Fi `saved`, kindil's networks, when it is on.
     pub fn load(self: &Arc<Self>, saved: &[Credentials]) -> anyhow::Result<()> {
-        let _transition = lock(&self.lifecycle);
+        let _transition = self.transition("loading the networks");
         self.give(saved)
     }
 
@@ -194,14 +200,29 @@ impl Net {
         candidate: &[Credentials],
         saved: &[Credentials],
     ) -> anyhow::Result<()> {
-        let _transition = lock(&self.lifecycle);
+        let _transition = self.transition("joining");
         let joined = self.join(candidate);
         if joined.is_err() {
             if let Err(error) = self.give(saved) {
-                eprintln!("kindil: Wi-Fi: putting the saved networks back: {error}");
+                crate::log!("kindil: Wi-Fi: putting the saved networks back: {error}");
             }
         }
         joined
+    }
+
+    /// The lifecycle lock, for `why`; a wait of over [`SLOW_LOCK`] is
+    /// logged, naming who waited.
+    fn transition(&self, why: &str) -> std::sync::MutexGuard<'_, ()> {
+        let since = Instant::now();
+        let guard = lock(&self.lifecycle);
+        let waited = since.elapsed();
+        if waited > SLOW_LOCK {
+            crate::log!(
+                "kindil: Wi-Fi: {why} waited {:.1} s for another Wi-Fi change",
+                waited.as_secs_f64()
+            );
+        }
+        guard
     }
 
     /// The Wi-Fi the stack runs (or last ran).
@@ -260,7 +281,7 @@ impl Net {
     /// is due. kindil's own Wi-Fi (behind its switch) isn't parked yet: its
     /// keeper rejoins by itself.
     pub fn park(self: &Arc<Self>) -> anyhow::Result<()> {
-        let _transition = lock(&self.lifecycle);
+        let _transition = self.transition("parking");
         if self.power() == Power::Off
             || self.backend() != Backend::Supplicant
             || self.parked.load(Ordering::SeqCst)
@@ -272,18 +293,27 @@ impl Net {
         Ok(())
     }
 
-    /// After a suspend: join again, then renew the address (usually kept).
-    /// A supplicant that doesn't answer gets the whole stack started again.
+    /// After a suspend: join again, then renew the address (usually kept),
+    /// and return once the renewed lease is applied (route and name
+    /// servers), or [`LEASE_APPLIED_WAIT`] has passed: whatever goes online
+    /// next finds the network. A supplicant that doesn't answer gets the
+    /// whole stack started again. The lifecycle lock isn't held while
+    /// waiting for the lease.
     pub fn reconnect(self: &Arc<Self>) -> anyhow::Result<()> {
         let joins = {
-            let _transition = lock(&self.lifecycle);
+            let transition = self.transition("reconnecting");
             // REASSOCIATE (or a restart) undoes a park's DISCONNECT.
             self.parked.store(false, Ordering::SeqCst);
             if self.power() == Power::Off {
                 return Ok(());
             }
             if self.backend() == Backend::Supplicant {
-                return self.reconnect_supplicant();
+                let renewal = self.reconnect_supplicant()?;
+                drop(transition);
+                if let Some(renewal) = renewal {
+                    lease_applied(renewal, LEASE_APPLIED_WAIT);
+                }
+                return Ok(());
             }
             // The keeper joins again, the PMK again too, and proves it
             // with a renewed lease.
@@ -302,15 +332,16 @@ impl Net {
         Ok(())
     }
 
-    /// `reconnect` for wpa_supplicant, with `lifecycle` held.
-    fn reconnect_supplicant(self: &Arc<Self>) -> anyhow::Result<()> {
+    /// `reconnect` for wpa_supplicant, with `lifecycle` held: the renewal
+    /// asked of udhcpc, if one was.
+    fn reconnect_supplicant(self: &Arc<Self>) -> anyhow::Result<Option<Renewal>> {
         let rejoined =
             wifi::open(INTERFACE).and_then(|wpa| wpa.command("REASSOCIATE").map(|_| wpa));
         let Ok(wpa) = rejoined else {
             // Gone or hung (no answer within the socket's timeout).
-            eprintln!("kindil: wpa_supplicant isn't answering; starting Wi-Fi again");
+            crate::log!("kindil: wpa_supplicant isn't answering; starting Wi-Fi again");
             let saved = lock(&self.saved).clone();
-            return self.start(&saved);
+            return self.start(&saved).map(|()| None);
         };
         let since = Instant::now();
         while !matches!(wpa.link(), Ok(Link::Associated { .. })) {
@@ -321,15 +352,15 @@ impl Net {
     }
 
     /// After a join or a resume with wpa_supplicant: udhcpc renews the
-    /// lease now; kindil's own client keeps it until T1 if it is for this
-    /// network, and asks afresh if not.
-    fn renew(&self) -> anyhow::Result<()> {
+    /// lease now (the renewal asked of it); kindil's own client keeps it
+    /// until T1 if it is for this network, and asks afresh if not.
+    fn renew(&self) -> anyhow::Result<Option<Renewal>> {
         match lock(&self.client).as_ref() {
             Some(client) => {
                 client.request(current_network());
-                Ok(())
+                Ok(None)
             }
-            None => renew_dhcp(),
+            None => renew_dhcp().map(Some),
         }
     }
 
@@ -413,7 +444,7 @@ impl Net {
         while since.elapsed() < TRY_WAIT {
             if matches!(wpa.link(), Ok(Link::Associated { ssid: ref joined, .. }) if *joined == ssid)
             {
-                return self.renew();
+                return self.renew().map(drop);
             }
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -477,13 +508,13 @@ impl Net {
     /// cleared (by the stop in `start`), wpa_supplicant started with the
     /// saved networks.
     fn fall_back(self: &Arc<Self>, why: &str) {
-        eprintln!(
+        crate::log!(
             "kindil: kindil's own Wi-Fi gives up ({why}); wpa_supplicant for the rest of this run"
         );
         self.fell_back.store(true, Ordering::SeqCst);
         let saved = lock(&self.saved).clone();
         if let Err(error) = self.start(&saved) {
-            eprintln!("kindil: Wi-Fi with wpa_supplicant: {error}; trying again");
+            crate::log!("kindil: Wi-Fi with wpa_supplicant: {error}; trying again");
             self.keep_starting();
         }
     }
@@ -496,7 +527,7 @@ impl Net {
         let mut generation = self.generation.load(Ordering::SeqCst);
         std::thread::spawn(move || {
             retry_start(&std::thread::sleep, &mut || {
-                let _transition = lock(&net.lifecycle);
+                let _transition = net.transition("restarting");
                 if net.generation.load(Ordering::SeqCst) != generation
                     || Net::wanted() == Power::Off
                 {
@@ -534,7 +565,7 @@ impl Net {
         let switch = std::fs::read_to_string(station::SWITCH).ok();
         let chosen = backend(switch.as_deref(), self.fell_back.load(Ordering::SeqCst));
         if chosen == Backend::Kindil {
-            eprintln!(
+            crate::log!(
                 "kindil: Wi-Fi: kindil's own, without wpa_supplicant ({})",
                 station::SWITCH
             );
@@ -568,12 +599,12 @@ impl Net {
         let switch = std::fs::read_to_string(dhcpc::SWITCH).ok();
         let started = dhcpc::chosen(switch.as_deref()).then(|| {
             dhcpc::Client::start(INTERFACE, std::path::Path::new(dhcpc::RESOLV)).inspect_err(
-                |error| eprintln!("kindil: DHCP: kindil's own client: {error}; udhcpc instead"),
+                |error| crate::log!("kindil: DHCP: kindil's own client: {error}; udhcpc instead"),
             )
         });
         match started {
             Some(Ok(client)) => {
-                eprintln!("kindil: DHCP: kindil's own client ({})", dhcpc::SWITCH);
+                crate::log!("kindil: DHCP: kindil's own client ({})", dhcpc::SWITCH);
                 if self.backend() == Backend::Supplicant {
                     // wpa_supplicant joins by itself: ask at once, as udhcpc
                     // would; a join or a resume asks again.
@@ -635,11 +666,11 @@ impl Net {
                 } else {
                     (pause * 2).min(PAUSE_MAX)
                 };
-                eprintln!("kindil: {name} exited ({status:?}); starting it again in {pause:?}");
+                crate::log!("kindil: {name} exited ({status:?}); starting it again in {pause:?}");
                 let mut gone = Gone::default();
                 loop {
                     std::thread::sleep(pause);
-                    let _transition = lock(&net.lifecycle);
+                    let _transition = net.transition("restarting wpa_supplicant");
                     if !wanted(&net) {
                         return;
                     }
@@ -652,7 +683,7 @@ impl Net {
                             break;
                         }
                         Err(error) => {
-                            eprintln!("kindil: {name}: {error}");
+                            crate::log!("kindil: {name}: {error}");
                             pause = (pause * 2).min(PAUSE_MAX);
                         }
                     }
@@ -693,11 +724,11 @@ impl Net {
                 } else {
                     (pause * 2).min(PAUSE_MAX)
                 };
-                eprintln!("kindil: udhcpc exited ({status}); starting it again in {pause:?}");
+                crate::log!("kindil: udhcpc exited ({status}); starting it again in {pause:?}");
                 let mut gone = Gone::default();
                 loop {
                     std::thread::sleep(pause);
-                    let _transition = lock(&net.lifecycle);
+                    let _transition = net.transition("restarting udhcpc");
                     if !wanted(&net) {
                         return;
                     }
@@ -718,7 +749,7 @@ impl Net {
                             break;
                         }
                         Err(error) => {
-                            eprintln!("kindil: udhcpc: {error}");
+                            crate::log!("kindil: udhcpc: {error}");
                             pause = (pause * 2).min(PAUSE_MAX);
                         }
                     }
@@ -834,7 +865,7 @@ impl Net {
                 })
                 .and_then(|socket| station::disconnect(&socket))
             {
-                eprintln!("kindil: Wi-Fi: leaving the network: {error}");
+                crate::log!("kindil: Wi-Fi: leaving the network: {error}");
             }
         }
         // Nothing to take down the first time (no driver yet): quietly.
@@ -867,7 +898,7 @@ impl Keep {
     /// `f` under the lifecycle lock, while this keeper's stack is the one
     /// running.
     fn guarded<R>(&self, f: impl FnOnce(&Arc<Net>) -> R) -> Option<R> {
-        let _transition = lock(&self.net.lifecycle);
+        let _transition = self.net.transition("the keeper");
         self.wanted().then(|| f(&self.net))
     }
 }
@@ -903,7 +934,7 @@ impl station::Context for Keep {
     }
 
     fn with<R>(&self, f: impl FnOnce(&wext::Socket, &[Credentials]) -> R) -> Option<R> {
-        let _transition = lock(&self.net.lifecycle);
+        let _transition = self.net.transition("the keeper");
         if !self.wanted() {
             return None;
         }
@@ -983,7 +1014,7 @@ fn retry_start(
             None => return false,
             Some(Ok(())) => return true,
             Some(Err(error)) => {
-                eprintln!("kindil: Wi-Fi with wpa_supplicant: {error}; trying again")
+                crate::log!("kindil: Wi-Fi with wpa_supplicant: {error}; trying again")
             }
         }
     }
@@ -1131,9 +1162,7 @@ pub(crate) fn terminate(file: &str) {
         if !gone_within(libc::SIGTERM, Duration::from_secs(3))
             && !gone_within(libc::SIGKILL, Duration::from_secs(2))
         {
-            // Never panics, unlike eprintln!: a full /var/local.
-            let line = format!("kindil: process {pid} ({file}) won't exit\n");
-            let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+            crate::log!("kindil: process {pid} ({file}) won't exit");
         }
     }
     let _ = std::fs::remove_file(file);
@@ -1201,13 +1230,50 @@ fn spawn_dhcp() -> anyhow::Result<Child> {
 }
 
 /// Asks udhcpc to renew the lease now; it was kept through a nap.
-fn renew_dhcp() -> anyhow::Result<()> {
+fn renew_dhcp() -> anyhow::Result<Renewal> {
     let pid = pid(DHCP_PID)
         .filter(|&pid| alive(pid))
         .ok_or_else(|| anyhow::anyhow!("udhcpc isn't running"))?;
+    let asked = crate::dhcp::monotonic();
     // SAFETY: plain kill(2) on udhcpc's own pid.
     unsafe { libc::kill(pid, libc::SIGUSR1) };
-    Ok(())
+    Ok(Renewal {
+        pid: pid as u32,
+        asked,
+    })
+}
+
+/// A renewal asked of udhcpc `pid` at `asked` ([`crate::dhcp::monotonic`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Renewal {
+    pub pid: u32,
+    pub asked: Duration,
+}
+
+impl Renewal {
+    /// Whether `marker`, udhcpc's hook's latest, applied a lease asked for
+    /// by this renewal (or after it).
+    pub fn applied_by(self, marker: Option<crate::dhcp::Marker>) -> bool {
+        marker.is_some_and(|marker| marker.at >= self.asked)
+    }
+}
+
+/// Waits up to `wait` for udhcpc's hook to apply `renewal`'s lease: it
+/// leaves its marker last, after the route and the name servers.
+fn lease_applied(renewal: Renewal, wait: Duration) -> bool {
+    let since = Instant::now();
+    loop {
+        if renewal.applied_by(crate::dhcp::marker(renewal.pid)) {
+            return true;
+        }
+        if since.elapsed() >= wait {
+            crate::log!(
+                "kindil: Wi-Fi: the renewed lease wasn't applied within {wait:?}; going on"
+            );
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1252,13 +1318,13 @@ impl Gone {
         match (present, self.said) {
             (true, said) => {
                 if said {
-                    eprintln!("kindil: {INTERFACE} is back; starting {child}");
+                    crate::log!("kindil: {INTERFACE} is back; starting {child}");
                 }
                 self.said = false;
                 false
             }
             (false, false) => {
-                eprintln!("kindil: {INTERFACE} is gone; {child} waits for it");
+                crate::log!("kindil: {INTERFACE} is gone; {child} waits for it");
                 self.said = true;
                 true
             }
@@ -1389,6 +1455,29 @@ mod tests {
         net.kick(Kick::Resumed);
         net.kick(Kick::Saved);
         assert_eq!(new.wait(Duration::ZERO), Some(Kick::Resumed));
+    }
+
+    #[test]
+    fn a_renewal_is_applied_by_the_hooks_marker_from_after_it() {
+        use crate::dhcp::{Leased, Marker};
+        let renewal = Renewal {
+            pid: 812,
+            asked: Duration::from_secs(5_000),
+        };
+        let marker = |secs| {
+            Some(Marker {
+                leased: Leased::Renew,
+                ip: "192.168.1.130".parse().unwrap(),
+                at: Duration::from_secs(secs),
+            })
+        };
+        assert!(!renewal.applied_by(None), "no lease yet");
+        assert!(
+            !renewal.applied_by(marker(4_000)),
+            "the lease before the nap"
+        );
+        assert!(renewal.applied_by(marker(5_000)));
+        assert!(renewal.applied_by(marker(5_001)));
     }
 
     #[test]
