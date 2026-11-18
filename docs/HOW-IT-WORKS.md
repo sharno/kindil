@@ -144,7 +144,11 @@ and a reboot always returns the Kindle to stock.
   - **Low battery**: at 5% and not charging, kindil sleeps with a screen that
     asks for a charge. Suspended, the last few percent last for days; asleep
     on battery it wakes every 6 hours to check, and at 1% powers off, as
-    Amazon's powerd would.
+    Amazon's powerd would. Only the power button or a charger ends this
+    sleep: a charger's plug-in wakes the device seconds before its driver
+    says it is connected, so a wake waits up to 10 s for either and
+    otherwise sleeps on with the screen untouched; with a charger already
+    in, it doesn't sleep at all.
   - **Charging**: the charger charges by itself; kindil pauses it outside
     32-113 °F, powerd's range, and resumes 3 °F back inside.
   - **Crash restart**: the launcher restarts kindil after a crash. After 3

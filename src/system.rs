@@ -125,11 +125,22 @@ pub enum Mode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sleep {
     /// The sleep screen is up; the light is being switched off.
-    DimmingLight,
+    DimmingLight { why: Why },
     /// Waiting for the panel before suspending.
-    Settling { light: Option<Brightness> },
+    Settling { light: Option<Brightness>, why: Why },
     /// Suspended, or about to be.
-    Suspended { light: Option<Brightness> },
+    Suspended { light: Option<Brightness>, why: Why },
+}
+
+/// Why kindil sleeps, which decides what ends the sleep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Why {
+    /// The power button, or the auto-sleep time: any wake but the sleep's
+    /// own battery check wakes the app.
+    Asked,
+    /// [`Event::BatteryEmpty`]: only the power button or a charger ends it,
+    /// and with a charger already in there is no reason to sleep at all.
+    BatteryEmpty,
 }
 
 /// Doze: suspend to RAM between minute updates. E-ink keeps the picture
@@ -153,7 +164,9 @@ pub enum Effect {
     LightOff,
     /// Deliver [`Event::PanelSettled`] after [`PANEL_SETTLE`].
     AwaitPanel,
-    Suspend,
+    /// Suspend for this reason, then deliver [`Event::Resumed`] once the
+    /// sleep ends ([`crate::host::Host::suspend`]).
+    Suspend(Why),
     /// Suspend until the next minute, then deliver [`Event::Resumed`].
     Nap,
     /// Update the screen after a nap, then deliver [`Event::PanelSettled`].
@@ -222,9 +235,16 @@ impl Mode {
             (M::Awake { since }, E::PowerButton) if now.duration_since(since) < WAKING_PRESS => {
                 Err(Ignored::WakingPress)
             }
-            (M::Awake { .. }, E::PowerButton | E::Idle | E::BatteryEmpty) => {
-                to(M::Asleep(Sleep::DimmingLight), FALL_ASLEEP)
-            }
+            (M::Awake { .. }, E::PowerButton | E::Idle) => to(
+                M::Asleep(Sleep::DimmingLight { why: Why::Asked }),
+                FALL_ASLEEP,
+            ),
+            (M::Awake { .. }, E::BatteryEmpty) => to(
+                M::Asleep(Sleep::DimmingLight {
+                    why: Why::BatteryEmpty,
+                }),
+                FALL_ASLEEP,
+            ),
             (M::Awake { .. }, E::Doze) => to(M::Dozing(Doze::DimmingLight), [Effect::LightOff]),
             (M::Dozing(Doze::DimmingLight), E::LightOff(light)) => {
                 to(M::Dozing(Doze::Settling { light }), [Effect::AwaitPanel])
@@ -244,25 +264,33 @@ impl Mode {
                     .chain(doze.napped().then_some(Effect::Reconnect)),
             ),
             // The light is already off, or on its way: LightOff carries its level.
-            (M::Dozing(Doze::DimmingLight), E::BatteryEmpty) => {
-                to(M::Asleep(Sleep::DimmingLight), [Effect::ShowSleep])
-            }
+            (M::Dozing(Doze::DimmingLight), E::BatteryEmpty) => to(
+                M::Asleep(Sleep::DimmingLight {
+                    why: Why::BatteryEmpty,
+                }),
+                [Effect::ShowSleep],
+            ),
             (M::Dozing(Doze::Settling { light } | Doze::Drawing { light }), E::BatteryEmpty) => to(
-                M::Asleep(Sleep::Settling { light }),
+                M::Asleep(Sleep::Settling {
+                    light,
+                    why: Why::BatteryEmpty,
+                }),
                 [Effect::ShowSleep, Effect::AwaitPanel],
             ),
             (M::Dozing(doze), E::Drive(Drive::Computer)) => to(
                 M::UsbDrive,
                 wake(doze.light()).chain([Effect::ReleaseStorage, Effect::ShowUsbDrive]),
             ),
-            (M::Asleep(Sleep::DimmingLight), E::LightOff(light)) => {
-                to(M::Asleep(Sleep::Settling { light }), [Effect::AwaitPanel])
-            }
+            (M::Asleep(Sleep::DimmingLight { why }), E::LightOff(light)) => to(
+                M::Asleep(Sleep::Settling { light, why }),
+                [Effect::AwaitPanel],
+            ),
             // Woken while the light was going off: put it back.
             (M::Awake { .. }, E::LightOff(light)) => to(self, light.map(Effect::RestoreLight)),
-            (M::Asleep(Sleep::Settling { light }), E::PanelSettled) => {
-                to(M::Asleep(Sleep::Suspended { light }), [Effect::Suspend])
-            }
+            (M::Asleep(Sleep::Settling { light, why }), E::PanelSettled) => to(
+                M::Asleep(Sleep::Suspended { light, why }),
+                [Effect::Suspend(why)],
+            ),
             (M::Asleep(sleep), E::PowerButton | E::Resumed) => to(
                 awake,
                 wake(sleep.light()).chain(sleep.suspended().then_some(Effect::Reconnect)),
@@ -315,7 +343,7 @@ impl Mode {
             )
             | (M::Asleep(Sleep::Settling { .. } | Sleep::Suspended { .. }), E::LightOff(_))
             | (
-                M::Asleep(Sleep::DimmingLight | Sleep::Settling { .. }),
+                M::Asleep(Sleep::DimmingLight { .. } | Sleep::Settling { .. }),
                 E::PanelSettled | E::SuspendFailed,
             )
             | (M::Asleep(Sleep::Suspended { .. }), E::PanelSettled)
@@ -338,14 +366,14 @@ impl Mode {
 impl Sleep {
     fn light(self) -> Option<Brightness> {
         match self {
-            Sleep::DimmingLight => None,
-            Sleep::Settling { light } | Sleep::Suspended { light } => light,
+            Sleep::DimmingLight { .. } => None,
+            Sleep::Settling { light, .. } | Sleep::Suspended { light, .. } => light,
         }
     }
 
     fn suspended(self) -> bool {
         match self {
-            Sleep::DimmingLight | Sleep::Settling { .. } => false,
+            Sleep::DimmingLight { .. } | Sleep::Settling { .. } => false,
             Sleep::Suspended { .. } => true,
         }
     }
@@ -959,7 +987,7 @@ mod tests {
                 Effect::ShowSleep,
                 Effect::LightOff,
                 Effect::AwaitPanel,
-                Effect::Suspend,
+                Effect::Suspend(Why::Asked),
                 Effect::Wake,
                 Effect::RestoreLight(light),
                 Effect::Reconnect,
@@ -977,7 +1005,7 @@ mod tests {
             (Event::PanelSettled, 11_600),
         ]);
         assert!(matches!(mode, Mode::Awake { .. }));
-        assert!(!effects.contains(&Effect::Suspend));
+        assert!(!effects.contains(&Effect::Suspend(Why::Asked)));
         assert_eq!(effects.last(), Some(&Effect::RestoreLight(light)));
     }
 
@@ -995,7 +1023,7 @@ mod tests {
     #[test]
     fn idle_sleeps_like_a_press() {
         let (mode, _) = run(&[(Event::Idle, 10_000)]);
-        assert_eq!(mode, Mode::Asleep(Sleep::DimmingLight));
+        assert_eq!(mode, Mode::Asleep(Sleep::DimmingLight { why: Why::Asked }));
     }
 
     #[test]
@@ -1054,7 +1082,12 @@ mod tests {
     fn an_empty_battery_sleeps_from_awake_or_dozing() {
         let light = Brightness::new(40);
         let (mode, effects) = run(&[(Event::BatteryEmpty, 10_000)]);
-        assert_eq!(mode, Mode::Asleep(Sleep::DimmingLight));
+        assert_eq!(
+            mode,
+            Mode::Asleep(Sleep::DimmingLight {
+                why: Why::BatteryEmpty
+            })
+        );
         assert_eq!(effects, FALL_ASLEEP);
         let (mode, effects) = run(&[
             (Event::Doze, 10_000),
@@ -1065,7 +1098,13 @@ mod tests {
             (Event::BatteryEmpty, 12_500),
             (Event::PanelSettled, 14_000),
         ]);
-        assert_eq!(mode, Mode::Asleep(Sleep::Suspended { light: Some(light) }));
+        assert_eq!(
+            mode,
+            Mode::Asleep(Sleep::Suspended {
+                light: Some(light),
+                why: Why::BatteryEmpty
+            })
+        );
         assert_eq!(
             effects,
             [
@@ -1075,7 +1114,7 @@ mod tests {
                 Effect::Redraw,
                 Effect::ShowSleep,
                 Effect::AwaitPanel,
-                Effect::Suspend,
+                Effect::Suspend(Why::BatteryEmpty),
             ]
         );
     }
