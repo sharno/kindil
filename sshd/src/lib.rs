@@ -968,7 +968,9 @@ impl russh::server::Handler for Connection {
                 *pending = size;
             }
             if let Some(master) = &chan.master {
-                let _ = master.resize(size);
+                if let Err(error) = master.resize(size) {
+                    noise(format_args!("{}: resizing a terminal: {error}", self.peer));
+                }
             }
         }
         Ok(())

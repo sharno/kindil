@@ -275,33 +275,21 @@ async fn gives_a_shell_its_terminal_and_its_size() {
         .unwrap();
     channel.request_shell(true).await.unwrap();
     let mut seen = String::new();
+    // The prompt, set apart from the line's own echo by the quotes.
     channel
-        .data(&b"echo \"[$TERM]\"; stty size; tty\n"[..])
+        .data(&b"PS1='ki''ndil$ '; echo \"[$TERM]\"; stty size; tty\n"[..])
         .await
         .unwrap();
     read_until(&mut channel, &mut seen, "[xterm-test]").await;
     read_until(&mut channel, &mut seen, "24 80").await;
     read_until(&mut channel, &mut seen, "/dev/").await;
+    // Resized only once the shell waits at its prompt: readline (bash's,
+    // macOS's /bin/sh) reads the size and writes it back as it sets up
+    // the terminal for each line, so a resize landing in between is
+    // undone, whatever the server. Once it has prompted, nothing does.
+    read_until(&mut channel, &mut seen, "kindil$ ").await;
     channel.window_change(100, 30, 0, 0).await.unwrap();
-    // The shell may read its next line before the resize reaches the
-    // terminal: ask until it reports the new size.
-    let since = std::time::Instant::now();
-    while !seen.contains("30 100") {
-        // As long as the other reads here: a loaded machine can be slow.
-        assert!(
-            since.elapsed() < Duration::from_secs(20),
-            "never resized: {seen}"
-        );
-        channel.data(&b"stty size\n"[..]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        while let Ok(Some(msg)) =
-            tokio::time::timeout(Duration::from_millis(100), channel.wait()).await
-        {
-            if let ChannelMsg::Data { data } = msg {
-                seen.push_str(&String::from_utf8_lossy(&data));
-            }
-        }
-    }
+    // Handled before the line typed after it: the next command sees it.
     channel.data(&b"stty size; exit 7\n"[..]).await.unwrap();
     let rest = collect(&mut channel).await;
     assert!(rest.stdout().contains("30 100"), "{seen}{}", rest.stdout());
