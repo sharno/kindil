@@ -20,6 +20,8 @@ pub struct Device {
     target: String,
     key: Option<PathBuf>,
     port: Option<u16>,
+    /// The emulator's guest: each instance has a host key of its own.
+    throwaway_host_key: bool,
 }
 
 impl Device {
@@ -34,7 +36,23 @@ impl Device {
             ),
             Err(_) => None,
         };
-        Ok(Self { target, key, port })
+        Ok(Self {
+            target,
+            key,
+            port,
+            throwaway_host_key: false,
+        })
+    }
+
+    /// The emulated Kindle (xtask/src/emulate.rs): root on a local port,
+    /// with the emulator's key, whose host key isn't kept.
+    pub fn emulator(port: u16, key: PathBuf) -> Self {
+        Self {
+            target: "root@127.0.0.1".into(),
+            key: Some(key),
+            port: Some(port),
+            throwaway_host_key: true,
+        }
     }
 
     fn options(&self) -> Vec<String> {
@@ -46,6 +64,15 @@ impl Device {
         ];
         if let Some(port) = self.port {
             options.extend(["-p".into(), port.to_string()]);
+        }
+        if self.throwaway_host_key {
+            for option in [
+                "StrictHostKeyChecking=no",
+                "UserKnownHostsFile=/dev/null",
+                "LogLevel=ERROR",
+            ] {
+                options.extend(["-o".into(), option.into()]);
+            }
         }
         if let Some(key) = &self.key {
             options.extend([
@@ -232,6 +259,7 @@ mod tests {
             target: "root@kindle".into(),
             key: Some("/k/id".into()),
             port: Some(2222),
+            throwaway_host_key: false,
         };
         let command = device.ssh("uptime");
         assert_eq!(command.get_program(), "ssh");
@@ -246,6 +274,7 @@ mod tests {
             target: "root@kindle".into(),
             key: None,
             port: None,
+            throwaway_host_key: false,
         };
         assert_eq!(
             args(&device.ssh("true")),

@@ -186,6 +186,91 @@ Restart and Power off also come back to Amazon's UI on the next boot.
 If kindil ever stops responding: SSH in and `killall kindil` (the launcher then
 restarts Amazon's UI), or hold the power button for about 20 s to reboot.
 
+## Emulator
+
+`cargo xtask emulate` runs kindil on an emulated PW1:
+[katadelos/eink-emulator](https://github.com/katadelos/eink-emulator), a
+QEMU with the PW1's board (`imx50-celeste`), booting the PW1's own kernel
+(2.6.31) and system partition. It is the device's software on emulated
+hardware: upstart and Amazon's boot, the jobs kindil's launcher stops and
+restores, KUAL's way in (`start.sh`), the boot job and a standalone boot,
+the EPDC display driver and its update ioctls, the cyttsp touchscreen, the
+AR6003 Wi-Fi driver with kindil's own wpa_supplicant and DHCP, kindil's SSH
+server, and the battery, charger and front-light sysfs files.
+
+Nothing of it lives in this repo, and no firmware does: it comes from your
+own PW1. You need
+
+- the emulator's checkout with its QEMU built (`./eink build`; it needs
+  Python 3.10+, Ninja, Meson, GLib, pixman, dtc and e2fsprogs: with Nix,
+  a shell with `python3 ninja meson pkg-config glib pixman dtc bison flex`
+  and `e2fsprogs.bin` builds it on macOS; e2fsprogs's development headers
+  break QEMU's Cocoa window there);
+- a firmware directory, outside the repo, with the PW1's kernel `uImage`
+  (from the eMMC at 0x41000: its 64-byte header, then the size it gives),
+  `rootfs.img` (mmcblk0p1, raw ext3), and a bootloader. No PW1 update
+  carries U-Boot: put the device's own there as `u-boot.bin` if you have it,
+  or build upstream barebox, which supports the PW1 as EY21. It needs Linux
+  (macOS's case-insensitive disk can't even check it out; a container
+  does):
+
+  ```sh
+  git clone --depth 1 https://github.com/barebox/barebox && cd barebox
+  make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- kindle-mx50_defconfig
+  make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf-
+  cp images/barebox-kindle-ey21.img "$KINDIL_EMULATOR_FIRMWARE"/
+  ```
+
+  The kernel doesn't boot without one: it needs Lab126's ATAGs (board ID,
+  serial) and the DDR type U-Boot leaves in the DDR controller, or its idle
+  loop calls a function it never set up. barebox passes the ATAGs from the
+  emulated IDME; it can't read the emulated eMMC (its DMA reads come back
+  empty), so QEMU puts the kernel in RAM at every reset and xtask tells
+  barebox, over the serial console, to set the DDR type and boot it.
+  Never copy the device's `/var/local` (mmcblk0p3) into the emulator: it
+  holds your Wi-Fi passwords and keys. The emulator gives the guest a fresh
+  one, and a synthetic serial number and MAC.
+
+```sh
+export KINDIL_EINK_EMULATOR=~/src/eink-emulator
+export KINDIL_EMULATOR_FIRMWARE=~/kindle-firmware/pw1   # uImage, rootfs.img, bootloader
+cargo xtask emulate setup        # the instance, from the firmware directory
+cargo xtask emulate run          # boot it (headless; --window to see and click it)
+cargo xtask emulate install      # build kindil and install it, with example settings
+ssh -i "$KINDIL_EINK_EMULATOR/build/ssh/id_ed25519" -p 4122 root@127.0.0.1 \
+  /mnt/us/extensions/kindil/bin/start.sh
+cargo xtask emulate tap 379 500                # a finger at panel pixel (x, y), 758 × 1024
+cargo xtask emulate screenshot dist/emulator/now.png
+cargo xtask emulate stop
+cargo xtask emulate test         # all of it from a clean instance, then a standalone boot
+```
+
+Without the two variables every task says so and does nothing, so CI and
+other computers are unaffected. `install` adds what a first start needs
+where it isn't there yet: `examples/miqat.toml` and `examples/kindil.toml`,
+the emulator's open access point `Kindle-QEMU` in kindil's saved networks,
+the emulator's key in USBNetwork's `authorized_keys` (which seeds kindil's
+SSH server's), and "sleep when idle: never" (see below). Ports: 4122 is
+SSH over USB, 4123 the emulator's SSH over Wi-Fi, 4124 kindil's SSH server
+over Wi-Fi (`KINDIL_EMULATOR_SSH_PORT` moves all three). After the guest
+reboots itself (Settings → Power → Restart), `cargo xtask emulate boot`
+takes barebox through the boot again. `test` leaves its screenshots in
+`dist/emulator/`.
+
+What it doesn't cover, of what kindil touches:
+
+| kindil uses | In the emulator |
+|---|---|
+| The panel's look: waveforms, ghosting, partial-update artefacts | Synthetic waveforms; the screenshot is the framebuffer, not the ink |
+| Power button (`yoshibutton` uevents) | Never arrives: the press reaches the emulated PMIC, whose interrupt for it the PW1's kernel leaves masked |
+| Battery gauge (`yoshi_battery`) | Fixed: 80 %, 77 °F, 3.9 V, 0 mA; low battery, the 1 % power-off and the charging temperature limits can't be reached |
+| Charger (`aplite_charger.0/connected`, `charging`) | Always connected and charging (the USB link holds VBUS): no unplug, no plug-in wake |
+| Front light (`fl_tps6116x`) | The file takes the level; there is no light |
+| Suspend to RAM (`/sys/power/state`) and the `rtc1` alarm | Doze's naps suspend (the CPU waits in the kernel's iRAM suspend code) and the PMIC's alarm is raised and taken, but USB networking didn't come back: the kernel disabled the USB controller's interrupt (`irq 18: nobody cared`), SSH stayed unreachable, and QEMU later exited on its own. Doze and sleep are therefore off in `install`'s settings |
+| USB drive mode (the gadget's `lun0`, volumd) | The emulator swaps the storage gadget for USB Ethernet: no drive mode |
+| Wi-Fi security, kindil's own WPA2 offload (`/var/local/kindil/wifi`) | Only the open `Kindle-QEMU` network: no WPA, no signal changes |
+| Real time and battery life | QEMU's clock follows the computer's; nothing measures power |
+
 ## Releasing
 
 To release: bump `version` in `Cargo.toml`, commit, then publish a GitHub

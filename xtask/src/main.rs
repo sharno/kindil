@@ -4,6 +4,7 @@
 //! tasks use the flake's toolchains, as `nix develop` provides them.
 mod dev;
 mod device;
+mod emulate;
 mod release;
 mod verify;
 
@@ -64,6 +65,9 @@ enum Task {
         hours: u64,
         command: Vec<String>,
     },
+    /// kindil on an emulated PW1 (eink-emulator; see docs/DEVELOP.md#emulator)
+    #[command(subcommand)]
+    Emulate(emulate::Emulate),
 }
 
 fn root() -> PathBuf {
@@ -103,5 +107,6 @@ fn main() -> anyhow::Result<()> {
             args,
         } => dev::run_on_device(&script, deadline, &args),
         Task::Wait { hours, command } => dev::wait(hours, &command),
+        Task::Emulate(task) => emulate::emulate(task),
     }
 }

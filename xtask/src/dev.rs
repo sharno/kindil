@@ -237,7 +237,11 @@ pub fn desktop() -> anyhow::Result<()> {
 /// copy never runs a stale binary.
 pub fn deploy() -> anyhow::Result<()> {
     let binary = device()?;
-    let device = Device::from_env()?;
+    install_files(&Device::from_env()?, &binary)
+}
+
+/// The launcher files, then `binary`, into /mnt/us/extensions/kindil.
+pub fn install_files(device: &Device, binary: &Path) -> anyhow::Result<()> {
     let launcher = Path::new("kindle/extensions/kindil");
     let files: Vec<PathBuf> = walk(launcher)?;
     device.run("mkdir -p /mnt/us/extensions/kindil /mnt/us/kindil")?;
@@ -250,7 +254,7 @@ pub fn deploy() -> anyhow::Result<()> {
     }
     // Staged aside, then moved over the old one in a single step.
     device.run("mkdir -p /mnt/us/extensions/kindil/bin.new")?;
-    device.put(&[&binary], "/mnt/us/extensions/kindil/bin.new")?;
+    device.put(&[binary], "/mnt/us/extensions/kindil/bin.new")?;
     print!(
         "{}",
         device.run(
