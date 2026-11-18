@@ -398,25 +398,15 @@ impl Host for KindleHost {
         self.released.notify();
     }
 
-    fn suspend(&self) -> anyhow::Result<()> {
-        let recorder = crate::flight::Recorder::device();
-        loop {
-            // A nap's alarm must not wake a sleep the user asked for; on
-            // battery, a check of its own every few hours does (src/power.rs).
-            let check = (!plugged().unwrap_or(false)).then_some(crate::power::CHECK_ASLEEP);
-            let due = check.map(|after| epoch_seconds() + after.as_secs() as i64);
-            // The user asked for this sleep: without its check's alarm it
-            // still sleeps, until the button, rather than stay up.
-            sleep_once(&recorder, "sleep", check.map(Alarm::Wanted))?;
-            let now = epoch_seconds();
-            if !due.is_some_and(|due| crate::power::alarm_woke(due, now)) {
-                // The power button: the app wakes.
-                return Ok(());
-            }
-            let battery = gauge_battery()?;
-            if crate::power::critical(battery) {
-                crate::log!("kindil: battery critical ({battery:?}); powering off");
-                return self.power_off();
+    fn suspend(&self, why: crate::system::Why) -> anyhow::Result<()> {
+        let device = Sleeping {
+            recorder: crate::flight::Recorder::device(),
+        };
+        match crate::power::sleep(&device, why)? {
+            crate::power::Slept::Woken | crate::power::Slept::Charging => Ok(()),
+            crate::power::Slept::Critical => {
+                crate::log!("kindil: battery critical; powering off");
+                self.power_off()
             }
         }
     }
@@ -485,6 +475,42 @@ impl Host for KindleHost {
 
     fn locate_by_ip(&self) -> anyhow::Result<crate::location::Place> {
         crate::location::Lookup::default().locate()
+    }
+}
+
+/// The power button's presses since kindil started, counted by its listener
+/// ([`power_button`]): a wake from the battery's sleep tells the button from
+/// a charger by it.
+static PRESSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The device under a sleep (src/power.rs).
+struct Sleeping {
+    recorder: crate::flight::Recorder,
+}
+
+impl crate::power::Sleeper for Sleeping {
+    fn plugged(&self) -> bool {
+        plugged().unwrap_or(false)
+    }
+    fn presses(&self) -> u64 {
+        PRESSES.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// The user asked for the sleep, or the battery did: without its
+    /// check's alarm it still sleeps, until the button, rather than stay up.
+    fn suspend(&self, alarm: Option<Duration>) -> anyhow::Result<()> {
+        sleep_once(&self.recorder, "sleep", alarm.map(Alarm::Wanted))
+    }
+    fn now(&self) -> i64 {
+        epoch_seconds()
+    }
+    fn battery(&self) -> anyhow::Result<Battery> {
+        gauge_battery()
+    }
+    fn wait(&self, time: Duration) {
+        std::thread::sleep(time);
+    }
+    fn note(&self, line: &str) {
+        self.recorder.note(line);
     }
 }
 
@@ -600,6 +626,7 @@ fn power_button(pressed: impl Fn()) -> std::io::Result<()> {
     let listener = crate::uevent::Listener::open()?;
     loop {
         if is_power_button(&listener.next()?) {
+            PRESSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             pressed();
         }
     }

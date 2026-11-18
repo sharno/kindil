@@ -222,8 +222,10 @@ pub trait Host: Send + Sync {
     /// A line for the device's flight recorder (src/flight.rs): how each
     /// doze wake ended. Nothing elsewhere.
     fn note(&self, _line: &str) {}
-    /// Suspends to RAM; returns once the device is awake again.
-    fn suspend(&self) -> anyhow::Result<()>;
+    /// Suspends to RAM for this reason; returns once the app should wake
+    /// (see [`crate::power::sleep`]). For an empty battery it returns at
+    /// once, without suspending, if a charger is in.
+    fn suspend(&self, why: crate::system::Why) -> anyhow::Result<()>;
     /// Suspends to RAM with a timed wake at `until` (on the wall clock, taken
     /// right before arming); returns once awake, by the timer or the power
     /// button. An error means it didn't suspend.
@@ -284,6 +286,8 @@ struct SimulatedState {
     /// Naps fail as when the wake alarm can't be armed; how many did.
     refuse_naps: bool,
     refused_naps: u32,
+    /// A charger is plugged in during the next suspend.
+    plug_in_asleep: bool,
 }
 
 /// The Simulated device's place search: well-known public places.
@@ -375,6 +379,7 @@ impl Default for Simulated {
                 clock_off: None,
                 refuse_naps: false,
                 refused_naps: 0,
+                plug_in_asleep: false,
             }),
         }
     }
@@ -399,6 +404,12 @@ impl Simulated {
 
     pub fn set_battery(&self, battery: Battery) {
         self.with(|s| s.battery = battery);
+    }
+
+    /// From now on a charger is plugged in while the device sleeps: the
+    /// suspend ends charging.
+    pub fn plug_in_asleep(&self) {
+        self.with(|s| s.plug_in_asleep = true);
     }
 
     pub fn set_charge(&self, charge: crate::drain::MilliampHours) {
@@ -579,11 +590,31 @@ impl Host for Simulated {
     }
     /// Tests deliver events themselves.
     fn listen(&self, _: Deliver) {}
-    /// Wakes at once, as if the power button were pressed right away.
-    fn suspend(&self) -> anyhow::Result<()> {
+    /// Wakes at once, as if the power button were pressed right away, or
+    /// by a charger plugged in while asleep ([`Simulated::plug_in_asleep`]).
+    /// Like the device, it doesn't sleep for an empty battery while charging.
+    fn suspend(&self, why: crate::system::Why) -> anyhow::Result<()> {
         self.with(|s| {
+            let charging = matches!(
+                s.battery,
+                Battery::Known {
+                    charge: crate::battery::Charge::Charging,
+                    ..
+                }
+            );
+            if why == crate::system::Why::BatteryEmpty && charging {
+                return;
+            }
             s.suspends += 1;
             s.parked_naps += u32::from(s.parked);
+            if s.plug_in_asleep {
+                if let Battery::Known { percent, .. } = s.battery {
+                    s.battery = Battery::Known {
+                        percent,
+                        charge: crate::battery::Charge::Charging,
+                    };
+                }
+            }
         });
         Ok(())
     }
