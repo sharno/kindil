@@ -1384,6 +1384,7 @@ impl Ctx {
                 let mut ledger = DozeLedger::new(now, None);
                 // Wi-Fi is up until the first nap parks it.
                 ledger.wifi_on(now);
+                ledger.dhcp(crate::dhcpc::counts());
                 *lock(&self.ledger) = ledger;
                 let ledger = self.ledger.clone();
                 self.background(
@@ -1401,7 +1402,11 @@ impl Ctx {
         let ledger = self.ledger.clone();
         self.background(
             |host| host.info().charge,
-            move |_, charge| eprintln!("kindil: {}", lock(&ledger).close(now, charge)),
+            move |_, charge| {
+                let mut ledger = lock(&ledger);
+                ledger.dhcp(crate::dhcpc::counts());
+                eprintln!("kindil: {}", ledger.close(now, charge));
+            },
         );
     }
 

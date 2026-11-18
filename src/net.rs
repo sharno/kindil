@@ -15,6 +15,14 @@
 //! (src/station.rs) joins through the driver's wireless extensions, beside
 //! the same udhcpc. If it gives up, it falls back to wpa_supplicant for the
 //! rest of the run.
+//!
+//! Behind another switch ([`dhcpc::SWITCH`] saying `kindil`), each start
+//! runs kindil's own DHCP client (src/dhcpc.rs), a thread, in place of
+//! udhcpc and its hook, with either Wi-Fi. Its leases prove kindil's own
+//! Wi-Fi's joins as udhcpc's markers did; a resume on the same network
+//! keeps the lease without a DHCP exchange until T1; Off gives the lease
+//! back. If it can't start, udhcpc runs for that start.
+use crate::dhcpc;
 use crate::host::{Power, Signal};
 use crate::station::{self, Kick};
 use crate::wext::{self, Bss, Driver};
@@ -124,6 +132,8 @@ pub struct Net {
     lease_for: Mutex<Option<(u32, String)>>,
     /// The running udhcpc, and since when.
     dhcp: Mutex<Option<(Child, Instant)>>,
+    /// kindil's own DHCP client, in udhcpc's place, while it runs.
+    client: Mutex<Option<dhcpc::Client>>,
     /// Left the network for a doze or a sleep ([`Net::park`]); a reconnect,
     /// a start, or new networks join again.
     parked: AtomicBool,
@@ -145,6 +155,7 @@ impl Default for Net {
             scans: AtomicU64::new(0),
             lease_for: Mutex::new(None),
             dhcp: Mutex::new(None),
+            client: Mutex::new(None),
             parked: AtomicBool::new(false),
         }
     }
@@ -306,7 +317,32 @@ impl Net {
             anyhow::ensure!(since.elapsed() < JOIN_WAIT, "no access point joined");
             std::thread::sleep(Duration::from_millis(100));
         }
-        renew_dhcp()
+        self.renew()
+    }
+
+    /// After a join or a resume with wpa_supplicant: udhcpc renews the
+    /// lease now; kindil's own client keeps it until T1 if it is for this
+    /// network, and asks afresh if not.
+    fn renew(&self) -> anyhow::Result<()> {
+        match lock(&self.client).as_ref() {
+            Some(client) => {
+                client.request(current_network());
+                Ok(())
+            }
+            None => renew_dhcp(),
+        }
+    }
+
+    /// Before joining `ssid` for Settings: kindil's own client gives back
+    /// the lease of the network it is leaving, while still on it.
+    fn leaving_for(&self, ssid: &str) {
+        let client = lock(&self.client);
+        let Some(client) = client.as_ref().filter(|c| c.lease().is_some()) else {
+            return;
+        };
+        if current_network().is_some_and(|on| on.ssid != ssid) {
+            client.give_back();
+        }
     }
 
     // Below, `lifecycle` is held by the caller.
@@ -319,7 +355,8 @@ impl Net {
             }
             Power::Off => {
                 std::fs::write(OFF_FLAG, b"")?;
-                self.stop();
+                // Off gives the lease back first, while still on the network.
+                self.end(true);
                 // Off means no Wi-Fi at all, Amazon's included.
                 clear_slate();
                 Ok(())
@@ -349,6 +386,9 @@ impl Net {
             .first()
             .map(|c| c.ssid().as_str().to_owned())
             .ok_or_else(|| anyhow::anyhow!("no network to join"))?;
+        if self.power() == Power::On {
+            self.leaving_for(&ssid);
+        }
         match self.power() {
             Power::Off => self.switch(Power::On, candidate)?,
             Power::On => self.give(candidate)?,
@@ -373,7 +413,7 @@ impl Net {
         while since.elapsed() < TRY_WAIT {
             if matches!(wpa.link(), Ok(Link::Associated { ssid: ref joined, .. }) if *joined == ssid)
             {
-                return renew_dhcp();
+                return self.renew();
             }
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -525,7 +565,24 @@ impl Net {
                 std::thread::spawn(move || station::keep(&keep));
             }
         }
-        self.supervise_dhcp(generation)?;
+        let switch = std::fs::read_to_string(dhcpc::SWITCH).ok();
+        let started = dhcpc::chosen(switch.as_deref()).then(|| {
+            dhcpc::Client::start(INTERFACE, std::path::Path::new(dhcpc::RESOLV)).inspect_err(
+                |error| eprintln!("kindil: DHCP: kindil's own client: {error}; udhcpc instead"),
+            )
+        });
+        match started {
+            Some(Ok(client)) => {
+                eprintln!("kindil: DHCP: kindil's own client ({})", dhcpc::SWITCH);
+                if self.backend() == Backend::Supplicant {
+                    // wpa_supplicant joins by itself: ask at once, as udhcpc
+                    // would; a join or a resume asks again.
+                    client.request(None);
+                }
+                *lock(&self.client) = Some(client);
+            }
+            _ => self.supervise_dhcp(generation)?,
+        }
         *lock(&self.power) = Power::On;
         Ok(())
     }
@@ -693,10 +750,22 @@ impl Net {
         Ok(pid)
     }
 
-    /// For kindil's own Wi-Fi, `lifecycle` held: a lease for `ssid`, by the
-    /// udhcpc that holds it renewing, or else by a fresh udhcpc.
-    fn ask_lease(&self, ssid: &str) -> anyhow::Result<station::Ticket> {
+    /// For kindil's own Wi-Fi, `lifecycle` held: a lease for `ssid` on
+    /// `bssid`. kindil's own client answers by the request's number; else
+    /// the udhcpc that holds it renews, or a fresh udhcpc asks.
+    fn ask_lease(&self, ssid: &str, bssid: [u8; 6]) -> anyhow::Result<station::Ticket> {
         let since = crate::dhcp::monotonic();
+        if let Some(client) = lock(&self.client).as_ref() {
+            let ask = client.request(Some(dhcpc::machine::Network {
+                ssid: ssid.to_owned(),
+                bssid,
+            }));
+            return Ok(station::Ticket {
+                pid: ask,
+                since,
+                renew: false,
+            });
+        }
         let pid = self.dhcp_pid();
         let held = lock(&self.lease_for).clone();
         if let (Some(pid), Some((holder, network))) = (pid, held) {
@@ -721,13 +790,34 @@ impl Net {
         })
     }
 
+    /// The lease answering ticket `pid`, from kindil's own client or from
+    /// udhcpc `pid`'s hook.
+    fn marker(&self, pid: u32) -> Option<crate::dhcp::Marker> {
+        match lock(&self.client).as_ref() {
+            Some(client) => client.marker(pid),
+            None => crate::dhcp::marker(pid),
+        }
+    }
+
     /// kindil's stack down; never fails halfway into a state On can't
     /// recover from.
     fn stop(&self) {
+        self.end(false);
+    }
+
+    /// `stop`, giving the lease back first if `release`.
+    fn end(&self, release: bool) {
         // Its children now exit for good, and its keeper stops.
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.kicked.notify_all();
         *lock(&self.power) = Power::Off;
+        if let Some(client) = lock(&self.client).take() {
+            if release {
+                client.release();
+            } else {
+                client.stop();
+            }
+        }
         if let Some((mut child, _)) = lock(&self.dhcp).take() {
             end(&mut child);
         }
@@ -841,12 +931,12 @@ impl station::Context for Keep {
 }
 
 impl station::Dhcp for Keep {
-    fn ask(&self, ssid: &str) -> Option<Result<station::Ticket, String>> {
-        self.guarded(|net| net.ask_lease(ssid).map_err(|e| format!("{e:#}")))
+    fn ask(&self, ssid: &str, bssid: [u8; 6]) -> Option<Result<station::Ticket, String>> {
+        self.guarded(|net| net.ask_lease(ssid, bssid).map_err(|e| format!("{e:#}")))
     }
 
     fn marker(&self, pid: u32) -> Option<crate::dhcp::Marker> {
-        crate::dhcp::marker(pid)
+        self.net.marker(pid)
     }
 
     fn address(&self) -> Option<std::net::Ipv4Addr> {
@@ -862,12 +952,12 @@ impl station::Dhcp for Keep {
 struct Locked<'a>(&'a Net);
 
 impl station::Dhcp for Locked<'_> {
-    fn ask(&self, ssid: &str) -> Option<Result<station::Ticket, String>> {
-        Some(self.0.ask_lease(ssid).map_err(|e| format!("{e:#}")))
+    fn ask(&self, ssid: &str, bssid: [u8; 6]) -> Option<Result<station::Ticket, String>> {
+        Some(self.0.ask_lease(ssid, bssid).map_err(|e| format!("{e:#}")))
     }
 
     fn marker(&self, pid: u32) -> Option<crate::dhcp::Marker> {
-        crate::dhcp::marker(pid)
+        self.0.marker(pid)
     }
 
     fn address(&self) -> Option<std::net::Ipv4Addr> {
@@ -933,6 +1023,14 @@ fn own_link() -> anyhow::Result<(Link, Option<Signal>)> {
         },
         signal,
     ))
+}
+
+/// The network the driver is on now, whichever Wi-Fi joined it.
+fn current_network() -> Option<dhcpc::machine::Network> {
+    let socket = wext::Socket::open(INTERFACE).ok()?;
+    let bssid = socket.bssid().ok()??;
+    let ssid = String::from_utf8_lossy(&socket.essid().ok()?).into_owned();
+    Some(dhcpc::machine::Network { ssid, bssid })
 }
 
 /// Amazon's Wi-Fi jobs, if anything started them, and any wpa_supplicant or
@@ -1262,7 +1360,7 @@ mod tests {
         assert_eq!(keep.joined("Home"), None);
         assert_eq!(keep.scanned(Ok(vec![])), None);
         assert_eq!(keep.proven(&ticket, "Home"), None);
-        assert_eq!(keep.ask("Home"), None);
+        assert_eq!(keep.ask("Home", [2, 0, 0, 0, 0, 1]), None);
         assert!(keep.with(|_, _| ()).is_none());
         assert_eq!(net.joins.load(Ordering::SeqCst), 1);
         assert_eq!(net.scans.load(Ordering::SeqCst), 1);

@@ -542,6 +542,9 @@ pub struct DozeLedger {
     /// the network.
     clock_rtc: (u32, chrono::TimeDelta),
     clock_net: (u32, chrono::TimeDelta),
+    /// kindil's own DHCP client's counts when the ledger began, and last
+    /// heard ([`DozeLedger::dhcp`]).
+    dhcp: Option<(crate::dhcpc::Counts, crate::dhcpc::Counts)>,
 }
 
 impl DozeLedger {
@@ -569,7 +572,15 @@ impl DozeLedger {
             held_from: None,
             clock_rtc: (0, chrono::TimeDelta::zero()),
             clock_net: (0, chrono::TimeDelta::zero()),
+            dhcp: None,
         }
+    }
+
+    /// kindil's own DHCP client's counts now (src/dhcpc.rs): the first
+    /// call is where the ledger's count starts.
+    pub fn dhcp(&mut self, counts: crate::dhcpc::Counts) {
+        let from = self.dhcp.map_or(counts, |(from, _)| from);
+        self.dhcp = Some((from, counts));
     }
 
     /// The clock was stepped.
@@ -742,12 +753,26 @@ impl DozeLedger {
             (_, 0) => "none".to_string(),
             (sum, n) => format!("{} mA", sum / i64::from(n)),
         };
+        let dhcp = match self.dhcp {
+            Some((from, to)) => {
+                let exchanges = to.exchanges.saturating_sub(from.exchanges);
+                let rate = match over.num_seconds() {
+                    s if s > 0 => exchanges as f64 * 3600.0 / s as f64,
+                    _ => 0.0,
+                };
+                format!(
+                    ", DHCP {exchanges} exchanges ({rate:.1} an hour, {} messages)",
+                    to.packets.saturating_sub(from.packets)
+                )
+            }
+            None => String::new(),
+        };
         let line = format!(
             "doze ledger over {} min: awake {:.0} s in {} wakes ({:.1} s each, {} online; \
              {} ticks {:.2} s each, {} full {:.2} s each), asleep {:.0} s (monotonic {} s), \
              Wi-Fi up {:.0} s, held awake {:.0} s ({} maintenance windows, {:.0} s for SSH), \
              panel done {} / timed {} / not seen {}, gauge {used}, current at wake {current}, \
-             clock corrected {} times by the RTC ({:+.1} s) and {} by the network ({:+.1} s)",
+             clock corrected {} times by the RTC ({:+.1} s) and {} by the network ({:+.1} s){dhcp}",
             over.num_minutes(),
             seconds(self.awake),
             self.wakes,
@@ -771,13 +796,15 @@ impl DozeLedger {
             self.clock_net.0,
             seconds(self.clock_net.1),
         );
-        let (awake_from, napping_from, wifi_from, redraw) = (
+        let (awake_from, napping_from, wifi_from, redraw, dhcp) = (
             self.awake_from,
             self.napping_from,
             self.wifi_from,
             self.redraw,
+            self.dhcp,
         );
         *self = Self::new(now, gauge.or(self.gauge));
+        self.dhcp = dhcp.map(|(_, to)| (to, to));
         self.awake_from = awake_from.map(|_| now);
         self.redraw = redraw;
         self.napping_from = napping_from;
@@ -1225,6 +1252,25 @@ mod tests {
         let line = ledger.close(t0 + secs(7200), None);
         assert!(line.contains("awake 0 s in 0 wakes"), "{line}");
         assert!(line.contains("no gauge, current at wake none"), "{line}");
+    }
+
+    #[test]
+    fn the_ledger_counts_dhcp_exchanges_an_hour() {
+        use crate::dhcpc::Counts;
+        let t0 = wall(1, 0, 0);
+        let mut ledger = DozeLedger::new(t0, None);
+        let counts = |exchanges, packets| Counts { exchanges, packets };
+        ledger.dhcp(counts(5, 9));
+        ledger.dhcp(counts(6, 11));
+        let line = ledger.close(t0 + chrono::TimeDelta::minutes(30), None);
+        assert!(
+            line.ends_with(", DHCP 1 exchanges (2.0 an hour, 2 messages)"),
+            "{line}"
+        );
+        // The next ledger counts from there.
+        ledger.dhcp(counts(6, 11));
+        let line = ledger.close(t0 + chrono::TimeDelta::minutes(90), None);
+        assert!(line.ends_with(", DHCP 0 exchanges (0.0 an hour, 0 messages)"));
     }
 
     #[test]

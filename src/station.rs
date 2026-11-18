@@ -423,8 +423,9 @@ pub fn networks(seen: &[Bss]) -> Vec<Network> {
     networks
 }
 
-/// A request for a lease: the udhcpc that has to answer it, since when,
-/// and whether a renew of a lease it holds may answer too.
+/// A request for a lease: the udhcpc that has to answer it (or, with
+/// kindil's own DHCP client, the request's number), since when, and
+/// whether a renew of a lease it holds may answer too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ticket {
     pub pid: u32,
@@ -432,7 +433,8 @@ pub struct Ticket {
     pub renew: bool,
 }
 
-/// The address: kindil's udhcpc and its hook (src/dhcp.rs). A lease taken
+/// The address: kindil's udhcpc and its hook (src/dhcp.rs), or kindil's
+/// own DHCP client (src/dhcpc.rs). A lease taken
 /// after a join proves the join: no DHCP exchange gets through without the
 /// keys, while a wrong password can still associate for a few seconds
 /// before the access point gives up on the handshake.
@@ -440,12 +442,14 @@ pub struct Ticket {
 /// `None` from any of these: the stack that asked is no longer the one
 /// running.
 pub trait Dhcp {
-    /// A lease for `ssid`, now. The udhcpc that holds `ssid`'s lease (by
-    /// [`Dhcp::proven`]) is asked to renew it; for any other network, or
-    /// without one, udhcpc is started afresh and the ticket names the new
-    /// one.
-    fn ask(&self, ssid: &str) -> Option<Result<Ticket, String>>;
-    /// The marker udhcpc `pid`'s hook left, if any.
+    /// A lease for `ssid` on `bssid`, now. The udhcpc that holds `ssid`'s
+    /// lease (by [`Dhcp::proven`]) is asked to renew it; for any other
+    /// network, or without one, udhcpc is started afresh and the ticket
+    /// names the new one. kindil's own client numbers each request, and
+    /// keeps a lease it holds for this network until T1.
+    fn ask(&self, ssid: &str, bssid: [u8; 6]) -> Option<Result<Ticket, String>>;
+    /// The marker udhcpc `pid`'s hook left, if any (or the lease kindil's
+    /// own client took for request `pid`).
     fn marker(&self, pid: u32) -> Option<Marker>;
     /// The interface's IPv4 address.
     fn address(&self) -> Option<Ipv4Addr>;
@@ -483,7 +487,7 @@ fn prove(
     sleep: &dyn Fn(Duration),
     bssid_now: &mut dyn FnMut() -> Option<Result<Option<[u8; 6]>, DriverError>>,
 ) -> Option<Result<bool, DriverError>> {
-    let ticket = match dhcp.ask(ssid)? {
+    let ticket = match dhcp.ask(ssid, bssid)? {
         Ok(ticket) => ticket,
         Err(error) => {
             eprintln!("kindil: Wi-Fi: asking for an address: {error}");
@@ -1519,7 +1523,7 @@ pub mod fake {
     }
 
     impl Dhcp for FakeContext {
-        fn ask(&self, ssid: &str) -> Option<Result<Ticket, String>> {
+        fn ask(&self, ssid: &str, _bssid: [u8; 6]) -> Option<Result<Ticket, String>> {
             self.effect("ask")?;
             self.asked.borrow_mut().push(ssid.to_owned());
             let pid = self.pid.get();

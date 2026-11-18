@@ -212,6 +212,7 @@ faster.
 | `/mnt/us/extensions/kindil/` | KUAL launcher and the `kindil` binary; during an update also `kindil.next`, `kindil.trying`, and afterwards `kindil.previous` |
 | `/var/local/kindil/` | The running copy, the launcher and the log; off `/mnt/us`, which a computer takes in USB drive mode |
 | `/var/local/kindil/networks.toml` | The Wi-Fi networks joined in kindil, with their passwords (root only) |
+| `/var/local/kindil/dhcp` | `kindil` inside: kindil's own DHCP client instead of udhcpc (off by default; [DHCP-TEST.md](DHCP-TEST.md)) |
 | `/var/local/kindil/usb-drive` | `kindil` inside: kindil runs USB drive mode instead of volumd (off by default; [docs/USB-DRIVE-TEST.md](USB-DRIVE-TEST.md)) |
 | `/var/local/kindil/usb-exported` | Present while a computer may have the storage: the next start checks it |
 | `/var/local/kindil/kindil-sshd`, `/var/local/kindil/ssh/` | kindil's SSH server, its host key, trusted and ignored keys (root only) |
