@@ -1,9 +1,11 @@
-//! The naps' flight recorder: a line for each step of every suspend
-//! (Wi-Fi parked, the alarm armed and read back, suspending, resumed),
+//! The naps' flight recorder: a line for how each doze wake ended (what it
+//! drew, for which minute, the panel's frame count) and for each step of
+//! every suspend (Wi-Fi parked, the alarm armed and read back, suspending,
+//! resumed),
 //! stamped and written before the step, so after a freeze the last line
 //! says where the device stopped. Kept apart from kindil.log, which would
-//! drown in two lines a minute: [`MAX_BYTES`] in the file and as much in
-//! the one before it, about a day of naps. The kernel syncs the
+//! drown in three lines a minute: [`MAX_BYTES`] in the file and as much in
+//! the one before it, about half a day of naps. The kernel syncs the
 //! filesystems on its way into each suspend, so the line written just
 //! before one is on the flash when the device sleeps.
 use std::io::Write;

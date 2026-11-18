@@ -1448,3 +1448,31 @@ fn ignored_ssh_keys_are_not_offered_again() {
     assert_eq!(f.k().get_ssh_trusted().row_count(), 1);
     assert!(host.own_ssh().new_on_usb.is_empty());
 }
+
+#[test]
+fn a_dozing_app_keeps_napping_and_turning_its_clock_after_the_clock_steps_back() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    // 22:20:01 on 2026-11-17, Atlantic time is the config's UTC here.
+    static CLOCK: AtomicI64 = AtomicI64::new(1_795_386_001);
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::with_clock(host.clone(), || {
+        chrono::DateTime::from_timestamp(CLOCK.load(Ordering::Relaxed), 0).unwrap()
+    });
+    f.app.device_event(Event::Doze);
+    f.app.fire_timers();
+    let mut shown = Vec::new();
+    for round in 0..90 {
+        // As on 2026-11-17: the clock set back 9.5 s (here 10) during a
+        // wake, past the minute it had just turned.
+        if round == 3 {
+            CLOCK.fetch_sub(10, Ordering::Relaxed);
+        }
+        let naps = host.naps();
+        f.app.fire_timers();
+        assert_eq!(host.naps(), naps + 1, "round {round}: napped");
+        shown.push(f.k().get_clock().to_string());
+        CLOCK.fetch_add(60, Ordering::Relaxed);
+    }
+    shown.dedup();
+    assert!(shown.len() >= 88, "the clock turned each minute: {shown:?}");
+}

@@ -1175,6 +1175,154 @@ mod tests {
         (online, fulls.into_values().collect())
     }
 
+    /// What a night of dozing decided, in real seconds from its start.
+    #[derive(Debug, Default)]
+    struct Night {
+        online: Vec<i64>,
+        full: Vec<i64>,
+        ledgers: Vec<i64>,
+        windows: Vec<i64>,
+        held: i64,
+    }
+
+    impl Night {
+        fn longest_gap(times: &[i64], end: i64) -> i64 {
+            let mut last = 0;
+            let mut gap = 0;
+            for &t in times.iter().chain([end].iter()) {
+                gap = gap.max(t - last);
+                last = t;
+            }
+            gap
+        }
+    }
+
+    /// Twelve hours of doze wakes as the UI decides them (src/ui.rs
+    /// `redraw_doze` and `nap_or_hold`): a wake a second past each minute of
+    /// the clock, the clock gaining `gain` seconds a nap, and each online
+    /// wake's sync stepping it back to real time at the end of the wake,
+    /// plus `step` seconds at the first one after `first_step_at` (another
+    /// clock's error). The step reaches the schedule, the maintenance windows
+    /// and the ledger as it does in the app.
+    fn night(gain: f64, step: f64, first_step_at: i64) -> Night {
+        use crate::maintenance::{Hold, Maintenance};
+        use chrono::TimeDelta;
+        let start = wall(20, 0, 0);
+        let at = |real: f64| start + TimeDelta::microseconds((real * 1e6) as i64);
+        let mut error = 0.0;
+        let mut real: f64 = 1.0;
+        let mut schedule = Schedule::default();
+        schedule.doze_began();
+        let mut maintenance = Maintenance::new(start);
+        let mut ledger = DozeLedger::new(start, None);
+        let mut night = Night::default();
+        let mut stepped = false;
+        while real < 12.0 * 3600.0 {
+            let now = at(real + error);
+            let wake = schedule.wake(now, true);
+            let opens = wake.window == Window::Online && maintenance.online_wake(now);
+            ledger.woke(now, Instant::now(), wake.window, wake.redraw);
+            if ledger.due(now) {
+                ledger.close(now, None);
+                night.ledgers.push(real as i64);
+            }
+            if wake.window == Window::Online {
+                night.online.push(real as i64);
+            }
+            if wake.redraw == Redraw::Full {
+                night.full.push(real as i64);
+            }
+            if opens {
+                night.windows.push(real as i64);
+            }
+            // The wake's work, then its sync, if online.
+            real += if wake.window == Window::Online {
+                12.0
+            } else {
+                1.3
+            };
+            if wake.window == Window::Online {
+                let mut by = -error;
+                if !stepped && real as i64 >= first_step_at {
+                    by += step;
+                    stepped = true;
+                }
+                error += by;
+                let delta = TimeDelta::microseconds((by * 1e6) as i64);
+                ledger.clock_corrected(crate::clock::Correction {
+                    seconds: by,
+                    source: crate::clock::Source::Ntp("time.example.org"),
+                });
+                schedule.clock_stepped(delta);
+                maintenance.clock_stepped(delta);
+            }
+            // Nap, or hold awake, until a second past the clock's next minute.
+            let now = at(real + error);
+            let until = next_redraw(now) + TimeDelta::seconds(1);
+            ledger.napping(now, Instant::now());
+            if let Some(Hold::Window) = maintenance.hold(now, &[]) {
+                ledger.holding(now, Hold::Window);
+                night.held += (until - now).num_seconds();
+            } else {
+                error += gain;
+            }
+            real += (until - now).as_seconds_f64();
+        }
+        night
+    }
+
+    #[test]
+    fn a_night_of_steps_back_and_forth_keeps_every_wake_doing_its_work() {
+        let end = 12 * 3600;
+        // A step back makes the clock's minutes come that much later.
+        let check = |night: &Night, back: i64, what: &str| {
+            let gap = |times: &[i64]| Night::longest_gap(times, end) - back;
+            assert!(
+                gap(&night.online) <= 32 * 60,
+                "{what}: online {:?}",
+                night.online
+            );
+            assert!(
+                gap(&night.full) <= 6 * 60,
+                "{what}: full redraws {:?}",
+                &night.full[..night.full.len().min(16)]
+            );
+            assert!(
+                gap(&night.ledgers) <= 62 * 60,
+                "{what}: ledgers {:?}",
+                night.ledgers
+            );
+            assert!(
+                gap(&night.windows) <= 2 * 3600 + 300,
+                "{what}: windows {:?}",
+                night.windows
+            );
+            assert!(
+                night.held <= night.windows.len() as i64 * 185,
+                "{what}: held {} s in {} windows",
+                night.held,
+                night.windows.len()
+            );
+        };
+        // The night of 2026-11-17: 0.33 s gained a nap, stepped back at
+        // each fetch (9.5 s at 22:20); and the night before, losing.
+        check(&night(0.33, 0.0, 0), 0, "gaining");
+        check(&night(-0.5, 0.0, 0), 0, "losing");
+        // One step of another size besides, either way, landing on either
+        // side of a minute turning.
+        for step in [
+            -3600.0, -600.0, -61.0, -59.0, -9.5, -0.5, 0.5, 9.5, 59.0, 61.0, 600.0,
+        ] {
+            for first_step_at in [1_800, 3_600, 3_600 + 50, 7_200 + 59] {
+                check(
+                    &night(0.33, step, first_step_at),
+                    (-step).max(0.0).ceil() as i64,
+                    &format!("step {step} at {first_step_at}"),
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_clock_step_neither_doubles_nor_skips_a_fetch_or_a_full_redraw() {
         // 724 s fast, set back; 724 s and 40 minutes slow, set forward; and

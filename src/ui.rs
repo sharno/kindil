@@ -1590,7 +1590,7 @@ impl Ctx {
                 }
             }
         }
-        self.settle_wake(wake, window, dashboard, drawn);
+        self.settle_wake(wake, (now, window, redraw), dashboard, drawn);
     }
 
     /// The battery after a doze wake: only the gauge, not the whole status.
@@ -1704,7 +1704,17 @@ impl Ctx {
     /// dashboard's frame for this wake, if it has one): when the panel says
     /// it finished, or [`PANEL_UPDATE`] after sending when it can't say; at
     /// the window's ceiling if the frame never shows.
-    fn settle_wake(&self, wake: u64, window: Window, dashboard: bool, drawn: u64) {
+    /// `doing` is the wake's time on the clock, and what it does; the end
+    /// of each wake is noted for the flight recorder ([`Host::note`]): what
+    /// it drew, for which minute, and how its redraw ended.
+    fn settle_wake(
+        &self,
+        wake: u64,
+        doing: (DateTime<Utc>, Window, Redraw),
+        dashboard: bool,
+        drawn: u64,
+    ) {
+        let (at, window, redraw) = doing;
         let ceiling = window.ceiling();
         let Execution::Background = self.execution else {
             return self.after(ceiling, DeviceEvent::PanelSettled);
@@ -1715,9 +1725,18 @@ impl Ctx {
             let draw_wake = self.draw_wake.clone();
             let ledger = self.ledger.clone();
             let deliver = Arc::new(self.deliver());
+            let host = self.host.clone();
+            let display = self.display.clone();
             move |settle: Settle| {
                 let won = draw_wake.claim(wake);
                 if won {
+                    host.note(&format!(
+                        "wake {wake}: {window:?} {redraw:?} for {}, {settle:?} after {:.1} s, \
+                         panel frame {}",
+                        crate::logging::stamp(at, crate::logging::zone()),
+                        since.elapsed().as_secs_f64(),
+                        display.frames()
+                    ));
                     if window == Window::Online {
                         crate::log!(
                             "kindil: online wake ended after {:.1} s ({settle:?})",
