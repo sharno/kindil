@@ -6,6 +6,7 @@
 //! The stamp is the device's zone once [`set_zone`] has been told it (the
 //! launcher's own lines are local time too), UTC with a `Z` before that.
 use chrono::{DateTime, Utc};
+#[cfg(feature = "kindle")]
 use std::io::Write;
 use std::sync::OnceLock;
 
@@ -34,7 +35,12 @@ pub fn stamp(now: DateTime<Utc>, zone: Option<chrono_tz::Tz>) -> String {
 /// One stamped line on stderr, in one write; never panics.
 pub fn line(args: std::fmt::Arguments<'_>) {
     let text = format!("{} {args}\n", stamp(Utc::now(), zone()));
+    // On the device, a write that can't fail. Elsewhere (tests, previews)
+    // eprint!, whose output the test harness captures.
+    #[cfg(feature = "kindle")]
     let _ = std::io::stderr().lock().write_all(text.as_bytes());
+    #[cfg(not(feature = "kindle"))]
+    eprint!("{text}");
 }
 
 /// `eprintln!`, stamped with the wall time and never panicking.
