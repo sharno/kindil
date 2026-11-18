@@ -40,11 +40,8 @@ const CHECKS: &[(&str, &str, Expect)] = &[
     // is armed on a charger too, it holds either way.
     ("Sleep", "SleepCableQuiet", Expect::Holds),
     ("Launcher", "Launcher", Expect::Holds),
-    (
-        "Launcher",
-        "LauncherCommitCut",
-        Expect::Fails("an exit between the commit's renames"),
-    ),
+    // Failed on 0.15.0; holds since the commit copies, then renames over.
+    ("Launcher", "LauncherCommitCut", Expect::Holds),
     ("Boot", "Boot", Expect::Holds),
     (
         "Boot",
