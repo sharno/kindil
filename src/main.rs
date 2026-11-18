@@ -150,6 +150,7 @@ fn desktop(cli: &Cli) -> anyhow::Result<()> {
 
 #[cfg(feature = "kindle")]
 fn kindle(cli: &Cli) -> anyhow::Result<Exit> {
+    kindil::logging::forward_log();
     use kindil::kindle::KindleHost;
     const REGULAR: &[u8] =
         include_bytes!("../crates/miqat/assets/fonts/IBMPlexSansArabic-Regular.ttf");
@@ -163,7 +164,7 @@ fn kindle(cli: &Cli) -> anyhow::Result<Exit> {
             motion: backend.motion_flag(),
         },
         presented: Some(Presented {
-            frames: backend.frame_counter(),
+            updates: Arc::new(slint_backend_kindle::updates_sent),
             wait_idle: slint_backend_kindle::wait_for_panel,
         }),
         execution: Execution::Background,

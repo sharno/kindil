@@ -22,7 +22,8 @@ After deploying, let it doze ten minutes, then in a maintenance window:
 $K "$P tail -12 /var/local/kindil/naps.log"
 ```
 
-Expect, per nap: `Wi-Fi parked in 0.0x s`, `nap: suspending, rtc1 alarm at
+Expect, per nap: `wake N: Draw Tick for … , Done after 1.2 s, panel
+update U`, `Wi-Fi parked in 0.0x s`, `nap: suspending, rtc1 alarm at
 N (rtc M +K s, read back N)`, `nap: resumed after K s by the clock, rtc1 at
 N...`. A `not read back` means `/dev/rtc1` couldn't be opened (it is
 exclusive): note who holds it (`fuser /dev/rtc1`). A `not suspending` line
@@ -63,6 +64,17 @@ $K "$P dmesg | grep -e savemsg -e 'def:rst' -e 'def:bcut' -e '^#'"
 - Last line `Wi-Fi parked` (or an online wake's line in kindil.log with
   nothing in naps.log after it): kindil stopped before suspending.
 - Last line `resumed`: the device came back and kindil stopped after.
+- `wake N: Draw Tick for 22:47:01…, Done` lines going on while the photo
+  of the screen shows an earlier minute: the panel accepted updates
+  that never reached the glass.
+- `doze redraw not seen on the panel` in kindil.log: a wake's frame
+  never led to an update the driver accepted. Beside it, `dashboard: …`
+  says the frame failed to render, `slint_backend_kindle…: EPDC refused
+  update …` that the driver refused it; neither means nothing new was
+  drawn (0.14.0 counted such a wake as done, silently).
+- Amazon's syslog keeps the kernel's suspend and resume lines, but only
+  until `tinyrot` rotates `/var/log/messages` (a tmpfs, lost on reboot);
+  the online wakes show in it as `channel hint set to …`.
 - The dmesg lines: Amazon's kernel prints the previous boot's last kernel
   messages (`# ...` between `Kernel Reboot Message Start/End`) after a
   watchdog or hard reset when its saved buffer survived, and the reset's

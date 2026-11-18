@@ -3044,6 +3044,7 @@ dependencies = [
  "html2text",
  "i-slint-core",
  "libc",
+ "log",
  "minisign-verify",
  "miqat",
  "rand",

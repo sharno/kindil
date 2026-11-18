@@ -219,6 +219,9 @@ pub trait Host: Send + Sync {
     /// The UI has let go of the user storage after [`crate::system::Event::StorageLeaving`]:
     /// kindil's own USB drive mode may unmount it.
     fn storage_released(&self) {}
+    /// A line for the device's flight recorder (src/flight.rs): how each
+    /// doze wake ended. Nothing elsewhere.
+    fn note(&self, _line: &str) {}
     /// Suspends to RAM; returns once the device is awake again.
     fn suspend(&self) -> anyhow::Result<()>;
     /// Suspends to RAM with a timed wake at `until` (on the wall clock, taken

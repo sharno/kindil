@@ -43,6 +43,27 @@ pub fn line(args: std::fmt::Arguments<'_>) {
     eprint!("{text}");
 }
 
+/// Hands the `log` crate's warnings and errors (the Kindle backend's: an
+/// e-ink update the driver refused, say) to [`line`]; the first call wins.
+pub fn forward_log() {
+    struct Forward;
+    impl log::Log for Forward {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                line(format_args!("{}: {}", record.target(), record.args()));
+            }
+        }
+        fn flush(&self) {}
+    }
+    static FORWARD: Forward = Forward;
+    if log::set_logger(&FORWARD).is_ok() {
+        log::set_max_level(log::LevelFilter::Warn);
+    }
+}
+
 /// `eprintln!`, stamped with the wall time and never panicking.
 #[macro_export]
 macro_rules! log {

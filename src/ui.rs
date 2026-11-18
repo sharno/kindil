@@ -25,7 +25,7 @@ use chrono::{DateTime, Timelike, Utc};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -57,8 +57,10 @@ pub enum Execution {
 /// backend has it, previews and tests don't.
 #[derive(Clone)]
 pub struct Presented {
-    /// Frames drawn, each counted once sent to the panel.
-    pub frames: Arc<AtomicU64>,
+    /// How many updates the panel's driver has accepted. Not frames drawn:
+    /// a draw that sent nothing (no pixel changed) or that the driver
+    /// refused leaves it as it was, so it can't pass for a redraw.
+    pub updates: Arc<dyn Fn() -> u64 + Send + Sync>,
     /// Blocks until the panel has finished its last update; an error if it
     /// can't tell.
     pub wait_idle: fn() -> std::io::Result<()>,
@@ -106,8 +108,8 @@ enum Drawn {
 }
 
 /// The last dashboard frame handed to the window: the doze wake it was drawn
-/// for, if any, and the panel frame count then (the panel frame after that
-/// has it).
+/// for, if any, and the panel's update count then (the next update the
+/// panel accepts has it).
 #[derive(Default)]
 struct DashboardFrames {
     shown: Mutex<Shown>,
@@ -117,7 +119,7 @@ struct DashboardFrames {
 #[derive(Clone, Copy, Default)]
 struct Shown {
     wake: Option<u64>,
-    frames: u64,
+    updates: u64,
 }
 
 /// The doze wake whose redraw is awaited. Its end is claimed once, by the
@@ -144,17 +146,15 @@ impl DrawWake {
 }
 
 impl Display {
-    fn frames(&self) -> u64 {
-        self.presented
-            .as_ref()
-            .map_or(0, |p| p.frames.load(Ordering::Acquire))
+    fn updates(&self) -> u64 {
+        self.presented.as_ref().map_or(0, |p| (p.updates)())
     }
 
     /// A dashboard frame (or its error) for `wake` was just handed to the
     /// window, on the UI thread, before the loop draws it.
     fn dashboard_shown(&self, wake: Option<u64>) {
-        let frames = self.frames();
-        *lock(&self.dashboard.shown) = Shown { wake, frames };
+        let updates = self.updates();
+        *lock(&self.dashboard.shown) = Shown { wake, updates };
         self.dashboard.changed.notify_all();
     }
 
@@ -180,10 +180,10 @@ impl Display {
                 if timeout.timed_out() {
                     return Drawn::NotSeen;
                 }
-                shown.frames
+                shown.updates
             }
         };
-        while presented.frames.load(Ordering::Acquire) <= drawn {
+        while (presented.updates)() <= drawn {
             if left().is_zero() {
                 return Drawn::NotSeen;
             }
@@ -1540,10 +1540,10 @@ impl Ctx {
             let opens = window == Window::Online && state.maintenance.online_wake(now);
             (half_hour, window, redraw, opens, state.wifi_parked)
         };
-        // Before the redraw starts: this wake, and the panel frames drawn so
+        // Before the redraw starts: this wake, and the panel updates sent so
         // far; its dashboard frame is tagged with the wake.
         let wake = self.draw_wake.begin();
-        let drawn = self.display.frames();
+        let drawn = self.display.updates();
         let due = {
             let mut ledger = lock(&self.ledger);
             ledger.woke(now, Instant::now(), window, redraw);
@@ -1590,7 +1590,7 @@ impl Ctx {
                 }
             }
         }
-        self.settle_wake(wake, window, dashboard, drawn);
+        self.settle_wake(wake, (now, window, redraw), dashboard, drawn);
     }
 
     /// The battery after a doze wake: only the gauge, not the whole status.
@@ -1704,7 +1704,17 @@ impl Ctx {
     /// dashboard's frame for this wake, if it has one): when the panel says
     /// it finished, or [`PANEL_UPDATE`] after sending when it can't say; at
     /// the window's ceiling if the frame never shows.
-    fn settle_wake(&self, wake: u64, window: Window, dashboard: bool, drawn: u64) {
+    /// `doing` is the wake's time on the clock, and what it does; the end
+    /// of each wake is noted for the flight recorder ([`Host::note`]): what
+    /// it drew, for which minute, and how its redraw ended.
+    fn settle_wake(
+        &self,
+        wake: u64,
+        doing: (DateTime<Utc>, Window, Redraw),
+        dashboard: bool,
+        drawn: u64,
+    ) {
+        let (at, window, redraw) = doing;
         let ceiling = window.ceiling();
         let Execution::Background = self.execution else {
             return self.after(ceiling, DeviceEvent::PanelSettled);
@@ -1715,9 +1725,18 @@ impl Ctx {
             let draw_wake = self.draw_wake.clone();
             let ledger = self.ledger.clone();
             let deliver = Arc::new(self.deliver());
+            let host = self.host.clone();
+            let display = self.display.clone();
             move |settle: Settle| {
                 let won = draw_wake.claim(wake);
                 if won {
+                    host.note(&format!(
+                        "wake {wake}: {window:?} {redraw:?} for {}, {settle:?} after {:.1} s, \
+                         panel update {}",
+                        crate::logging::stamp(at, crate::logging::zone()),
+                        since.elapsed().as_secs_f64(),
+                        display.updates()
+                    ));
                     if window == Window::Online {
                         crate::log!(
                             "kindil: online wake ended after {:.1} s ({settle:?})",
@@ -2429,7 +2448,13 @@ fn miqat_worker(
                     };
                     display.updated(&ui, update);
                 }
-                Err(error) => k.set_miqat_error(error.into()),
+                Err(error) => {
+                    // Under the frame on screen the error isn't visible:
+                    // logged, and no wake counts it as its redraw.
+                    crate::log!("kindil: dashboard: {error}");
+                    k.set_miqat_error(error.into());
+                    return;
+                }
             }
             if wake.is_some() && (asked, drew) == (Draw::Header, Draw::Full) {
                 lock(&display.ledger).drew_full();
@@ -2486,6 +2511,7 @@ fn miqat_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
 
     #[test]
     fn a_wake_is_ended_once_and_only_while_current() {
@@ -2501,11 +2527,14 @@ mod tests {
         assert!(wake.claim(second));
     }
 
-    fn display(frames: Arc<AtomicU64>, wait_idle: fn() -> std::io::Result<()>) -> Display {
+    fn display(updates: Arc<AtomicU64>, wait_idle: fn() -> std::io::Result<()>) -> Display {
         Display {
             panel: Panel::Lcd,
             ghosting: Arc::default(),
-            presented: Some(Presented { frames, wait_idle }),
+            presented: Some(Presented {
+                updates: Arc::new(move || updates.load(Ordering::Acquire)),
+                wait_idle,
+            }),
             dashboard: Arc::default(),
             dozing: Arc::default(),
             panel_error_logged: Arc::default(),
@@ -2538,6 +2567,39 @@ mod tests {
         assert!(!waiter.is_finished(), "shown, not yet drawn");
         frames.fetch_add(1, Ordering::Release);
         assert!(matches!(waiter.join().unwrap(), Drawn::Done));
+    }
+
+    #[test]
+    fn a_stuck_dashboard_worker_never_ends_a_wake_however_much_else_is_drawn() {
+        // The worker never hands over wake 7's frame (a fetch that never
+        // returns); other updates (the status row) still reach the panel.
+        let (display, updates) = eink();
+        let deadline = Instant::now() + Duration::from_millis(80);
+        let waiter = {
+            let display = display.clone();
+            std::thread::spawn(move || display.wait_drawn(Some(7), 0, deadline))
+        };
+        for _ in 0..5 {
+            updates.fetch_add(1, Ordering::Release);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The ceiling ends it, and logs it (settle_wake).
+        assert!(matches!(waiter.join().unwrap(), Drawn::NotSeen));
+    }
+
+    #[test]
+    fn a_frame_handed_over_counts_only_once_the_panel_accepted_an_update_after_it() {
+        // 2026-11-17 from 22:19: each wake's frame was handed to the window,
+        // but nothing new reached the glass. A draw that sent no update (or
+        // one the driver refused) leaves the count as it was: the wake isn't
+        // over until the ceiling, which logs it.
+        let (display, _updates) = eink();
+        display.dashboard_shown(Some(7));
+        let soon = Instant::now() + Duration::from_millis(60);
+        assert!(matches!(
+            display.wait_drawn(Some(7), 0, soon),
+            Drawn::NotSeen
+        ));
     }
 
     #[test]

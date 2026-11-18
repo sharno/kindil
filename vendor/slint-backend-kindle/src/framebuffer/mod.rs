@@ -3,21 +3,46 @@ mod ffi;
 use std::cell::Cell;
 use std::ops::Range;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 /// The marker the next update carries. Each update gets its own, so a wait
 /// is for that update and not for whichever earlier one shared a fixed
 /// marker; never 0, which the driver takes as "no marker". kindil patch.
 static NEXT_MARKER: AtomicU32 = AtomicU32::new(1);
-/// The marker of the last update sent to the panel.
+/// The marker of the last update the driver accepted.
 static LAST_MARKER: AtomicU32 = AtomicU32::new(0);
+/// Updates the driver accepted, and refused. kindil patch: a frame drawn
+/// counts as on the panel only once an update for it was accepted.
+static UPDATES_SENT: AtomicU64 = AtomicU64::new(0);
+static UPDATES_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// How many updates the panel's driver has accepted so far.
+pub(crate) fn updates_sent() -> u64 {
+    UPDATES_SENT.load(Ordering::Acquire)
+}
 
 fn next_marker() -> u32 {
     loop {
         let marker = NEXT_MARKER.fetch_add(1, Ordering::Relaxed);
         if marker != 0 {
-            LAST_MARKER.store(marker, Ordering::Release);
             return marker;
+        }
+    }
+}
+
+/// Notes the outcome of sending update `marker`: accepted, it is the one
+/// to wait for; refused, it is logged (the first, then every hundredth).
+fn sent(marker: u32, accepted: Result<(), std::io::Error>) {
+    match accepted {
+        Ok(()) => {
+            LAST_MARKER.store(marker, Ordering::Release);
+            UPDATES_SENT.fetch_add(1, Ordering::AcqRel);
+        }
+        Err(error) => {
+            let refused = UPDATES_REFUSED.fetch_add(1, Ordering::Relaxed);
+            if refused % 100 == 0 {
+                log::error!("EPDC refused update {marker} ({} refused so far): {error}", refused + 1);
+            }
         }
     }
 }
@@ -223,12 +248,22 @@ impl Framebuffer {
         let marker = next_marker();
         match self.update_variant.get() {
             Some(variant) => {
-                self.send_update_variant(variant, region, waveform, mode, marker);
+                let accepted = self.send_update_variant(variant, region, waveform, mode, marker);
+                // Read before anything else can set errno.
+                let error = std::io::Error::last_os_error();
+                sent(marker, if accepted { Ok(()) } else { Err(error) });
             }
             None => {
                 let accepted = UpdateVariant::PROBE_ORDER.into_iter().find(|&variant| {
                     self.send_update_variant(variant, region, waveform, mode, marker)
                 });
+                sent(
+                    marker,
+                    match accepted {
+                        Some(_) => Ok(()),
+                        None => Err(std::io::Error::other("no update ioctl accepted")),
+                    },
+                );
                 if accepted.is_none() {
                     log::error!(
                         "EPDC refresh failed: no known MXCFB_SEND_UPDATE variant \
@@ -478,5 +513,21 @@ pub(crate) fn wait_for_panel() -> std::io::Result<()> {
 impl Drop for Framebuffer {
     fn drop(&mut self) {
         unsafe { libc::munmap(self.map as *mut libc::c_void, self.len) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_accepted_update_counts_and_is_the_one_waited_for() {
+        let (before, last) = (updates_sent(), LAST_MARKER.load(Ordering::Acquire));
+        sent(4_000_001, Err(std::io::Error::from_raw_os_error(libc::EPERM)));
+        assert_eq!(updates_sent(), before, "refused");
+        assert_eq!(LAST_MARKER.load(Ordering::Acquire), last);
+        sent(4_000_002, Ok(()));
+        assert_eq!(updates_sent(), before + 1);
+        assert_eq!(LAST_MARKER.load(Ordering::Acquire), 4_000_002);
     }
 }

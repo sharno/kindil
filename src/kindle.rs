@@ -421,6 +421,10 @@ impl Host for KindleHost {
         }
     }
 
+    fn note(&self, line: &str) {
+        crate::flight::Recorder::device().note(line);
+    }
+
     fn nap(&self, until: chrono::DateTime<chrono::Utc>) -> anyhow::Result<()> {
         let recorder = crate::flight::Recorder::device();
         // Measured now, after parking Wi-Fi and right before arming: the
