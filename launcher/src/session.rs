@@ -10,7 +10,6 @@
 use crate::os::{log, Os};
 use crate::{Paths, SERVICES};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -126,16 +125,10 @@ impl Files {
     }
 
     fn choose(&self, slot: &Path) -> PathBuf {
-        if self.next.is_file() && std::fs::rename(&self.next, &self.trial).is_ok() {
-            match self.copy(&self.trial) {
-                Ok(()) if std::fs::write(&self.trying, b"").is_ok() => {
-                    log("trying the update");
-                    return self.bin.clone();
-                }
-                Ok(()) => {}
-                Err(error) => log(&format!("copying the update: {error}; dropping it")),
+        if let Some(staged) = self.staged() {
+            if let Ok(_trying) = staged.begin(self) {
+                return self.bin.clone();
             }
-            let _ = std::fs::remove_file(&self.trial);
         }
         if slot.is_file() && !self.current(slot) {
             if let Err(error) = self.copy(slot) {
@@ -148,6 +141,21 @@ impl Files {
             }
         }
         self.bin.clone()
+    }
+
+    /// A staged update, once nothing else is on trial: a trial or trial
+    /// files left over are rolled back first (none are, past the session's
+    /// start and the end of each run).
+    fn staged(&self) -> Option<Trial<Staged>> {
+        for _ in 0..2 {
+            match Trial::read(self) {
+                Ok(trial::SomeState::Staged(staged)) => return Some(staged),
+                Ok(trial::SomeState::Idle(_)) => return None,
+                Ok(trial::SomeState::Trying(trying)) => drop(trying.roll_back(self)),
+                Err(inconsistent) => inconsistent.roll_back(self),
+            }
+        }
+        None
     }
 
     /// Comparing the 16 MB binaries takes over 10 s at boot. Instead the copy
@@ -239,6 +247,161 @@ impl Files {
     fn drop_trial(&self) {
         let _ = std::fs::remove_file(&self.trying);
         let _ = std::fs::remove_file(&self.trial);
+    }
+
+    /// Rolls back whatever trial the files show; whether a run was on trial
+    /// (the marker was there).
+    fn end_trial(&self) -> bool {
+        match Trial::read(self) {
+            Ok(trial::SomeState::Trying(trying)) => {
+                trying.roll_back(self);
+                true
+            }
+            Ok(trial::SomeState::Idle(_) | trial::SomeState::Staged(_)) => false,
+            Err(inconsistent) => {
+                inconsistent.roll_back(self);
+                inconsistent == Inconsistent::MarkerWithoutBinary
+            }
+        }
+    }
+}
+
+/// Trial files no step leaves for long: what [`Trial::read`] refuses. Both
+/// roll back: a trial is never kept but by kindil, from a run the launcher
+/// marked as its trial.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Inconsistent {
+    /// The marker without `kindil.trying`: replaced by hand (a deploy), or
+    /// kindil's commit stopped between its two steps.
+    MarkerWithoutBinary,
+    /// `kindil.trying` without the marker: stopped between moving the update
+    /// in and marking its trial. It never ran.
+    BinaryWithoutMarker,
+}
+
+impl Inconsistent {
+    fn roll_back(self, files: &Files) {
+        log(match self {
+            Inconsistent::MarkerWithoutBinary => {
+                "the trial marker without kindil.trying: dropping the marker"
+            }
+            Inconsistent::BinaryWithoutMarker => {
+                "kindil.trying without the trial marker: dropping the untried update"
+            }
+        });
+        files.drop_trial();
+    }
+}
+
+use steps::{trial, Staged, Trial};
+
+/// An update's trial as typestate: a staged binary runs on trial only once
+/// it is moved in, copied and marked, and a trial can always be rolled back;
+/// only kindil keeps it (src/update.rs). The files are the state between
+/// runs: [`Trial::read`] rebuilds it from them. No state can be made outside
+/// this module but through [`Trial::read`] (the [`steps::Seal`] can't be).
+mod steps {
+    use super::{log, Files, Inconsistent};
+    use statum::{machine, state, transition, validators, Error};
+
+    /// What only this module can make.
+    pub(super) struct Seal(());
+
+    #[state]
+    pub(super) enum TrialState {
+        /// No update to try.
+        Idle,
+        /// `kindil.next`, written by kindil after checking its signature.
+        Staged,
+        /// Moved to `kindil.trying`, copied to run, and marked.
+        Trying,
+    }
+
+    #[machine]
+    pub(super) struct Trial<TrialState> {
+        seal: Seal,
+    }
+
+    #[transition]
+    impl Trial<Staged> {
+        /// One trial run: moved to `kindil.trying`, copied to run, and
+        /// marked. If it can't be, the update is dropped and nothing is on
+        /// trial (or, if it couldn't even be moved, it stays staged).
+        pub(super) fn begin(
+            self,
+            files: &Files,
+        ) -> ::core::result::Result<Trial<Trying>, Trial<Idle>> {
+            if std::fs::rename(&files.next, &files.trial).is_err() {
+                return Err(self.transition());
+            }
+            match files.copy(&files.trial) {
+                Ok(()) if std::fs::write(&files.trying, b"").is_ok() => {
+                    log("trying the update");
+                    return Ok(self.transition());
+                }
+                Ok(()) => {}
+                Err(error) => log(&format!("copying the update: {error}; dropping it")),
+            }
+            let _ = std::fs::remove_file(&files.trial);
+            Err(self.transition())
+        }
+    }
+
+    #[transition]
+    impl Trial<Trying> {
+        /// Back to the current binary: the trial's binary and marker go.
+        pub(super) fn roll_back(self, files: &Files) -> Trial<Idle> {
+            files.drop_trial();
+            self.transition()
+        }
+    }
+
+    /// Which trial files exist.
+    struct Found {
+        next: bool,
+        trial: bool,
+        marker: bool,
+    }
+
+    fn when(holds: bool) -> statum::Result<()> {
+        if holds {
+            Ok(())
+        } else {
+            Err(Error::InvalidState)
+        }
+    }
+
+    #[validators(Trial)]
+    impl Found {
+        fn is_idle(&self) -> statum::Result<()> {
+            when(!self.next && !self.trial && !self.marker)
+        }
+        fn is_staged(&self) -> statum::Result<()> {
+            when(self.next && !self.trial && !self.marker)
+        }
+        /// An update staged during the trial waits for the trial's end.
+        fn is_trying(&self) -> statum::Result<()> {
+            when(self.trial && self.marker)
+        }
+    }
+
+    impl Trial<Idle> {
+        /// The trial's state from the files on disk, or what is wrong with
+        /// them.
+        pub(super) fn read(files: &Files) -> Result<trial::SomeState, Inconsistent> {
+            let found = Found {
+                next: files.next.is_file(),
+                trial: files.trial.exists(),
+                marker: files.trying.exists(),
+            };
+            Trial::rebuild(&found).seal(Seal(())).build().map_err(|_| {
+                if found.marker {
+                    Inconsistent::MarkerWithoutBinary
+                } else {
+                    Inconsistent::BinaryWithoutMarker
+                }
+            })
+        }
     }
 }
 
@@ -347,7 +510,10 @@ impl UsbDrive {
     }
 }
 
-pub fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
+/// The session: Amazon's UI and services step aside, kindil runs, and
+/// they come back. Its result, [`Ended`], comes only from refusing before
+/// anything was stopped or from restoring.
+pub fn session(paths: &Paths, os: &dyn Os) -> Ended {
     crate::os::ignore(libc::SIGHUP);
     // Before anything runs: the launcher itself (the boot job and KUAL run
     // it next time), and below, in pick, the binary it runs.
@@ -355,51 +521,24 @@ pub fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
     let files = Files::new(paths);
     // A trial cut short by a reboot or a kill never settled: drop it, so the
     // current binary runs and nothing keeps the untried one.
-    if files.trying.exists() {
-        files.drop_trial();
+    if files.end_trial() {
         log("dropped an update whose trial was cut short");
     }
     // Event watchers an earlier kindil left behind (orphans, now init's);
     // they ignore TERM.
     os.kill_orphaned_watchers();
     end_children(paths, os);
-    let slot = files.installed.clone();
-    let bin = files.pick(&slot);
-    if !executable(&bin) {
-        log(&format!("missing {}", bin.display()));
-        return ExitCode::FAILURE;
-    }
-    let usb = UsbDrive::read(paths, os);
-    // Stopping the GUI job signals its whole tree, which can include us.
-    crate::os::ignore(libc::SIGTERM);
-    // A standalone boot never started it.
-    let gui = os.running("lab126_gui");
-    if gui {
-        // Let KUAL close its menu before the UI goes away.
-        os.sleep(Duration::from_secs(2));
-        log("stopping the Kindle UI");
-        os.stop("lab126_gui");
-        os.sleep(Duration::from_secs(2));
-    }
-    // kindil draws to the framebuffer itself: X has nothing to do while it
-    // runs. The way back starts it again, and Amazon's UI with it.
-    if os.running("x") {
-        os.stop("x");
-    }
-    // kindil does powerd's work itself: battery, front light, charging
-    // limits, sleep and the power button. Stopped first, and before kindil
-    // starts: stopping powerd switches the front light off, which kindil
-    // then sets.
-    if os.running("powerd") {
-        log("stopping powerd");
-        os.stop("powerd");
-    }
+    let ready = match Session::start().pick(&files) {
+        Ok(ready) => ready,
+        Err(ended) => return ended,
+    };
+    let aside = ready.step_aside(paths, os);
     std::thread::scope(|scope| {
         // The rest in the background, so kindil starts at once. Ended before
         // anything is brought back, so the two never race. Through Builder:
         // scope.spawn panics if no thread can be made; then one round now.
         let (done, rounds) = mpsc::channel::<()>();
-        let usb_drive = usb.is_some();
+        let usb_drive = aside.state_data.usb.is_some();
         let stopper = std::thread::Builder::new()
             .spawn_scoped(scope, move || {
                 stop_services(os, &rounds, STOP_ROUNDS, usb_drive);
@@ -413,19 +552,19 @@ pub fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
         // Amazon's screen modules would draw over kindil in USB drive mode
         // and after it; kindil draws its own screens. Only Amazon's UI loads
         // them.
-        if gui {
+        if aside.state_data.gui {
             os.lipc_set("com.lab126.blanket", "unload", "usb");
             os.lipc_set("com.lab126.blanket", "unload", "splash");
         }
         os.clear_screen();
-        run(paths, os, &files, slot, bin);
+        aside.run(paths, os, &files);
         drop(done);
         if let Ok(stopper) = stopper {
             let _ = stopper.join();
         }
-        restore(paths, os, gui, usb);
-    });
-    ExitCode::SUCCESS
+        aside.restore(paths, os)
+    })
+    .end()
 }
 
 /// Up to `rounds` rounds STOP_EVERY apart, until `done` ends.
@@ -463,10 +602,9 @@ fn run(paths: &Paths, os: &dyn Os, files: &Files, mut slot: PathBuf, mut bin: Pa
         log(&os.version(&bin).unwrap_or_else(|| "kindil ?".into()));
         let status = os.run(&bin, &args);
         log(&format!("kindil exited ({status})"));
-        if files.trying.exists() {
+        if files.end_trial() {
             // The trial ended before kindil kept it: back to the previous
             // binary.
-            files.drop_trial();
             log("the update ended early; back to the previous version");
             if status == 0 {
                 break;
@@ -510,44 +648,6 @@ fn end_children(paths: &Paths, os: &dyn Os) {
     }
 }
 
-/// Amazon's UI back, with everything it needs.
-fn restore(paths: &Paths, os: &dyn Os, gui: bool, usb: Option<UsbDrive>) {
-    // A standalone boot skipped Amazon's framework: without it, Amazon's UI
-    // is an empty screen. `launcher boot` sets the flag again after a boot
-    // kindil stays up.
-    let _ = std::fs::remove_file(&paths.skip);
-    // kindil may have paused charging for the temperature (src/power.rs);
-    // powerd, back now, keeps its own range.
-    let _ = std::fs::write(&paths.charger, "1");
-    if !os.running("powerd") {
-        os.start("powerd");
-    }
-    // Before Amazon's UI, which expects the storage volumd's. Its start runs
-    // kindil's boot job again, which does nothing twice in a boot.
-    if let Some(usb) = usb {
-        usb.restore(os);
-    }
-    if gui {
-        os.lipc_set("com.lab126.blanket", "load", "usb");
-        os.lipc_set("com.lab126.blanket", "load", "splash");
-    }
-    log("starting the Kindle UI");
-    wifi_back(paths, os);
-    // kindil, even one that crashed, may have let its SSH port in.
-    os.close_port(crate::SSH_PORT);
-    for job in SERVICES {
-        if !os.running(job) {
-            os.start(job);
-        }
-    }
-    if os.running("x") {
-        os.start("lab126_gui");
-    } else {
-        os.start("x");
-    }
-    let _ = std::fs::remove_file(&paths.pid_file);
-}
-
 /// kindil ran Wi-Fi itself (src/net.rs): its DHCP client and wpa_supplicant
 /// go, and so does its SSH server (src/ssh.rs) with the sessions open over
 /// it, and wifid starts Amazon's supplicant afresh. The driver stays loaded:
@@ -571,11 +671,213 @@ fn wifi_back(paths: &Paths, os: &dyn Os) {
     }
 }
 
+pub use lifecycle::Ended;
+use lifecycle::Session;
+
+/// The session as typestate: once Amazon's UI, X or powerd have stopped
+/// (`Aside`), the only way to the session's result, [`Ended`], is
+/// `Session::restore`. What that covers, and what it can't:
+///
+/// - Every return: [`session`] must return an [`Ended`], which only
+///   `pick`'s refusal (before anything stopped) and a `Restored`
+///   session make; once `step_aside` took the `Ready` session, a refusal is
+///   no longer to be had. The transitions are `#[must_use]`.
+/// - Not a `Session<Aside>` dropped on purpose: Rust has no linear types,
+///   so code could drop one and then loop forever or exit the process.
+///   None does.
+/// - Not a panic: the release build aborts, so no `Drop` runs on one, and
+///   a drop guard would cover nothing the types don't. The launcher keeps
+///   to code that doesn't panic instead (no indexing, no unwraps), and a
+///   reboot is always a way back (see the module's head).
+/// - Not a kill: SIGKILL ends the launcher wherever it is; HUP and TERM
+///   are ignored.
+mod lifecycle {
+    use super::{executable, log, run, wifi_back, Files, UsbDrive};
+    use crate::os::Os;
+    use crate::{Paths, SERVICES};
+    use statum::{machine, state, transition};
+    use std::path::PathBuf;
+    use std::process::ExitCode;
+
+    /// What only this module can make.
+    pub(super) struct Seal(());
+
+    /// How a session ended: `main`'s exit code.
+    #[must_use = "the session's result is its exit code"]
+    pub struct Ended(ExitCode);
+
+    impl Ended {
+        pub fn code(self) -> ExitCode {
+            self.0
+        }
+    }
+
+    /// The binary to run, and the slot it came from.
+    pub(super) struct Picked {
+        slot: PathBuf,
+        bin: PathBuf,
+    }
+
+    /// What stepped aside, to bring back.
+    pub(super) struct Away {
+        pub(super) gui: bool,
+        pub(super) usb: Option<UsbDrive>,
+        picked: Picked,
+    }
+
+    #[state]
+    pub(super) enum SessionState {
+        /// Nothing picked or stopped yet.
+        Starting,
+        /// A runnable binary picked; nothing stopped yet.
+        Ready(Picked),
+        /// Amazon's UI, X and powerd stopped (the rest stop in the
+        /// background): only `restore` leaves.
+        Aside(Away),
+        /// Amazon's UI and everything it needs started again.
+        Restored,
+    }
+
+    #[machine]
+    pub(super) struct Session<SessionState> {
+        seal: Seal,
+    }
+
+    impl Session<Starting> {
+        /// Through a state without data: statum's builder for one with data
+        /// keeps a panic (an `expect` it never takes) in the release build.
+        pub(super) fn start() -> Self {
+            Self::builder().seal(Seal(())).build()
+        }
+    }
+
+    #[transition]
+    impl Session<Starting> {
+        /// The binary to run, or the session refused with nothing stopped.
+        pub(super) fn pick(self, files: &Files) -> ::core::result::Result<Session<Ready>, Ended> {
+            let slot = files.installed.clone();
+            let bin = files.pick(&slot);
+            if !executable(&bin) {
+                log(&format!("missing {}", bin.display()));
+                return Err(Ended(ExitCode::FAILURE));
+            }
+            Ok(self.transition_with(Picked { slot, bin }))
+        }
+    }
+
+    #[transition]
+    impl Session<Ready> {
+        /// Amazon's UI, X and powerd stop; what USB drive mode needs back is
+        /// read first.
+        #[must_use = "once Amazon's UI has stopped, only restore() brings it back"]
+        pub(super) fn step_aside(self, paths: &Paths, os: &dyn Os) -> Session<Aside> {
+            let usb = UsbDrive::read(paths, os);
+            // Stopping the GUI job signals its whole tree, which can include
+            // us.
+            crate::os::ignore(libc::SIGTERM);
+            // A standalone boot never started it.
+            let gui = os.running("lab126_gui");
+            if gui {
+                // Let KUAL close its menu before the UI goes away.
+                os.sleep(std::time::Duration::from_secs(2));
+                log("stopping the Kindle UI");
+                os.stop("lab126_gui");
+                os.sleep(std::time::Duration::from_secs(2));
+            }
+            // kindil draws to the framebuffer itself: X has nothing to do
+            // while it runs. The way back starts it again, and Amazon's UI
+            // with it.
+            if os.running("x") {
+                os.stop("x");
+            }
+            // kindil does powerd's work itself: battery, front light,
+            // charging limits, sleep and the power button. Stopped first,
+            // and before kindil starts: stopping powerd switches the front
+            // light off, which kindil then sets.
+            if os.running("powerd") {
+                log("stopping powerd");
+                os.stop("powerd");
+            }
+            self.transition_map(|picked| Away { gui, usb, picked })
+        }
+    }
+
+    impl Session<Aside> {
+        /// Runs kindil until it exits for good.
+        pub(super) fn run(&self, paths: &Paths, os: &dyn Os, files: &Files) {
+            let picked = &self.state_data.picked;
+            run(paths, os, files, picked.slot.clone(), picked.bin.clone());
+        }
+    }
+
+    #[transition]
+    impl Session<Aside> {
+        /// Amazon's UI back, with everything it needs.
+        #[must_use = "the session ends with end()"]
+        pub(super) fn restore(self, paths: &Paths, os: &dyn Os) -> Session<Restored> {
+            let (gui, usb) = (self.state_data.gui, self.state_data.usb);
+            // A standalone boot skipped Amazon's framework: without it,
+            // Amazon's UI is an empty screen. `launcher boot` sets the flag
+            // again after a boot kindil stays up.
+            let _ = std::fs::remove_file(&paths.skip);
+            // kindil may have paused charging for the temperature
+            // (src/power.rs); powerd, back now, keeps its own range.
+            let _ = std::fs::write(&paths.charger, "1");
+            if !os.running("powerd") {
+                os.start("powerd");
+            }
+            // Before Amazon's UI, which expects the storage volumd's. Its
+            // start runs kindil's boot job again, which does nothing twice in
+            // a boot.
+            if let Some(usb) = usb {
+                usb.restore(os);
+            }
+            if gui {
+                os.lipc_set("com.lab126.blanket", "load", "usb");
+                os.lipc_set("com.lab126.blanket", "load", "splash");
+            }
+            log("starting the Kindle UI");
+            wifi_back(paths, os);
+            // kindil, even one that crashed, may have let its SSH port in.
+            os.close_port(crate::SSH_PORT);
+            for job in SERVICES {
+                if !os.running(job) {
+                    os.start(job);
+                }
+            }
+            if os.running("x") {
+                os.start("lab126_gui");
+            } else {
+                os.start("x");
+            }
+            let _ = std::fs::remove_file(&paths.pid_file);
+            self.transition()
+        }
+    }
+
+    impl Session<Restored> {
+        pub(super) fn end(self) -> Ended {
+            Ended(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// The session's and the trial's graphs, for docs/state-machines.md.
+#[cfg(test)]
+pub(crate) fn graphs() -> [statum::StableGraphMetadata; 2] {
+    use statum::MachineIntrospection;
+    [
+        statum::StableGraphMetadata::from_graph(Session::<lifecycle::Starting>::GRAPH),
+        statum::StableGraphMetadata::from_graph(Trial::<steps::Staged>::GRAPH),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::os::fake::Fake;
     use std::collections::BTreeSet;
+    use std::process::ExitCode;
 
     struct Env {
         dir: tempfile::TempDir,
@@ -659,7 +961,7 @@ mod tests {
         }
 
         fn session(&self, os: &Fake) -> ExitCode {
-            session(&self.paths, os)
+            session(&self.paths, os).code()
         }
     }
 
@@ -727,6 +1029,57 @@ mod tests {
         env.session(&Fake::default());
         assert_eq!(env.files(), "kindil");
         assert_eq!(env.running(), "kindil 1.0.0");
+    }
+
+    #[test]
+    fn inconsistent_trial_files_roll_back_and_the_current_binary_runs() {
+        for leftover in ["kindil.trying", "marker"] {
+            let env = Env::new();
+            env.fake(&env.ext("kindil"), "1.0.0", "exit 0");
+            if leftover == "marker" {
+                std::fs::write(env.paths.run.join("trying"), "").unwrap();
+            } else {
+                env.fake(&env.ext("kindil.trying"), "2.0.0", "exit 0");
+            }
+            env.session(&Fake::default());
+            assert_eq!(env.files(), "kindil", "{leftover}");
+            assert!(!env.paths.run.join("trying").exists(), "{leftover}");
+            assert_eq!(env.running(), "kindil 1.0.0", "{leftover}");
+        }
+    }
+
+    #[test]
+    fn the_trial_files_rebuild_one_state_or_say_whats_wrong() {
+        let env = Env::new();
+        let files = Files::new(&env.paths);
+        let read = || match Trial::read(&files) {
+            Ok(trial::SomeState::Idle(_)) => "idle".to_owned(),
+            Ok(trial::SomeState::Staged(_)) => "staged".to_owned(),
+            Ok(trial::SomeState::Trying(_)) => "trying".to_owned(),
+            Err(error) => format!("{error:?}"),
+        };
+        for (next, trial, marker, want) in [
+            (false, false, false, "idle"),
+            (true, false, false, "staged"),
+            (false, true, true, "trying"),
+            (true, true, true, "trying"),
+            (false, false, true, "MarkerWithoutBinary"),
+            (true, false, true, "MarkerWithoutBinary"),
+            (false, true, false, "BinaryWithoutMarker"),
+            (true, true, false, "BinaryWithoutMarker"),
+        ] {
+            for (on, path) in [
+                (next, &files.next),
+                (trial, &files.trial),
+                (marker, &files.trying),
+            ] {
+                let _ = std::fs::remove_file(path);
+                if on {
+                    std::fs::write(path, "").unwrap();
+                }
+            }
+            assert_eq!(read(), want, "next {next}, trial {trial}, marker {marker}");
+        }
     }
 
     fn counting(env: &Env, word: &str, then: &str) -> String {

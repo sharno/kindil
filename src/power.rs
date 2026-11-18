@@ -68,8 +68,8 @@ pub trait Sleeper {
     fn plugged(&self) -> bool;
     /// How many times the power button was pressed since kindil started.
     fn presses(&self) -> u64;
-    /// Suspends, with a wake alarm this far ahead if any; returns once awake.
-    fn suspend(&self, alarm: Option<Duration>) -> anyhow::Result<()>;
+    /// Suspends until `wake` (src/suspend.rs); returns once awake.
+    fn suspend(&self, wake: crate::suspend::Wake) -> anyhow::Result<()>;
     /// Seconds since the epoch.
     fn now(&self) -> i64;
     fn battery(&self) -> anyhow::Result<Battery>;
@@ -105,19 +105,27 @@ enum Woke {
 /// untouched. And it is no sleep at all while a charger is in: the decision
 /// to sleep was taken on a reading from before it was plugged.
 pub fn sleep(device: &impl Sleeper, why: crate::system::Why) -> anyhow::Result<Slept> {
+    use crate::suspend::{Asked, Wake};
     use crate::system::Why;
     loop {
         let plugged = device.plugged();
-        if why == Why::BatteryEmpty && plugged {
-            device.note("sleep: a charger is connected; no sleep for the battery");
-            return Ok(Slept::Charging);
-        }
         // A nap's alarm must not wake a sleep the user asked for; on
-        // battery, a check of its own every few hours does.
-        let check = (!plugged).then_some(CHECK_ASLEEP);
-        let due = check.map(|after| device.now() + after.as_secs() as i64);
+        // battery, a check of its own every few hours does. Only a sleep
+        // the user asked for may go without it: the battery's must check.
+        let wake = match (plugged, Asked::of(why)) {
+            (false, Some(asked)) => Wake::AlarmOrButton(CHECK_ASLEEP, asked),
+            (false, None) => Wake::Alarm(CHECK_ASLEEP),
+            (true, Some(asked)) => Wake::Button(asked),
+            (true, None) => {
+                device.note("sleep: a charger is connected; no sleep for the battery");
+                return Ok(Slept::Charging);
+            }
+        };
+        let due = wake
+            .alarm()
+            .map(|after| device.now() + after.as_secs() as i64);
         let presses = device.presses();
-        device.suspend(check)?;
+        device.suspend(wake)?;
         if due.is_some_and(|due| alarm_woke(due, device.now())) {
             let battery = device.battery()?;
             if critical(battery) {
@@ -198,6 +206,7 @@ mod tests {
         presses: Vec<u64>,
         percent: u8,
         alarms: std::cell::RefCell<Vec<Option<Duration>>>,
+        wakes_asked: std::cell::RefCell<Vec<crate::suspend::Wake>>,
         notes: std::cell::RefCell<Vec<String>>,
     }
 
@@ -210,6 +219,7 @@ mod tests {
                 presses: presses.to_vec(),
                 percent: 4,
                 alarms: std::cell::RefCell::default(),
+                wakes_asked: std::cell::RefCell::default(),
                 notes: std::cell::RefCell::default(),
             }
         }
@@ -229,8 +239,9 @@ mod tests {
                 .filter(|&&at| at <= self.clock.get())
                 .count() as u64
         }
-        fn suspend(&self, alarm: Option<Duration>) -> anyhow::Result<()> {
-            self.alarms.borrow_mut().push(alarm);
+        fn suspend(&self, wake: crate::suspend::Wake) -> anyhow::Result<()> {
+            self.alarms.borrow_mut().push(wake.alarm());
+            self.wakes_asked.borrow_mut().push(wake);
             let wake = self
                 .wakes
                 .borrow_mut()
@@ -321,6 +332,25 @@ mod tests {
         let device = Device::new(&[45_000], Some(0), &[]);
         assert_eq!(sleep(&device, Why::Asked).unwrap(), Slept::Woken);
         assert_eq!(*device.alarms.borrow(), [None]);
+    }
+
+    /// The battery's sleep never goes without its check's alarm: no alarm,
+    /// no suspend (src/suspend.rs). Only a sleep the user asked for falls
+    /// back to the power button.
+    #[test]
+    fn only_a_sleep_the_user_asked_for_may_go_without_an_alarm() {
+        use crate::suspend::{Asked, Wake};
+        let device = Device::new(&[45_000], None, &[45_000]);
+        sleep(&device, Why::BatteryEmpty).unwrap();
+        assert_eq!(*device.wakes_asked.borrow(), [Wake::Alarm(CHECK_ASLEEP)]);
+        let asked = Asked::of(Why::Asked).unwrap();
+        let device = Device::new(&[45_000], None, &[]);
+        sleep(&device, Why::Asked).unwrap();
+        assert_eq!(
+            *device.wakes_asked.borrow(),
+            [Wake::AlarmOrButton(CHECK_ASLEEP, asked)]
+        );
+        assert_eq!(Asked::of(Why::BatteryEmpty), None);
     }
 
     #[test]

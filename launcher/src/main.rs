@@ -22,6 +22,8 @@ mod boot;
 mod os;
 mod overlay;
 mod session;
+#[cfg(test)]
+mod state_machines;
 
 use std::path::PathBuf;
 
@@ -165,7 +167,7 @@ fn main() -> std::process::ExitCode {
     let command = std::env::args_os().nth(1);
     match command.as_ref().and_then(|c| c.to_str()) {
         Some("start") => start(&paths, &os),
-        Some("session") => return session::session(&paths, &os),
+        Some("session") => return session::session(&paths, &os).code(),
         // Always 0: bin/boot.sh takes any other exit for a crash and
         // brings Amazon's UI.
         Some("boot") => boot::boot(&paths, &os),

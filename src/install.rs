@@ -139,64 +139,243 @@ pub fn install(
 }
 
 fn run(id: &str, paths: &Paths, timing: &Timing, kindle: &dyn Kindle) -> anyhow::Result<()> {
-    let bundle = std::fs::read(paths.deploy.join("bundle.tgz")).context("failed: no bundle")?;
-    let expected = std::fs::read_to_string(paths.deploy.join("bundle.sha256"))
-        .context("failed: no checksum")?;
-    if sha256(&bundle) != expected.trim() {
-        bail!("failed: checksum mismatch");
+    let env = steps::Env {
+        paths,
+        timing,
+        kindle,
+    };
+    // Nothing changes before the backup: a failed check or backup is only
+    // an error. From the stop on, every failure rolls back.
+    let stopped = steps::check(id, paths)?.back_up(paths)?.stop(&env);
+    let kept = stopped
+        .place(paths)
+        .and_then(|placed| placed.start(&env).come_up(&env))
+        .and_then(|up| up.hold(&env));
+    match kept {
+        Ok(_) => Ok(()),
+        Err(failed) => Err(failed.roll_back(&env).into_error()),
     }
-    let staged = paths.deploy.join("x");
-    let _ = std::fs::remove_dir_all(&staged);
-    tar::Archive::new(flate2::read::GzDecoder::new(bundle.as_slice()))
-        .unpack(&staged)
-        .context("failed: can't unpack")?;
-    let new = staged.join("extensions/kindil");
-    let version =
-        version_of(&new.join("bin/kindil")).context("failed: the new binary won't run")?;
-    let rollback = paths.deploy.join("kindil.rollback");
-    if rollback.exists() {
-        executable(&rollback).context("failed: can't use the rollback binary")?;
-    }
-    // Everything as it is now, to put back if the new version doesn't come up.
-    let backup = paths.deploy.join("extension-backup.tar");
-    archive(&paths.extension, &backup).context("failed: can't back up the extension")?;
-    // Small (half a MB): kept on the user storage beside the bundle.
-    let launcher = paths.deploy.join("launcher-backup");
-    let _ = std::fs::remove_file(&launcher);
-    if paths.launcher.exists() {
-        std::fs::copy(&paths.launcher, &launcher).context("failed: can't back up the launcher")?;
-    }
-    log(id, &format!("installing {version}"));
+}
 
-    kindle.stop_kindil();
-    kindle.sleep(timing.settle);
-    if let Err(error) = put_in_place(&new, &paths.extension) {
-        return rollback_to(id, paths, timing, kindle, &format!("{error:#}"));
-    }
-    kindle.start_kindil(&paths.extension);
+/// The install as typestate: each step is a method of the state before it
+/// only, so the new version is kept only once it is in place, started, up
+/// and still up a minute later, and a rollback needs a backup to go back to
+/// (a failure before it changed nothing). Outside this module no state can
+/// be made but through [`check`]: the [`Seal`] can't be.
+mod steps {
+    use super::*;
+    use statum::{machine, state, transition};
 
-    let since = Instant::now();
-    while !kindle.up(&version, &paths.run) {
-        if since.elapsed() >= timing.up_within {
-            let reason = format!(
-                "{version} not up {} s after installing",
-                timing.up_within.as_secs()
-            );
-            return rollback_to(id, paths, timing, kindle, &reason);
+    /// What only this module can make.
+    pub(super) struct Seal(());
+
+    pub(super) struct Env<'a> {
+        pub paths: &'a Paths,
+        pub timing: &'a Timing,
+        pub kindle: &'a dyn Kindle,
+    }
+
+    #[state]
+    pub(super) enum Phase {
+        /// The bundle matched its checksum and unpacked here, and its binary
+        /// runs.
+        Checked(PathBuf),
+        /// The extension and the launcher are backed up.
+        BackedUp(PathBuf),
+        /// kindil stopped, and settled.
+        Stopped(PathBuf),
+        /// Every file of the bundle in place.
+        Placed,
+        Started,
+        /// The new version runs, with its Wi-Fi.
+        Up,
+        /// And still did HOLD later: kept.
+        Kept,
+        /// A step after the backup failed, for this reason.
+        Failed(String),
+        RolledBack(String),
+    }
+
+    #[machine]
+    pub(super) struct Installing<Phase> {
+        id: String,
+        /// The new binary's `--version`.
+        version: String,
+        seal: Seal,
+    }
+
+    /// The bundle: its checksum, unpacked, its binary run, and the rollback
+    /// binary sent along, if any, runnable.
+    pub(super) fn check(id: &str, paths: &Paths) -> anyhow::Result<Installing<Checked>> {
+        let bundle = std::fs::read(paths.deploy.join("bundle.tgz")).context("failed: no bundle")?;
+        let expected = std::fs::read_to_string(paths.deploy.join("bundle.sha256"))
+            .context("failed: no checksum")?;
+        if sha256(&bundle) != expected.trim() {
+            bail!("failed: checksum mismatch");
         }
-        kindle.sleep(timing.poll);
+        let staged = paths.deploy.join("x");
+        let _ = std::fs::remove_dir_all(&staged);
+        tar::Archive::new(flate2::read::GzDecoder::new(bundle.as_slice()))
+            .unpack(&staged)
+            .context("failed: can't unpack")?;
+        let new = staged.join("extensions/kindil");
+        let version =
+            version_of(&new.join("bin/kindil")).context("failed: the new binary won't run")?;
+        let rollback = paths.deploy.join("kindil.rollback");
+        if rollback.exists() {
+            executable(&rollback).context("failed: can't use the rollback binary")?;
+        }
+        Ok(Installing::<Checked>::builder()
+            .state_data(new)
+            .id(id.to_owned())
+            .version(version)
+            .seal(Seal(()))
+            .build())
     }
-    log(
-        id,
-        &format!("up {} s after installing", since.elapsed().as_secs()),
-    );
-    kindle.sleep(timing.hold);
-    if !kindle.up(&version, &paths.run) {
-        let reason = format!("{version} down again {} s later", timing.hold.as_secs());
-        return rollback_to(id, paths, timing, kindle, &reason);
+
+    #[transition]
+    impl Installing<Checked> {
+        /// Everything as it is now, to put back if the new version doesn't
+        /// come up.
+        pub(super) fn back_up(
+            self,
+            paths: &Paths,
+        ) -> ::core::result::Result<Installing<BackedUp>, anyhow::Error> {
+            let backup = paths.deploy.join("extension-backup.tar");
+            archive(&paths.extension, &backup).context("failed: can't back up the extension")?;
+            // Small (half a MB): kept on the user storage beside the bundle.
+            let launcher = paths.deploy.join("launcher-backup");
+            let _ = std::fs::remove_file(&launcher);
+            if paths.launcher.exists() {
+                std::fs::copy(&paths.launcher, &launcher)
+                    .context("failed: can't back up the launcher")?;
+            }
+            log(&self.id, &format!("installing {}", self.version));
+            Ok(self.transition_map(|new| new))
+        }
     }
-    log(id, &format!("done: {version}"));
-    Ok(())
+
+    #[transition]
+    impl Installing<BackedUp> {
+        pub(super) fn stop(self, env: &Env) -> Installing<Stopped> {
+            env.kindle.stop_kindil();
+            env.kindle.sleep(env.timing.settle);
+            self.transition_map(|new| new)
+        }
+    }
+
+    #[transition]
+    impl Installing<Stopped> {
+        pub(super) fn place(
+            self,
+            paths: &Paths,
+        ) -> ::core::result::Result<Installing<Placed>, Installing<Failed>> {
+            match put_in_place(&self.state_data, &paths.extension) {
+                Ok(()) => Ok(self.transition()),
+                Err(error) => Err(self.transition_with(format!("{error:#}"))),
+            }
+        }
+    }
+
+    #[transition]
+    impl Installing<Placed> {
+        pub(super) fn start(self, env: &Env) -> Installing<Started> {
+            env.kindle.start_kindil(&env.paths.extension);
+            self.transition()
+        }
+    }
+
+    #[transition]
+    impl Installing<Started> {
+        /// Up within `up_within`.
+        pub(super) fn come_up(
+            self,
+            env: &Env,
+        ) -> ::core::result::Result<Installing<Up>, Installing<Failed>> {
+            let since = Instant::now();
+            while !env.kindle.up(&self.version, &env.paths.run) {
+                if since.elapsed() >= env.timing.up_within {
+                    let reason = format!(
+                        "{} not up {} s after installing",
+                        self.version,
+                        env.timing.up_within.as_secs()
+                    );
+                    return Err(self.transition_with(reason));
+                }
+                env.kindle.sleep(env.timing.poll);
+            }
+            log(
+                &self.id,
+                &format!("up {} s after installing", since.elapsed().as_secs()),
+            );
+            Ok(self.transition())
+        }
+    }
+
+    #[transition]
+    impl Installing<Up> {
+        /// Still up `hold` later: the only way to keep it.
+        pub(super) fn hold(
+            self,
+            env: &Env,
+        ) -> ::core::result::Result<Installing<Kept>, Installing<Failed>> {
+            env.kindle.sleep(env.timing.hold);
+            if !env.kindle.up(&self.version, &env.paths.run) {
+                let reason = format!(
+                    "{} down again {} s later",
+                    self.version,
+                    env.timing.hold.as_secs()
+                );
+                return Err(self.transition_with(reason));
+            }
+            log(&self.id, &format!("done: {}", self.version));
+            Ok(self.transition())
+        }
+    }
+
+    #[transition]
+    impl Installing<Failed> {
+        /// The backup back, launcher files and all, with the rollback binary
+        /// sent along if there is one, and the launcher on the system storage
+        /// as it was.
+        pub(super) fn roll_back(self, env: &Env) -> Installing<RolledBack> {
+            let (id, paths) = (&self.id, env.paths);
+            log(id, &format!("{}; rolling back", self.state_data));
+            env.kindle.stop_kindil();
+            env.kindle.sleep(env.timing.settle);
+            let restored = (|| -> anyhow::Result<()> {
+                let _ = std::fs::remove_dir_all(&paths.extension);
+                std::fs::create_dir_all(&paths.extension)?;
+                tar::Archive::new(std::fs::File::open(
+                    paths.deploy.join("extension-backup.tar"),
+                )?)
+                .unpack(&paths.extension)?;
+                let rollback = paths.deploy.join("kindil.rollback");
+                if rollback.exists() {
+                    replace(&rollback, &paths.extension.join("bin/kindil"))?;
+                    executable(&paths.extension.join("bin/kindil"))?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = restored {
+                log(id, &format!("restoring the backup failed: {error:#}"));
+            }
+            if let Err(error) = restore_launcher(paths) {
+                log(id, &format!("restoring the launcher failed: {error:#}"));
+            }
+            env.kindle.start_kindil(&paths.extension);
+            let back =
+                version_of(&paths.extension.join("bin/kindil")).unwrap_or_else(|_| "?".into());
+            log(id, &format!("rolled back to {back}"));
+            self.transition_map(|reason| reason)
+        }
+    }
+
+    impl Installing<RolledBack> {
+        pub(super) fn into_error(self) -> anyhow::Error {
+            anyhow::anyhow!("rolled back: {}", self.state_data)
+        }
+    }
 }
 
 /// Installs every file of `new` into `extension`, each written aside and
@@ -222,42 +401,6 @@ fn put_in_place(new: &Path, extension: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-fn rollback_to(
-    id: &str,
-    paths: &Paths,
-    timing: &Timing,
-    kindle: &dyn Kindle,
-    reason: &str,
-) -> anyhow::Result<()> {
-    log(id, &format!("{reason}; rolling back"));
-    kindle.stop_kindil();
-    kindle.sleep(timing.settle);
-    let restored = (|| -> anyhow::Result<()> {
-        let _ = std::fs::remove_dir_all(&paths.extension);
-        std::fs::create_dir_all(&paths.extension)?;
-        tar::Archive::new(std::fs::File::open(
-            paths.deploy.join("extension-backup.tar"),
-        )?)
-        .unpack(&paths.extension)?;
-        let rollback = paths.deploy.join("kindil.rollback");
-        if rollback.exists() {
-            replace(&rollback, &paths.extension.join("bin/kindil"))?;
-            executable(&paths.extension.join("bin/kindil"))?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = restored {
-        log(id, &format!("restoring the backup failed: {error:#}"));
-    }
-    if let Err(error) = restore_launcher(paths) {
-        log(id, &format!("restoring the launcher failed: {error:#}"));
-    }
-    kindle.start_kindil(&paths.extension);
-    let back = version_of(&paths.extension.join("bin/kindil")).unwrap_or_else(|_| "?".into());
-    log(id, &format!("rolled back to {back}"));
-    bail!("rolled back: {reason}")
 }
 
 /// The launcher as it was before the install: the backup through a file
@@ -346,6 +489,13 @@ fn archive(dir: &Path, to: &Path) -> anyhow::Result<()> {
         let _ = std::fs::remove_file(to);
     }
     result
+}
+
+/// The install's graph, for docs/state-machines.md.
+#[cfg(test)]
+pub(crate) fn graph() -> statum::StableGraphMetadata {
+    use statum::MachineIntrospection;
+    statum::StableGraphMetadata::from_graph(steps::Installing::<steps::Checked>::GRAPH)
 }
 
 /// For tests: a bundle of `files` under `extensions/kindil/`.
@@ -532,6 +682,26 @@ mod tests {
         assert_eq!(installed(&s.paths, "kindil"), "kindil 1.0.0");
         assert_eq!(launcher(&s.paths), "old launcher", "the launcher files too");
         assert_eq!(fake.calls.borrow().last().unwrap(), "start kindil 1.0.0");
+    }
+
+    #[test]
+    fn files_that_wont_go_in_place_roll_back_before_anything_starts() {
+        let s = setup();
+        // A directory where the bundle's script goes: it can't be replaced.
+        std::fs::create_dir_all(s.paths.extension.join("bin/start.sh/x")).unwrap();
+        let fake = Fake::new(&s, true, true);
+        let error = install("t", &s.paths, &timing(), &fake).unwrap_err();
+        assert!(
+            error.to_string().contains("can't install bin/start.sh"),
+            "{error}"
+        );
+        assert_eq!(installed(&s.paths, "kindil"), "kindil 1.0.0");
+        assert_eq!(launcher(&s.paths), "old launcher");
+        assert_eq!(
+            *fake.calls.borrow(),
+            ["stop", "stop", "start kindil 1.0.0"],
+            "the new version never started"
+        );
     }
 
     #[test]

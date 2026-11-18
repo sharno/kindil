@@ -9,9 +9,10 @@
 //! [`LOOP`] mounted on `/mnt/base-us` ([`Mount::Base`]), which Amazon's FUSE
 //! filesystem `fsp` shows at `/mnt/us` ([`Mount::Fsp`]). The computer gets
 //! the whole of [`DEVICE`] through the mass storage gadget's LUN. One rule
-//! keeps the FAT safe, checked before every LUN write and every mount: the
-//! LUN holds the storage and `/mnt/base-us` is mounted never at the same
-//! time.
+//! keeps the FAT safe: the LUN holds the storage and `/mnt/base-us` is
+//! mounted never at the same time. [`Storage`]'s types keep it (the LUN is
+//! written only from [`GadgetIn`], mounts need the LUN seen empty), and the
+//! device is read again before every LUN write and every mount.
 //!
 //! Three layers, each tested against [`Ops`] faked:
 //! - [`State::step`]: pure, from kernel signals to what to do. A computer
@@ -239,15 +240,19 @@ pub trait Ops {
     /// From `/proc/mounts`.
     fn mounted(&self, mount: Mount) -> bool;
     fn umount(&self, mount: Mount) -> std::io::Result<()>;
-    fn mount(&self, mount: Mount, read_only: bool) -> std::io::Result<()>;
+    /// Only with the LUN seen empty: [`proof::LunEmpty`].
+    fn mount(&self, mount: Mount, read_only: bool, lun: &proof::LunEmpty) -> std::io::Result<()>;
     fn gadget(&self) -> Gadget;
     fn load(&self, gadget: Gadget) -> std::io::Result<()>;
     fn unload(&self, gadget: Gadget) -> std::io::Result<()>;
     /// The LUN's backing file, `""` when empty; `None` without a LUN (the
     /// storage gadget isn't loaded).
     fn lun(&self) -> std::io::Result<Option<String>>;
-    /// `""` empties it.
-    fn set_lun(&self, file: &str) -> std::io::Result<()>;
+    /// [`DEVICE`] into the LUN: the computer gets the storage. Only with
+    /// both mounts seen down: [`proof::NotMounted`].
+    fn export_lun(&self, unmounted: &proof::NotMounted) -> std::io::Result<()>;
+    /// Empties the LUN.
+    fn clear_lun(&self) -> std::io::Result<()>;
     /// Drops [`LOOP`]'s cached blocks, which predate the computer's writes.
     fn flush(&self);
     /// `fsck.vfat -a` on [`LOOP`]: its exit code.
@@ -267,15 +272,6 @@ fn empty(lun: &std::io::Result<Option<String>>) -> bool {
         // Unknown: as good as set.
         Err(_) => false,
     }
-}
-
-/// The invariant's two halves.
-fn may_set_lun(ops: &dyn Ops) -> bool {
-    !ops.mounted(Mount::Base) && !ops.mounted(Mount::Fsp)
-}
-
-fn may_mount(ops: &dyn Ops) -> bool {
-    empty(&ops.lun())
 }
 
 /// The first process other than kindil's own that holds the storage, once
@@ -299,21 +295,6 @@ fn busy(ops: &dyn Ops) -> Option<Holder> {
         }
         attempt += 1;
         ops.wait(HOLDERS_EVERY);
-    }
-}
-
-/// Mounts whatever isn't, as kindil had it; no check: nothing else wrote it.
-fn remount(ops: &dyn Ops) {
-    if !may_mount(ops) {
-        crate::log!("kindil: USB drive: the LUN holds the storage; not mounting it");
-        return;
-    }
-    for mount in [Mount::Base, Mount::Fsp] {
-        if !ops.mounted(mount) {
-            if let Err(error) = ops.mount(mount, false) {
-                crate::log!("kindil: USB drive: mounting {}: {error}", mount.path());
-            }
-        }
     }
 }
 
@@ -355,24 +336,438 @@ fn restore_gadget(ops: &dyn Ops, previous: Gadget) {
     }
 }
 
-/// Undoes an export that stopped before the computer got the storage.
-fn undo(ops: &dyn Ops, previous: Gadget, refusal: Refusal) -> Refusal {
-    restore_gadget(ops, previous);
-    remount(ops);
-    refusal
+/// The storage is back with the Kindle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Back {
+    /// `None`: the computer never had it, nothing to check.
+    pub check: Option<Check>,
 }
 
-/// The computer has the storage; what to restore when it's back.
+/// The storage couldn't come back: the LUN wouldn't let go, or it wouldn't
+/// mount.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Exported {
-    pub previous: Gadget,
+pub struct Lost;
+
+pub use sequence::{
+    proof, storage, Checked, Exported, Free, GadgetIn, Mounted, Released, Remounted, Storage,
+    Unmounted,
+};
+
+/// USB drive mode's two sequences as typestate, over [`Ops`]:
+///
+/// - out: [`Mounted`] → [`Unmounted`] (`/mnt/us`, then `/mnt/base-us`) →
+///   [`Free`] (seen unmounted) → [`GadgetIn`] (the storage gadget in place
+///   of USBNetwork's) → [`Exported`] (the LUN holds the storage);
+/// - back: [`Exported`] → [`Released`] (the LUN seen empty) → [`Checked`]
+///   (`fsck` if the computer had it) → [`Remounted`] (read-only after a
+///   failed check) → the gadget reloaded.
+///
+/// The FAT's one rule, the LUN and `/mnt/base-us` never both holding the
+/// storage, is structural: [`Ops::export_lun`] needs a [`proof::NotMounted`]
+/// that only [`GadgetIn`] makes, and [`Ops::mount`] a [`proof::LunEmpty`]
+/// that every state makes but [`Exported`]. Each proof is made only after
+/// reading the device again, as defence in depth: something outside kindil
+/// may have mounted the storage or written the LUN since. No state can be
+/// made outside this module but through [`Storage::kindle`] and
+/// [`Storage::observe`] (the [`Seal`] can't be).
+mod sequence {
+    use super::*;
+    use statum::{machine, state, transition, validators, Error};
+
+    /// What the device's two dangerous writes ask for: only this module
+    /// makes them.
+    pub mod proof {
+        /// The LUN seen empty: `/mnt/base-us` may be mounted.
+        #[derive(Debug)]
+        pub struct LunEmpty(pub(super) ());
+        /// Neither mount seen up: the LUN may take the storage.
+        #[derive(Debug)]
+        pub struct NotMounted(pub(super) ());
+    }
+
+    /// What only this module can make.
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct Seal(());
+
+    /// After the storage came back: the gadget to restore, and the check.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct After {
+        previous: Gadget,
+        check: Option<Check>,
+    }
+
+    #[state]
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum StorageState {
+        /// The Kindle has it: `/mnt/us` and `/mnt/base-us`, or some of it.
+        Mounted,
+        /// Both unmounted, neither lazily.
+        Unmounted,
+        /// And seen unmounted in `/proc/mounts`.
+        Free,
+        /// The storage gadget loaded, with its LUN; the gadget it replaced.
+        GadgetIn(Gadget),
+        /// The LUN holds the storage: the computer has it.
+        Exported(Gadget),
+        /// The LUN seen empty: emptied, or the gadget unloaded.
+        Released(Gadget),
+        /// Checked, if the computer had it.
+        Checked(After),
+        /// Mounted again; read-only if the check failed.
+        Remounted(After),
+    }
+
+    #[machine]
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct Storage<StorageState> {
+        seal: Seal,
+    }
+
+    /// The states in which this machine hasn't left the storage in the LUN:
+    /// all but [`Exported`].
+    trait LunNotOurs {}
+    impl LunNotOurs for Mounted {}
+    impl LunNotOurs for Unmounted {}
+    impl LunNotOurs for Free {}
+    impl LunNotOurs for GadgetIn {}
+    impl LunNotOurs for Released {}
+    impl LunNotOurs for Checked {}
+    impl LunNotOurs for Remounted {}
+
+    fn lun_empty<S: StorageStateTrait + LunNotOurs>(
+        _: &Storage<S>,
+        ops: &dyn Ops,
+    ) -> Option<proof::LunEmpty> {
+        empty(&ops.lun()).then_some(proof::LunEmpty(()))
+    }
+
+    /// Mounts whatever isn't, as kindil had it; no check: nothing else
+    /// wrote it.
+    fn put_back<S: StorageStateTrait + LunNotOurs>(storage: &Storage<S>, ops: &dyn Ops) {
+        let Some(lun) = lun_empty(storage, ops) else {
+            crate::log!("kindil: USB drive: the LUN holds the storage; not mounting it");
+            return;
+        };
+        for mount in [Mount::Base, Mount::Fsp] {
+            if !ops.mounted(mount) {
+                if let Err(error) = ops.mount(mount, false, &lun) {
+                    crate::log!("kindil: USB drive: mounting {}: {error}", mount.path());
+                }
+            }
+        }
+    }
+
+    impl Storage<Mounted> {
+        /// The Kindle has the storage: where an export starts.
+        pub fn kindle() -> Self {
+            Self::builder().seal(Seal(())).build()
+        }
+
+        /// The storage as the device has it: in the LUN ([`Exported`],
+        /// with the storage gadget to keep), unmounted with the LUN empty
+        /// ([`Released`]), or else (some of it) mounted.
+        pub fn observe(ops: &dyn Ops) -> storage::SomeState {
+            let observed = Observed {
+                lun_empty: empty(&ops.lun()),
+                fsp: ops.mounted(Mount::Fsp),
+                base: ops.mounted(Mount::Base),
+            };
+            Storage::rebuild(&observed)
+                .seal(Seal(()))
+                .build()
+                // Every observation is one of the three; were it not, the
+                // state that must unmount and look again before anything.
+                .unwrap_or_else(|_| storage::SomeState::Mounted(Storage::kindle()))
+        }
+    }
+
+    #[transition]
+    impl Storage<Mounted> {
+        /// `/mnt/us`, then `/mnt/base-us` under it; if either won't, what
+        /// went is mounted again.
+        pub fn unmount(self, ops: &dyn Ops) -> ::core::result::Result<Storage<Unmounted>, Refusal> {
+            for mount in [Mount::Fsp, Mount::Base] {
+                if ops.mounted(mount) {
+                    if let Err(error) = ops.umount(mount) {
+                        crate::log!("kindil: USB drive: unmounting {}: {error}", mount.path());
+                        put_back(&self, ops);
+                        return Err(Refusal::Unmount(mount));
+                    }
+                }
+            }
+            Ok(self.transition())
+        }
+    }
+
+    #[transition]
+    impl Storage<Unmounted> {
+        /// Seen unmounted.
+        pub fn verify(self, ops: &dyn Ops) -> ::core::result::Result<Storage<Free>, Refusal> {
+            if let Some(mount) = [Mount::Fsp, Mount::Base]
+                .into_iter()
+                .find(|&m| ops.mounted(m))
+            {
+                crate::log!("kindil: USB drive: {} still mounted", mount.path());
+                put_back(&self, ops);
+                return Err(Refusal::Unmount(mount));
+            }
+            Ok(self.transition())
+        }
+    }
+
+    #[transition]
+    impl Storage<Free> {
+        /// The storage gadget in place of whichever is loaded.
+        pub fn load_gadget(
+            self,
+            ops: &dyn Ops,
+        ) -> ::core::result::Result<Storage<GadgetIn>, Refusal> {
+            let previous = ops.gadget();
+            let gadget_in = self.transition_with(previous);
+            if let Err(error) = swap_in(ops, previous) {
+                crate::log!("kindil: USB drive: the storage gadget: {error}");
+                return Err(gadget_in.undo(ops, Refusal::Gadget));
+            }
+            Ok(gadget_in)
+        }
+    }
+
+    impl Storage<GadgetIn> {
+        /// Undoes an export that stopped before the computer got the
+        /// storage.
+        fn undo(self, ops: &dyn Ops, refusal: Refusal) -> Refusal {
+            restore_gadget(ops, self.state_data);
+            put_back(&self, ops);
+            refusal
+        }
+
+        /// Both mounts seen down, now.
+        fn not_mounted(&self, ops: &dyn Ops) -> Option<proof::NotMounted> {
+            (!ops.mounted(Mount::Base) && !ops.mounted(Mount::Fsp)).then_some(proof::NotMounted(()))
+        }
+    }
+
+    #[transition]
+    impl Storage<GadgetIn> {
+        /// Marks the storage away, to check it after a yank, and only then
+        /// puts it in the LUN, while the cable is in.
+        pub fn export(self, ops: &dyn Ops) -> ::core::result::Result<Storage<Exported>, Refusal> {
+            if !ops.plugged() {
+                return Err(self.undo(ops, Refusal::Unplugged));
+            }
+            let Some(not_mounted) = self.not_mounted(ops) else {
+                crate::log!("kindil: USB drive: the storage was mounted again; not exporting");
+                return Err(self.undo(ops, Refusal::Unmount(Mount::Base)));
+            };
+            if let Err(error) = ops.set_exported(true) {
+                crate::log!("kindil: USB drive: marking the storage away: {error}");
+                return Err(self.undo(ops, Refusal::Flag));
+            }
+            if let Err(error) = ops.export_lun(&not_mounted) {
+                crate::log!("kindil: USB drive: writing the LUN: {error}");
+                if empty(&ops.lun()) {
+                    let _ = ops.set_exported(false);
+                }
+                return Err(self.undo(ops, Refusal::Gadget));
+            }
+            crate::log!("kindil: USB drive: the computer has the storage");
+            Ok(self.transition_map(|previous| previous))
+        }
+    }
+
+    #[transition]
+    impl Storage<Exported> {
+        /// The storage out of the LUN: emptied, or, if the gadget won't let
+        /// go (the computer locked it), the gadget unloaded; and seen out.
+        pub fn release(self, ops: &dyn Ops) -> ::core::result::Result<Storage<Released>, Lost> {
+            for attempt in 0..LUN_TRIES {
+                if empty(&ops.lun()) {
+                    return Ok(self.transition_map(|previous| previous));
+                }
+                if let Err(error) = ops.clear_lun() {
+                    crate::log!("kindil: USB drive: emptying the LUN: {error}");
+                }
+                if empty(&ops.lun()) {
+                    return Ok(self.transition_map(|previous| previous));
+                }
+                if attempt + 1 < LUN_TRIES {
+                    ops.wait(LUN_EVERY);
+                }
+            }
+            crate::log!("kindil: USB drive: the LUN won't empty; unloading the gadget");
+            if let Err(error) = ops.unload(Gadget::Storage) {
+                crate::log!("kindil: USB drive: unloading g_file_storage: {error}");
+            }
+            if empty(&ops.lun()) {
+                Ok(self.transition_map(|previous| previous))
+            } else {
+                Err(Lost)
+            }
+        }
+    }
+
+    #[transition]
+    impl Storage<Released> {
+        /// `fsck` if [`EXPORTED`] says a computer may have written it.
+        pub fn check(self, ops: &dyn Ops) -> Storage<Checked> {
+            let check = ops.exported().then(|| {
+                ops.flush();
+                let check = Check::of(ops.fsck());
+                crate::log!("kindil: USB drive: storage check: {check:?}");
+                check
+            });
+            self.transition_map(|previous| After { previous, check })
+        }
+    }
+
+    #[transition]
+    impl Storage<Checked> {
+        /// `/mnt/base-us`, read-only if the check failed, and `/mnt/us`
+        /// over it; [`EXPORTED`] cleared unless read-only, so a storage left
+        /// unchecked is checked again at the next start.
+        pub fn mount(self, ops: &dyn Ops) -> ::core::result::Result<Storage<Remounted>, Lost> {
+            let read_only = self.state_data.check.is_some_and(Check::read_only);
+            // The rule, again: nothing may have set the LUN since.
+            let Some(lun) = lun_empty(&self, ops) else {
+                crate::log!("kindil: USB drive: the LUN holds the storage; not mounting it");
+                return Err(Lost);
+            };
+            for mount in [Mount::Base, Mount::Fsp] {
+                if !ops.mounted(mount) {
+                    // fsp over a read-only FAT is read-only too.
+                    let read_only = read_only && mount == Mount::Base;
+                    if let Err(error) = ops.mount(mount, read_only, &lun) {
+                        crate::log!("kindil: USB drive: mounting {}: {error}", mount.path());
+                        return Err(Lost);
+                    }
+                }
+            }
+            if !read_only {
+                if let Err(error) = ops.set_exported(false) {
+                    crate::log!("kindil: USB drive: clearing {EXPORTED}: {error}");
+                }
+            }
+            Ok(self.transition_map(|after| after))
+        }
+    }
+
+    impl Storage<Remounted> {
+        pub fn back(&self) -> Back {
+            Back {
+                check: self.state_data.check,
+            }
+        }
+
+        /// The gadget from before the export back.
+        pub fn reload(self, ops: &dyn Ops) -> Back {
+            restore_gadget(ops, self.state_data.previous);
+            self.back()
+        }
+    }
+
+    impl Storage<Released> {
+        /// Mounted again without a check: nothing else wrote it.
+        pub fn put_back(self, ops: &dyn Ops) {
+            put_back(&self, ops);
+        }
+    }
+
+    impl Storage<Mounted> {
+        /// Whatever isn't mounted, mounted again.
+        pub fn put_back(self, ops: &dyn Ops) {
+            put_back(&self, ops);
+        }
+    }
+
+    /// What the device shows, read once each.
+    struct Observed {
+        lun_empty: bool,
+        fsp: bool,
+        base: bool,
+    }
+
+    fn when<T>(holds: bool, data: T) -> statum::Result<T> {
+        if holds {
+            Ok(data)
+        } else {
+            Err(Error::InvalidState)
+        }
+    }
+
+    /// Only what the device shows: the steps between are this run's own.
+    #[validators(Storage)]
+    impl Observed {
+        fn is_mounted(&self) -> statum::Result<()> {
+            when(self.lun_empty && (self.fsp || self.base), ())
+        }
+        fn is_unmounted(&self) -> statum::Result<()> {
+            Err(Error::InvalidState)
+        }
+        fn is_free(&self) -> statum::Result<()> {
+            Err(Error::InvalidState)
+        }
+        fn is_gadget_in(&self) -> statum::Result<Gadget> {
+            Err(Error::InvalidState)
+        }
+        /// An earlier kindil exported it: the storage gadget stays.
+        fn is_exported(&self) -> statum::Result<Gadget> {
+            when(!self.lun_empty, Gadget::Storage)
+        }
+        fn is_released(&self) -> statum::Result<Gadget> {
+            when(self.lun_empty && !self.fsp && !self.base, Gadget::Storage)
+        }
+        fn is_checked(&self) -> statum::Result<After> {
+            Err(Error::InvalidState)
+        }
+        fn is_remounted(&self) -> statum::Result<After> {
+            Err(Error::InvalidState)
+        }
+    }
 }
 
 /// Hands the storage to the computer: refused while anything but kindil
 /// holds it (kindil releases its own first); synced; `/mnt/us` then
 /// `/mnt/base-us` unmounted and seen unmounted; the storage gadget in
 /// place of USBNetwork's; and only then the partition in the LUN.
-pub fn export(ops: &dyn Ops) -> Result<Exported, Refusal> {
+///
+/// Those steps in that order, as [`Storage`] has them:
+///
+/// ```
+/// use kindil::drive::{Exported, Ops, Refusal, Storage};
+/// fn export(ops: &dyn Ops) -> Result<Storage<Exported>, Refusal> {
+///     Storage::kindle().unmount(ops)?.verify(ops)?.load_gadget(ops)?.export(ops)
+/// }
+/// ```
+///
+/// A storage not seen unmounted has no export:
+///
+/// ```compile_fail
+/// use kindil::drive::{Exported, Ops, Refusal, Storage};
+/// fn export(ops: &dyn Ops) -> Result<Storage<Exported>, Refusal> {
+///     Storage::kindle().unmount(ops)?.load_gadget(ops)?.export(ops)
+/// }
+/// ```
+///
+/// One the computer has can't be mounted, only released first:
+///
+/// ```compile_fail
+/// use kindil::drive::{Exported, Ops, Storage};
+/// fn mount(ops: &dyn Ops, storage: Storage<Exported>) {
+///     let _ = storage.check(ops);
+/// }
+/// ```
+///
+/// Nor can a state, or a proof the device asks for, be made by hand:
+///
+/// ```compile_fail
+/// use kindil::drive::{Exported, Storage};
+/// let _ = Storage::<Exported>::builder().state_data(kindil::drive::Gadget::Storage).build();
+/// ```
+///
+/// ```compile_fail
+/// let _ = kindil::drive::proof::LunEmpty(());
+/// ```
+pub fn export(ops: &dyn Ops) -> Result<Storage<Exported>, Refusal> {
     if let Some(holder) = busy(ops) {
         crate::log!(
             "kindil: USB drive: {} ({}) holds {}",
@@ -386,138 +781,26 @@ pub fn export(ops: &dyn Ops) -> Result<Exported, Refusal> {
         });
     }
     ops.sync();
-    for mount in [Mount::Fsp, Mount::Base] {
-        if ops.mounted(mount) {
-            if let Err(error) = ops.umount(mount) {
-                crate::log!("kindil: USB drive: unmounting {}: {error}", mount.path());
-                remount(ops);
-                return Err(Refusal::Unmount(mount));
-            }
-        }
-    }
-    if let Some(mount) = [Mount::Fsp, Mount::Base]
-        .into_iter()
-        .find(|&m| ops.mounted(m))
-    {
-        crate::log!("kindil: USB drive: {} still mounted", mount.path());
-        remount(ops);
-        return Err(Refusal::Unmount(mount));
-    }
-    let previous = ops.gadget();
-    if let Err(error) = swap_in(ops, previous) {
-        crate::log!("kindil: USB drive: the storage gadget: {error}");
-        return Err(undo(ops, previous, Refusal::Gadget));
-    }
-    if !ops.plugged() {
-        return Err(undo(ops, previous, Refusal::Unplugged));
-    }
-    if !may_set_lun(ops) {
-        crate::log!("kindil: USB drive: the storage was mounted again; not exporting");
-        return Err(undo(ops, previous, Refusal::Unmount(Mount::Base)));
-    }
-    if let Err(error) = ops.set_exported(true) {
-        crate::log!("kindil: USB drive: marking the storage away: {error}");
-        return Err(undo(ops, previous, Refusal::Flag));
-    }
-    if let Err(error) = ops.set_lun(DEVICE) {
-        crate::log!("kindil: USB drive: writing the LUN: {error}");
-        if empty(&ops.lun()) {
-            let _ = ops.set_exported(false);
-        }
-        return Err(undo(ops, previous, Refusal::Gadget));
-    }
-    crate::log!("kindil: USB drive: the computer has the storage");
-    Ok(Exported { previous })
+    Storage::kindle()
+        .unmount(ops)?
+        .verify(ops)?
+        .load_gadget(ops)?
+        .export(ops)
 }
-
-/// The storage out of the LUN: emptied, or, if the gadget won't let go
-/// (the computer locked it), the gadget unloaded. True once it's out.
-fn release_lun(ops: &dyn Ops) -> bool {
-    for attempt in 0..LUN_TRIES {
-        if empty(&ops.lun()) {
-            return true;
-        }
-        if let Err(error) = ops.set_lun("") {
-            crate::log!("kindil: USB drive: emptying the LUN: {error}");
-        }
-        if empty(&ops.lun()) {
-            return true;
-        }
-        if attempt + 1 < LUN_TRIES {
-            ops.wait(LUN_EVERY);
-        }
-    }
-    crate::log!("kindil: USB drive: the LUN won't empty; unloading the gadget");
-    if let Err(error) = ops.unload(Gadget::Storage) {
-        crate::log!("kindil: USB drive: unloading g_file_storage: {error}");
-    }
-    empty(&ops.lun())
-}
-
-/// The storage is back with the Kindle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Back {
-    /// `None`: the computer never had it, nothing to check.
-    pub check: Option<Check>,
-}
-
-/// The storage couldn't come back: the LUN wouldn't let go, or it wouldn't
-/// mount.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Lost;
 
 /// Takes the storage back from the computer: out of the LUN and seen out,
 /// checked if the computer had it, mounted (read-only if the check failed),
-/// and `previous` gadget restored.
-pub fn bring_back(ops: &dyn Ops, previous: Gadget) -> Result<Back, Lost> {
-    if !release_lun(ops) {
-        return Err(Lost);
-    }
-    let back = check_and_mount(ops)?;
-    restore_gadget(ops, previous);
-    Ok(back)
-}
-
-/// With the storage unmounted and out of the LUN.
-fn check_and_mount(ops: &dyn Ops) -> Result<Back, Lost> {
-    let check = ops.exported().then(|| {
-        ops.flush();
-        let check = Check::of(ops.fsck());
-        crate::log!("kindil: USB drive: storage check: {check:?}");
-        check
-    });
-    let read_only = check.is_some_and(Check::read_only);
-    // The invariant, again: nothing may have set the LUN since.
-    if !may_mount(ops) {
-        crate::log!("kindil: USB drive: the LUN holds the storage; not mounting it");
-        return Err(Lost);
-    }
-    for mount in [Mount::Base, Mount::Fsp] {
-        if !ops.mounted(mount) {
-            // fsp over a read-only FAT is read-only too.
-            let read_only = read_only && mount == Mount::Base;
-            if let Err(error) = ops.mount(mount, read_only) {
-                crate::log!("kindil: USB drive: mounting {}: {error}", mount.path());
-                return Err(Lost);
-            }
-        }
-    }
-    // A storage left unchecked is checked again at the next start.
-    if !read_only {
-        if let Err(error) = ops.set_exported(false) {
-            crate::log!("kindil: USB drive: clearing {EXPORTED}: {error}");
-        }
-    }
-    Ok(Back { check })
+/// and the gadget from before restored.
+pub fn bring_back(ops: &dyn Ops, storage: Storage<Exported>) -> Result<Back, Lost> {
+    Ok(storage.release(ops)?.check(ops).mount(ops)?.reload(ops))
 }
 
 /// How kindil found the storage at start.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Found {
     /// Mounted, nothing to do.
     Mounted,
     /// Still in the LUN: an earlier kindil exported it and stopped.
-    Exported,
+    Exported(Storage<Exported>),
     /// Mounted again after an earlier kindil stopped mid-way.
     Remounted,
     /// [`EXPORTED`] was set: unmounted, checked and mounted again.
@@ -527,48 +810,86 @@ pub enum Found {
     Lost,
 }
 
+impl std::fmt::Debug for Found {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Found::Mounted => f.write_str("Mounted"),
+            Found::Exported(_) => f.write_str("Exported"),
+            Found::Remounted => f.write_str("Remounted"),
+            Found::Checked(check) => f.debug_tuple("Checked").field(check).finish(),
+            Found::Unchecked(refusal) => f.debug_tuple("Unchecked").field(refusal).finish(),
+            Found::Lost => f.write_str("Lost"),
+        }
+    }
+}
+
 /// Puts the storage right at start, after a kindil or a Kindle that stopped
 /// while a computer had it (the boot's own mount may cover a FAT the
 /// computer left half-written). The UI has released the storage.
 pub fn recover(ops: &dyn Ops) -> Found {
-    if !empty(&ops.lun()) {
-        return Found::Exported;
+    let observed = Storage::observe(ops);
+    if let storage::SomeState::Exported(storage) = observed {
+        return Found::Exported(storage);
     }
-    let mounted = ops.mounted(Mount::Fsp) || ops.mounted(Mount::Base);
     if !ops.exported() {
-        if ops.mounted(Mount::Fsp) && ops.mounted(Mount::Base) {
-            return Found::Mounted;
-        }
-        remount(ops);
-        return Found::Remounted;
+        return match observed {
+            storage::SomeState::Mounted(_)
+                if ops.mounted(Mount::Fsp) && ops.mounted(Mount::Base) =>
+            {
+                Found::Mounted
+            }
+            storage::SomeState::Mounted(mounted) => {
+                mounted.put_back(ops);
+                Found::Remounted
+            }
+            storage::SomeState::Released(released) => {
+                released.put_back(ops);
+                Found::Remounted
+            }
+            // Not what an observation gives.
+            _ => Found::Remounted,
+        };
     }
-    if mounted {
-        if let Some(holder) = busy(ops) {
-            crate::log!(
-                "kindil: USB drive: can't check the storage: {} ({}) holds {}",
-                holder.name,
-                holder.pid,
-                holder.path
-            );
-            return Found::Unchecked(Refusal::Busy {
-                pid: holder.pid,
-                name: holder.name,
-            });
-        }
-        ops.sync();
-        for mount in [Mount::Fsp, Mount::Base] {
-            if ops.mounted(mount) {
-                if let Err(error) = ops.umount(mount) {
-                    crate::log!("kindil: USB drive: unmounting {}: {error}", mount.path());
-                    remount(ops);
-                    return Found::Unchecked(Refusal::Unmount(mount));
+    let released = match observed {
+        storage::SomeState::Released(released) => released,
+        storage::SomeState::Mounted(mounted) => {
+            if let Some(holder) = busy(ops) {
+                crate::log!(
+                    "kindil: USB drive: can't check the storage: {} ({}) holds {}",
+                    holder.name,
+                    holder.pid,
+                    holder.path
+                );
+                return Found::Unchecked(Refusal::Busy {
+                    pid: holder.pid,
+                    name: holder.name,
+                });
+            }
+            ops.sync();
+            if let Err(refusal) = mounted.unmount(ops) {
+                return Found::Unchecked(refusal);
+            }
+            // Seen unmounted, with the LUN still empty, before the check.
+            match Storage::observe(ops) {
+                storage::SomeState::Released(released) => released,
+                storage::SomeState::Exported(storage) => return Found::Exported(storage),
+                storage::SomeState::Mounted(mounted) => {
+                    crate::log!(
+                        "kindil: USB drive: the storage was mounted again; not checking it"
+                    );
+                    mounted.put_back(ops);
+                    return Found::Unchecked(Refusal::Unmount(Mount::Base));
                 }
+                _ => return Found::Unchecked(Refusal::Unmount(Mount::Base)),
             }
         }
-    }
-    match check_and_mount(ops) {
-        Ok(Back { check: Some(check) }) => Found::Checked(check),
-        Ok(Back { check: None }) => Found::Remounted,
+        _ => return Found::Unchecked(Refusal::Unmount(Mount::Base)),
+    };
+    match released.check(ops).mount(ops) {
+        Ok(back) => match back.back() {
+            Back { check: Some(check) } => Found::Checked(check),
+            Back { check: None } => Found::Remounted,
+        },
         Err(Lost) => Found::Lost,
     }
 }
@@ -711,6 +1032,8 @@ pub trait Ui {
 pub struct Driver<'a> {
     ops: &'a dyn Ops,
     state: State,
+    /// While the computer has the storage: the only way to bring it back.
+    exported: Option<Storage<Exported>>,
 }
 
 impl<'a> Driver<'a> {
@@ -727,7 +1050,7 @@ impl<'a> Driver<'a> {
             Found::Checked(check) => Some(Notice::Checked(check)),
             Found::Unchecked(refusal) => Some(Notice::Unchecked(refusal)),
             Found::Lost => Some(Notice::Lost),
-            Found::Mounted | Found::Exported | Found::Remounted => None,
+            Found::Mounted | Found::Exported(_) | Found::Remounted => None,
         };
         if let Some(notice) = notice {
             ui.deliver(Event::DriveNotice(notice));
@@ -737,17 +1060,24 @@ impl<'a> Driver<'a> {
                 crate::log!("kindil: USB drive: loading g_file_storage: {error}");
             }
         }
-        let state = if found == Found::Exported {
-            ui.deliver(Event::Drive(crate::system::Drive::Computer));
-            State::Computer {
-                previous: Gadget::Storage,
+        let (state, exported) = match found {
+            Found::Exported(storage) => {
+                ui.deliver(Event::Drive(crate::system::Drive::Computer));
+                let previous = storage.state_data;
+                (State::Computer { previous }, Some(storage))
             }
-        } else {
-            State::Kindle {
-                plugged: ops.plugged(),
-            }
+            _ => (
+                State::Kindle {
+                    plugged: ops.plugged(),
+                },
+                None,
+            ),
         };
-        Self { ops, state }
+        Self {
+            ops,
+            state,
+            exported,
+        }
     }
 
     pub fn state(&self) -> State {
@@ -805,15 +1135,34 @@ impl<'a> Driver<'a> {
             None | Some(Command::Await(_)) => {}
             Some(Command::Export) => {
                 ui.release();
-                let result = export(self.ops);
-                match result {
-                    Ok(_) => ui.deliver(Event::Drive(crate::system::Drive::Computer)),
-                    Err(refusal) => ui.deliver(Event::DriveNotice(Notice::Refused(refusal))),
-                }
-                self.input(Input::Exported(result.map(|e| e.previous)), now, ui);
+                let result = match export(self.ops) {
+                    Ok(storage) => {
+                        ui.deliver(Event::Drive(crate::system::Drive::Computer));
+                        let previous = storage.state_data;
+                        self.exported = Some(storage);
+                        Ok(previous)
+                    }
+                    Err(refusal) => {
+                        ui.deliver(Event::DriveNotice(Notice::Refused(refusal)));
+                        Err(refusal)
+                    }
+                };
+                self.input(Input::Exported(result), now, ui);
             }
-            Some(Command::Return(previous)) => {
-                let back = bring_back(self.ops, previous);
+            Some(Command::Return(_)) => {
+                let back = match self.exported.take() {
+                    Some(storage) => bring_back(self.ops, storage),
+                    // Computer is entered only with the storage in hand;
+                    // were it not, the device says where it is.
+                    None => match Storage::observe(self.ops) {
+                        storage::SomeState::Exported(storage) => bring_back(self.ops, storage),
+                        storage::SomeState::Released(released) => released
+                            .check(self.ops)
+                            .mount(self.ops)
+                            .map(|back| back.reload(self.ops)),
+                        _ => Ok(Back { check: None }),
+                    },
+                };
                 ui.deliver(Event::Drive(crate::system::Drive::Kindle));
                 let notice = match back {
                     Ok(Back {
@@ -833,6 +1182,13 @@ impl<'a> Driver<'a> {
             }
         }
     }
+}
+
+/// USB drive mode's graph, for docs/state-machines.md.
+#[cfg(test)]
+pub(crate) fn graph() -> statum::StableGraphMetadata {
+    use statum::MachineIntrospection;
+    statum::StableGraphMetadata::from_graph(Storage::<Mounted>::GRAPH)
 }
 
 #[cfg(test)]
@@ -971,7 +1327,7 @@ mod tests {
             self.mount_cell(mount).set(false);
             Ok(())
         }
-        fn mount(&self, mount: Mount, read_only: bool) -> std::io::Result<()> {
+        fn mount(&self, mount: Mount, read_only: bool, _: &proof::LunEmpty) -> std::io::Result<()> {
             let detail = format!("{}{}", mount.path(), if read_only { " ro" } else { "" });
             self.note("mount", &detail)?;
             assert!(
@@ -1007,20 +1363,11 @@ mod tests {
         fn lun(&self) -> std::io::Result<Option<String>> {
             Ok((self.gadget.get() == Gadget::Storage).then(|| self.lun.borrow().clone()))
         }
-        fn set_lun(&self, file: &str) -> std::io::Result<()> {
-            self.note("lun", file)?;
-            assert_eq!(self.gadget.get(), Gadget::Storage, "no LUN to write");
-            if !file.is_empty() {
-                assert!(
-                    !self.base.get() && !self.fsp.get(),
-                    "INVARIANT: exporting a mounted storage"
-                );
-                assert!(self.exported.get(), "exported before the flag");
-            } else if self.locked.get() {
-                return Err(std::io::Error::from_raw_os_error(16));
-            }
-            *self.lun.borrow_mut() = file.to_owned();
-            Ok(())
+        fn export_lun(&self, _: &proof::NotMounted) -> std::io::Result<()> {
+            self.set_lun(DEVICE)
+        }
+        fn clear_lun(&self) -> std::io::Result<()> {
+            self.set_lun("")
         }
         fn flush(&self) {
             let _ = self.note("flush", "");
@@ -1043,6 +1390,24 @@ mod tests {
             self.plugged.get()
         }
         fn wait(&self, _: Duration) {}
+    }
+
+    impl Fake {
+        fn set_lun(&self, file: &str) -> std::io::Result<()> {
+            self.note("lun", file)?;
+            assert_eq!(self.gadget.get(), Gadget::Storage, "no LUN to write");
+            if !file.is_empty() {
+                assert!(
+                    !self.base.get() && !self.fsp.get(),
+                    "INVARIANT: exporting a mounted storage"
+                );
+                assert!(self.exported.get(), "exported before the flag");
+            } else if self.locked.get() {
+                return Err(std::io::Error::from_raw_os_error(16));
+            }
+            *self.lun.borrow_mut() = file.to_owned();
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -1295,11 +1660,11 @@ mod tests {
     #[test]
     fn a_locked_lun_is_released_by_unloading_the_gadget() {
         let fake = Fake::default().computer();
-        export(&fake).unwrap();
+        let exported = export(&fake).unwrap();
         fake.locked.set(true);
         fake.plugged.set(false);
         assert_eq!(
-            bring_back(&fake, Gadget::Storage),
+            bring_back(&fake, exported),
             Ok(Back {
                 check: Some(Check::Clean)
             })
@@ -1323,8 +1688,8 @@ mod tests {
             fn umount(&self, m: Mount) -> std::io::Result<()> {
                 self.0.umount(m)
             }
-            fn mount(&self, m: Mount, ro: bool) -> std::io::Result<()> {
-                self.0.mount(m, ro)
+            fn mount(&self, m: Mount, ro: bool, lun: &proof::LunEmpty) -> std::io::Result<()> {
+                self.0.mount(m, ro, lun)
             }
             fn gadget(&self) -> Gadget {
                 Gadget::Storage
@@ -1338,7 +1703,10 @@ mod tests {
             fn lun(&self) -> std::io::Result<Option<String>> {
                 Ok(Some(DEVICE.into()))
             }
-            fn set_lun(&self, _: &str) -> std::io::Result<()> {
+            fn export_lun(&self, _: &proof::NotMounted) -> std::io::Result<()> {
+                Err(std::io::Error::from_raw_os_error(16))
+            }
+            fn clear_lun(&self) -> std::io::Result<()> {
                 Err(std::io::Error::from_raw_os_error(16))
             }
             fn flush(&self) {}
@@ -1360,7 +1728,10 @@ mod tests {
         fake.fsp.set(false);
         fake.base.set(false);
         let stuck = Stuck(fake);
-        assert_eq!(bring_back(&stuck, Gadget::Storage), Err(Lost));
+        let storage::SomeState::Exported(exported) = Storage::observe(&stuck) else {
+            panic!("the LUN holds the storage")
+        };
+        assert_eq!(bring_back(&stuck, exported), Err(Lost));
         assert!(!stuck.0.did("fsck"));
         assert!(!stuck.0.base.get() && !stuck.0.fsp.get());
     }
@@ -1375,12 +1746,9 @@ mod tests {
         ] {
             let fake = Fake::default().computer();
             fake.fsck.set(code);
-            export(&fake).unwrap();
+            let exported = export(&fake).unwrap();
             fake.plugged.set(false);
-            assert_eq!(
-                bring_back(&fake, Gadget::Storage),
-                Ok(Back { check: Some(check) })
-            );
+            assert_eq!(bring_back(&fake, exported), Ok(Back { check: Some(check) }));
             assert_eq!(fake.read_only.get(), read_only, "exit {code}");
             assert_eq!(
                 fake.exported.get(),
@@ -1391,10 +1759,10 @@ mod tests {
         }
         // fsck that doesn't run at all: read-only too.
         let fake = Fake::default().computer();
-        export(&fake).unwrap();
+        let exported = export(&fake).unwrap();
         fake.fail.borrow_mut().push("fsck");
         assert_eq!(
-            bring_back(&fake, Gadget::Storage),
+            bring_back(&fake, exported),
             Ok(Back {
                 check: Some(Check::Failed(None))
             })
@@ -1548,7 +1916,7 @@ mod tests {
     #[test]
     fn a_start_while_still_exported_picks_up_with_the_computer() {
         let fake = Fake::default().computer();
-        export(&fake).unwrap();
+        let _ = export(&fake).unwrap();
         fake.log.borrow_mut().clear();
         let ui = Screen::default();
         let mut driver = Driver::start(&fake, &ui);
@@ -1568,6 +1936,109 @@ mod tests {
         let _ = Driver::start(&fake, &ui);
         assert!(fake.at_home());
         assert!(!fake.did("fsck"));
+    }
+
+    #[test]
+    fn the_device_shows_one_of_three_states() {
+        for (lun, fsp, base, want) in [
+            ("", true, true, "mounted"),
+            ("", false, true, "mounted"),
+            ("", false, false, "released"),
+            (DEVICE, false, false, "exported"),
+            (DEVICE, true, true, "exported"),
+        ] {
+            let fake = Fake::default();
+            *fake.lun.borrow_mut() = lun.into();
+            fake.fsp.set(fsp);
+            fake.base.set(base);
+            let found = match Storage::observe(&fake) {
+                storage::SomeState::Mounted(_) => "mounted",
+                storage::SomeState::Released(_) => "released",
+                storage::SomeState::Exported(_) => "exported",
+                _ => "other",
+            };
+            assert_eq!(found, want, "lun {lun:?}, fsp {fsp}, base {base}");
+        }
+        // No LUN at all (the gadget unloaded) is an empty one.
+        let fake = Fake::default();
+        fake.gadget.set(Gadget::None);
+        assert!(matches!(
+            Storage::observe(&fake),
+            storage::SomeState::Mounted(_)
+        ));
+    }
+
+    /// The check at start unmounted the storage and ran `fsck` without
+    /// looking again: a storage mounted again in between (as
+    /// `exporting_never_writes_the_lun_over_a_mounted_storage` has it for
+    /// the export) would have been checked, and repaired, while mounted.
+    #[test]
+    fn the_check_at_start_never_runs_over_a_storage_mounted_again() {
+        struct Remounting(Fake);
+        impl Ops for Remounting {
+            fn sync(&self) {}
+            fn holders(&self, m: Mount) -> Vec<Holder> {
+                self.0.holders(m)
+            }
+            fn mounted(&self, m: Mount) -> bool {
+                // Back as soon as both went.
+                if self.0.did("umount /mnt/base-us") && m == Mount::Base {
+                    self.0.base.set(true);
+                }
+                self.0.mounted(m)
+            }
+            fn umount(&self, m: Mount) -> std::io::Result<()> {
+                self.0.umount(m)
+            }
+            fn mount(&self, m: Mount, ro: bool, lun: &proof::LunEmpty) -> std::io::Result<()> {
+                self.0.mount(m, ro, lun)
+            }
+            fn gadget(&self) -> Gadget {
+                self.0.gadget()
+            }
+            fn load(&self, g: Gadget) -> std::io::Result<()> {
+                self.0.load(g)
+            }
+            fn unload(&self, g: Gadget) -> std::io::Result<()> {
+                self.0.unload(g)
+            }
+            fn lun(&self) -> std::io::Result<Option<String>> {
+                self.0.lun()
+            }
+            fn export_lun(&self, unmounted: &proof::NotMounted) -> std::io::Result<()> {
+                self.0.export_lun(unmounted)
+            }
+            fn clear_lun(&self) -> std::io::Result<()> {
+                self.0.clear_lun()
+            }
+            fn flush(&self) {}
+            fn fsck(&self) -> std::io::Result<i32> {
+                self.0.fsck()
+            }
+            fn exported(&self) -> bool {
+                self.0.exported()
+            }
+            fn set_exported(&self, on: bool) -> std::io::Result<()> {
+                self.0.set_exported(on)
+            }
+            fn plugged(&self) -> bool {
+                false
+            }
+            fn wait(&self, _: Duration) {}
+        }
+        let fake = Fake::default();
+        fake.exported.set(true);
+        let ops = Remounting(fake);
+        let found = recover(&ops);
+        assert!(
+            matches!(found, Found::Unchecked(Refusal::Unmount(Mount::Base))),
+            "{found:?}"
+        );
+        assert!(!ops.0.did("fsck"));
+        assert!(
+            ops.0.at_home() && ops.0.exported.get(),
+            "checked next start"
+        );
     }
 
     #[test]
@@ -1662,8 +2133,8 @@ mod tests {
             fn umount(&self, m: Mount) -> std::io::Result<()> {
                 self.0.umount(m)
             }
-            fn mount(&self, m: Mount, ro: bool) -> std::io::Result<()> {
-                self.0.mount(m, ro)
+            fn mount(&self, m: Mount, ro: bool, lun: &proof::LunEmpty) -> std::io::Result<()> {
+                self.0.mount(m, ro, lun)
             }
             fn gadget(&self) -> Gadget {
                 self.0.gadget()
@@ -1677,8 +2148,11 @@ mod tests {
             fn lun(&self) -> std::io::Result<Option<String>> {
                 self.0.lun()
             }
-            fn set_lun(&self, f: &str) -> std::io::Result<()> {
-                self.0.set_lun(f)
+            fn export_lun(&self, unmounted: &proof::NotMounted) -> std::io::Result<()> {
+                self.0.export_lun(unmounted)
+            }
+            fn clear_lun(&self) -> std::io::Result<()> {
+                self.0.clear_lun()
             }
             fn flush(&self) {}
             fn fsck(&self) -> std::io::Result<i32> {

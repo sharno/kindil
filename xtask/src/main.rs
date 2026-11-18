@@ -32,6 +32,8 @@ enum Task {
     Desktop,
     /// Format the Rust and Nix sources
     Fmt,
+    /// docs/state-machines.md from the statum machines' graphs
+    StateMachines,
     /// Build, then copy the binary and KUAL launcher to the Kindle
     Deploy,
     /// Install a signed GitHub release on the Kindle, with rollback
@@ -79,6 +81,7 @@ fn main() -> anyhow::Result<()> {
         Task::Sim => dev::sim(),
         Task::Desktop => dev::desktop(),
         Task::Fmt => dev::fmt(),
+        Task::StateMachines => dev::state_machines(),
         Task::Deploy => dev::deploy(),
         Task::Release {
             version,

@@ -3057,6 +3057,7 @@ dependencies = [
  "slint-backend-kindle",
  "slint-build",
  "socket2",
+ "statum",
  "tar",
  "tempfile",
  "textwrap",
@@ -3114,6 +3115,7 @@ name = "launcher"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "statum",
  "tempfile",
 ]
 
@@ -3192,6 +3194,26 @@ name = "linebender_resource_handle"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4a5ff6bcca6c4867b1c4fd4ef63e4db7436ef363e0ad7531d1558856bae64f4"
+
+[[package]]
+name = "linkme"
+version = "0.3.38"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a4e12fd3f6b22d5bc28beccac0f53bb35db4a897c6ddb709c4a0161f72eb6e"
+dependencies = [
+ "linkme-impl",
+]
+
+[[package]]
+name = "linkme-impl"
+version = "0.3.38"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cd04c256b1cd686a45898c8fd150c79b801d96a3eb7bae1075f9eb3b4b85c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
 
 [[package]]
 name = "linux-raw-sys"
@@ -5711,6 +5733,37 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "statum"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eabbdd1e888a8ea2342491cf0cddc2a4461b783f90fadde11cab830f05d051ab"
+dependencies = [
+ "statum-core",
+ "statum-macros",
+]
+
+[[package]]
+name = "statum-core"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b037b6ba7725e42cd326aaaab63f0754652f43c9d37786a21649abcecca929e"
+dependencies = [
+ "linkme",
+ "serde",
+]
+
+[[package]]
+name = "statum-macros"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db58eb6bd16486019b08bd8a2a588b5d1fe87a1e8f03555bfc0c65a379f4d60"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "strict-num"

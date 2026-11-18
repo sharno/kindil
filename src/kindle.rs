@@ -12,7 +12,7 @@ use crate::net::Net;
 use crate::networks::{self, Networks};
 use crate::system::{self, Event};
 use crate::uevent::Uevent;
-use crate::update::{Check, Commit, Github, Release, Slots, Version};
+use crate::update::{Check, Commit, Github, Ota, Release, Slots, Version};
 use crate::wifi::{Credentials, Link, Network, Ssid};
 use std::io::BufRead;
 use std::path::Path;
@@ -424,7 +424,7 @@ impl Host for KindleHost {
             recorder.note(&format!("nap: {left:?} left; not suspending"));
             return Ok(());
         }
-        sleep_once(&recorder, "nap", Some(Alarm::Required(left)))
+        sleep_once(&recorder, "nap", crate::suspend::Wake::Alarm(left))
     }
 
     /// [`sleep_once`] caught up already, before anything read the clock.
@@ -451,8 +451,10 @@ impl Host for KindleHost {
     }
 
     fn stage_update(&self, release: &Release) -> anyhow::Result<()> {
-        let binary = Github::default().download(release)?;
-        Slots::new(EXTENSION_BIN, UPDATE_TRIAL).stage(&binary, release.version)
+        Ota::available(release.clone())
+            .download(&Github::default())?
+            .stage(&Slots::new(EXTENSION_BIN, UPDATE_TRIAL))
+            .map(drop)
     }
 
     fn commit_update(&self) -> anyhow::Result<Commit> {
@@ -493,10 +495,11 @@ impl crate::power::Sleeper for Sleeping {
     fn presses(&self) -> u64 {
         PRESSES.load(std::sync::atomic::Ordering::SeqCst)
     }
-    /// The user asked for the sleep, or the battery did: without its
-    /// check's alarm it still sleeps, until the button, rather than stay up.
-    fn suspend(&self, alarm: Option<Duration>) -> anyhow::Result<()> {
-        sleep_once(&self.recorder, "sleep", alarm.map(Alarm::Wanted))
+    /// The user asked for the sleep, or the battery did: a sleep the user
+    /// asked for still sleeps without its check's alarm, until the button,
+    /// rather than stay up; the battery's doesn't (src/power.rs).
+    fn suspend(&self, wake: crate::suspend::Wake) -> anyhow::Result<()> {
+        sleep_once(&self.recorder, "sleep", wake)
     }
     fn now(&self) -> i64 {
         epoch_seconds()
@@ -515,91 +518,47 @@ impl crate::power::Sleeper for Sleeping {
 /// The last suspend's clock correction, for the doze's ledger.
 static CAUGHT_UP: Mutex<Option<crate::clock::Correction>> = Mutex::new(None);
 
-/// A suspend's wake alarm, this far ahead.
-#[derive(Clone, Copy, Debug)]
-enum Alarm {
-    /// No suspend without it: a nap's.
-    Required(Duration),
-    /// Without it the suspend lasts until the power button: a sleep's.
-    Wanted(Duration),
+/// The PW1 under a suspend (src/suspend.rs).
+struct Kernel<'a> {
+    recorder: &'a crate::flight::Recorder,
 }
 
-/// Every suspend goes through here: the wake alarm armed (or moved out of
-/// the way, for a sleep only the power button ends) as the very last thing
-/// before the suspend, read back from the RTC's registers, and no suspend
-/// at all if a [`Alarm::Required`] one fails: such a suspend could last
-/// until someone presses the button. Each step is noted in the flight
-/// recorder first. Back awake, the alarm is moved out of the way and the
-/// clock put back within the RTC's second.
+impl crate::suspend::Kernel for Kernel<'_> {
+    fn note(&self, line: &str) {
+        self.recorder.note(line);
+    }
+    fn mem(&self) -> std::io::Result<()> {
+        std::fs::write("/sys/power/state", b"mem")
+    }
+    fn epoch(&self) -> i64 {
+        epoch_seconds()
+    }
+    fn catch_up(&self) -> Option<crate::clock::Correction> {
+        crate::clock::catch_up()
+    }
+}
+
+/// Every suspend goes through here (src/suspend.rs): the wake alarm armed
+/// and read back as the very last thing before it, or, for a sleep the user
+/// asked for, moved out of the way; no suspend at all if an alarm it needs
+/// fails. The clock's correction is kept for the doze's ledger.
 fn sleep_once(
     recorder: &crate::flight::Recorder,
-    what: &str,
-    alarm: Option<Alarm>,
+    what: &'static str,
+    wake: crate::suspend::Wake,
 ) -> anyhow::Result<()> {
     let rtc = crate::wakealarm::WakeRtc::find();
-    let arm = |after| match &rtc {
-        Ok(rtc) => rtc.arm(after),
-        Err(error) => Err(anyhow::anyhow!("{error}")),
+    let env = crate::suspend::Env {
+        rtc: rtc.as_ref().map(|rtc| rtc as &dyn crate::suspend::Rtc),
+        kernel: &Kernel { recorder },
     };
-    let armed = match alarm {
-        Some(Alarm::Required(after)) => match arm(after) {
-            Ok(armed) => Some(armed),
-            Err(error) => {
-                recorder.note(&format!("{what}: not suspending: {error:#}"));
-                return Err(error.context("arming the wake alarm"));
-            }
-        },
-        Some(Alarm::Wanted(after)) => match arm(after) {
-            Ok(armed) => Some(armed),
-            Err(error) => {
-                crate::log!("kindil: {what}: no wake alarm ({error:#}); until the power button");
-                disarm(&rtc, recorder, what);
-                None
-            }
-        },
-        None => {
-            disarm(&rtc, recorder, what);
-            None
-        }
-    };
-    let rtc_name = rtc.as_ref().map(|rtc| rtc.name()).unwrap_or_default();
-    recorder.note(&match armed {
-        Some(armed) => format!("{what}: suspending, {rtc_name} {armed}"),
-        None => format!("{what}: suspending until the power button"),
-    });
-    let since = epoch_seconds();
-    let slept = std::fs::write("/sys/power/state", b"mem");
-    // The power button may have woken it first: the alarm must not wake a
-    // later suspend that didn't ask for it.
-    let rtc_now = rtc.as_ref().ok().and_then(|rtc| rtc.now().ok());
-    disarm(&rtc, recorder, what);
-    let correction = crate::clock::catch_up();
-    recorder.note(&format!(
-        "{what}: {} after {} s by the clock, {rtc_name} at {}{}",
-        match &slept {
-            Ok(()) => "resumed".to_owned(),
-            Err(error) => format!("suspend refused ({error})"),
-        },
-        epoch_seconds() - since,
-        rtc_now.map_or_else(|| "?".to_owned(), |n| n.to_string()),
-        correction.map_or_else(String::new, |c| format!("; {c}")),
-    ));
-    if let Some(correction) = correction {
+    let back = crate::suspend::once(&env, what, wake)?;
+    if let Some(correction) = back.correction {
         *lock(&CAUGHT_UP) = Some(correction);
     }
-    Ok(slept?)
-}
-
-/// Moves the alarm out of the way, if there is one; a failure is noted.
-fn disarm(
-    rtc: &anyhow::Result<crate::wakealarm::WakeRtc>,
-    recorder: &crate::flight::Recorder,
-    what: &str,
-) {
-    if let Ok(rtc) = rtc {
-        if let Err(error) = rtc.disarm() {
-            recorder.note(&format!("{what}: moving the alarm away: {error:#}"));
-        }
+    match back.refused {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
     }
 }
 
