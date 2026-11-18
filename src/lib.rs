@@ -17,6 +17,7 @@ pub mod kindle;
 pub mod launcher;
 pub mod lifeline;
 pub mod location;
+pub mod logging;
 pub mod maintenance;
 pub mod net;
 pub mod networks;

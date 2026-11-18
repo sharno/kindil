@@ -198,7 +198,7 @@ impl Net {
         let joined = self.join(candidate);
         if joined.is_err() {
             if let Err(error) = self.give(saved) {
-                eprintln!("kindil: Wi-Fi: putting the saved networks back: {error}");
+                crate::log!("kindil: Wi-Fi: putting the saved networks back: {error}");
             }
         }
         joined
@@ -308,7 +308,7 @@ impl Net {
             wifi::open(INTERFACE).and_then(|wpa| wpa.command("REASSOCIATE").map(|_| wpa));
         let Ok(wpa) = rejoined else {
             // Gone or hung (no answer within the socket's timeout).
-            eprintln!("kindil: wpa_supplicant isn't answering; starting Wi-Fi again");
+            crate::log!("kindil: wpa_supplicant isn't answering; starting Wi-Fi again");
             let saved = lock(&self.saved).clone();
             return self.start(&saved);
         };
@@ -477,13 +477,13 @@ impl Net {
     /// cleared (by the stop in `start`), wpa_supplicant started with the
     /// saved networks.
     fn fall_back(self: &Arc<Self>, why: &str) {
-        eprintln!(
+        crate::log!(
             "kindil: kindil's own Wi-Fi gives up ({why}); wpa_supplicant for the rest of this run"
         );
         self.fell_back.store(true, Ordering::SeqCst);
         let saved = lock(&self.saved).clone();
         if let Err(error) = self.start(&saved) {
-            eprintln!("kindil: Wi-Fi with wpa_supplicant: {error}; trying again");
+            crate::log!("kindil: Wi-Fi with wpa_supplicant: {error}; trying again");
             self.keep_starting();
         }
     }
@@ -534,7 +534,7 @@ impl Net {
         let switch = std::fs::read_to_string(station::SWITCH).ok();
         let chosen = backend(switch.as_deref(), self.fell_back.load(Ordering::SeqCst));
         if chosen == Backend::Kindil {
-            eprintln!(
+            crate::log!(
                 "kindil: Wi-Fi: kindil's own, without wpa_supplicant ({})",
                 station::SWITCH
             );
@@ -568,12 +568,12 @@ impl Net {
         let switch = std::fs::read_to_string(dhcpc::SWITCH).ok();
         let started = dhcpc::chosen(switch.as_deref()).then(|| {
             dhcpc::Client::start(INTERFACE, std::path::Path::new(dhcpc::RESOLV)).inspect_err(
-                |error| eprintln!("kindil: DHCP: kindil's own client: {error}; udhcpc instead"),
+                |error| crate::log!("kindil: DHCP: kindil's own client: {error}; udhcpc instead"),
             )
         });
         match started {
             Some(Ok(client)) => {
-                eprintln!("kindil: DHCP: kindil's own client ({})", dhcpc::SWITCH);
+                crate::log!("kindil: DHCP: kindil's own client ({})", dhcpc::SWITCH);
                 if self.backend() == Backend::Supplicant {
                     // wpa_supplicant joins by itself: ask at once, as udhcpc
                     // would; a join or a resume asks again.
@@ -635,7 +635,7 @@ impl Net {
                 } else {
                     (pause * 2).min(PAUSE_MAX)
                 };
-                eprintln!("kindil: {name} exited ({status:?}); starting it again in {pause:?}");
+                crate::log!("kindil: {name} exited ({status:?}); starting it again in {pause:?}");
                 let mut gone = Gone::default();
                 loop {
                     std::thread::sleep(pause);
@@ -652,7 +652,7 @@ impl Net {
                             break;
                         }
                         Err(error) => {
-                            eprintln!("kindil: {name}: {error}");
+                            crate::log!("kindil: {name}: {error}");
                             pause = (pause * 2).min(PAUSE_MAX);
                         }
                     }
@@ -693,7 +693,7 @@ impl Net {
                 } else {
                     (pause * 2).min(PAUSE_MAX)
                 };
-                eprintln!("kindil: udhcpc exited ({status}); starting it again in {pause:?}");
+                crate::log!("kindil: udhcpc exited ({status}); starting it again in {pause:?}");
                 let mut gone = Gone::default();
                 loop {
                     std::thread::sleep(pause);
@@ -718,7 +718,7 @@ impl Net {
                             break;
                         }
                         Err(error) => {
-                            eprintln!("kindil: udhcpc: {error}");
+                            crate::log!("kindil: udhcpc: {error}");
                             pause = (pause * 2).min(PAUSE_MAX);
                         }
                     }
@@ -834,7 +834,7 @@ impl Net {
                 })
                 .and_then(|socket| station::disconnect(&socket))
             {
-                eprintln!("kindil: Wi-Fi: leaving the network: {error}");
+                crate::log!("kindil: Wi-Fi: leaving the network: {error}");
             }
         }
         // Nothing to take down the first time (no driver yet): quietly.
@@ -983,7 +983,7 @@ fn retry_start(
             None => return false,
             Some(Ok(())) => return true,
             Some(Err(error)) => {
-                eprintln!("kindil: Wi-Fi with wpa_supplicant: {error}; trying again")
+                crate::log!("kindil: Wi-Fi with wpa_supplicant: {error}; trying again")
             }
         }
     }
@@ -1131,9 +1131,7 @@ pub(crate) fn terminate(file: &str) {
         if !gone_within(libc::SIGTERM, Duration::from_secs(3))
             && !gone_within(libc::SIGKILL, Duration::from_secs(2))
         {
-            // Never panics, unlike eprintln!: a full /var/local.
-            let line = format!("kindil: process {pid} ({file}) won't exit\n");
-            let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+            crate::log!("kindil: process {pid} ({file}) won't exit");
         }
     }
     let _ = std::fs::remove_file(file);
@@ -1252,13 +1250,13 @@ impl Gone {
         match (present, self.said) {
             (true, said) => {
                 if said {
-                    eprintln!("kindil: {INTERFACE} is back; starting {child}");
+                    crate::log!("kindil: {INTERFACE} is back; starting {child}");
                 }
                 self.said = false;
                 false
             }
             (false, false) => {
-                eprintln!("kindil: {INTERFACE} is gone; {child} waits for it");
+                crate::log!("kindil: {INTERFACE} is gone; {child} waits for it");
                 self.said = true;
                 true
             }

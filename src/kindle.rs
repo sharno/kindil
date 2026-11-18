@@ -76,7 +76,7 @@ impl KindleHost {
         // Amazon's UI, which ran until now, widened them (src/perms.rs):
         // narrowed before anything is read or run.
         for line in crate::perms::narrow_own(Path::new(crate::perms::RUN)) {
-            eprintln!("kindil: {line}");
+            crate::log!("kindil: {line}");
         }
         Self {
             frontlight: Frontlight::open().map_err(|e| e.to_string()),
@@ -126,7 +126,7 @@ fn guard_charging() -> anyhow::Result<()> {
     if pause != paused {
         std::fs::write(CHARGER, if pause { "0" } else { "1" })?;
         CHARGING_PAUSED.store(pause, Ordering::Relaxed);
-        eprintln!(
+        crate::log!(
             "kindil: charging {} at {temperature} °F",
             if pause { "paused" } else { "resumed" }
         );
@@ -180,7 +180,7 @@ impl Host for KindleHost {
 
     fn park_wifi(&self) {
         if let Err(error) = self.net.park() {
-            eprintln!("kindil: parking Wi-Fi: {error}");
+            crate::log!("kindil: parking Wi-Fi: {error}");
         }
     }
 
@@ -337,7 +337,7 @@ impl Host for KindleHost {
     fn info(&self) -> DeviceInfo {
         // Read each minute and each doze wake: the charging guard rides along.
         if let Err(error) = guard_charging() {
-            eprintln!("kindil: charging guard: {error}");
+            crate::log!("kindil: charging guard: {error}");
         }
         DeviceInfo {
             battery: gauge_battery().unwrap_or_else(|_| crate::battery::read(Path::new("/sys"))),
@@ -365,7 +365,7 @@ impl Host for KindleHost {
             // Without it the power button does nothing: never give up on it.
             loop {
                 if let Err(error) = power_button(|| power(Event::PowerButton)) {
-                    eprintln!("kindil: power button: {error}; listening again");
+                    crate::log!("kindil: power button: {error}; listening again");
                 }
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -401,7 +401,7 @@ impl Host for KindleHost {
             }
             // The resume lost time: back to the RTC's before reading it.
             if let Some(correction) = crate::clock::catch_up() {
-                eprintln!("kindil: {correction}");
+                crate::log!("kindil: {correction}");
             }
             let now = epoch_seconds();
             let checking = check.is_some_and(|due| crate::power::alarm_woke(due, now));
@@ -411,7 +411,7 @@ impl Host for KindleHost {
             }
             let battery = gauge_battery()?;
             if crate::power::critical(battery) {
-                eprintln!("kindil: battery critical ({battery:?}); powering off");
+                crate::log!("kindil: battery critical ({battery:?}); powering off");
                 return self.power_off();
             }
         }
@@ -460,9 +460,9 @@ impl Host for KindleHost {
         // Up for two minutes: this version's launcher is the one that starts
         // kindil from now on (src/launcher.rs).
         match crate::launcher::install(Path::new(crate::launcher::PATH)) {
-            Ok(true) => eprintln!("kindil: launcher updated"),
+            Ok(true) => crate::log!("kindil: launcher updated"),
             Ok(false) => {}
-            Err(error) => eprintln!("kindil: writing the launcher: {error:#}"),
+            Err(error) => crate::log!("kindil: writing the launcher: {error:#}"),
         }
         Ok(commit)
     }
@@ -528,20 +528,20 @@ fn power_button(pressed: impl Fn()) -> std::io::Result<()> {
 fn usb_drive(deliver: &(dyn Fn(Event) + Send + Sync), released: &crate::usb::Released) {
     let follow_volumd = || {
         if let Err(error) = volumd(deliver) {
-            eprintln!("kindil: USB drive mode: {error}");
+            crate::log!("kindil: USB drive mode: {error}");
         }
     };
     match crate::drive::Owner::read(Path::new(crate::drive::SWITCH)) {
         crate::drive::Owner::Amazon => follow_volumd(),
         crate::drive::Owner::Kindil => {
-            eprintln!("kindil: USB drive mode is kindil's; waiting for volumd to stop");
+            crate::log!("kindil: USB drive mode is kindil's; waiting for volumd to stop");
             if !crate::usb::volumd_gone() {
-                eprintln!("kindil: volumd still runs; USB drive mode stays volumd's");
+                crate::log!("kindil: volumd still runs; USB drive mode stays volumd's");
                 return follow_volumd();
             }
             loop {
                 if let Err(error) = crate::usb::run_drive(deliver, released) {
-                    eprintln!("kindil: USB drive: {error}; starting again");
+                    crate::log!("kindil: USB drive: {error}; starting again");
                 }
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -573,23 +573,23 @@ fn start_wifi(net: &Arc<Net>, networks: &Mutex<Networks>) {
         // Asked each time: switched off meanwhile, it stays off. Off still
         // takes Wi-Fi from Amazon: no Wi-Fi at all while kindil runs.
         if Net::wanted() == Power::Off {
-            eprintln!("kindil: Wi-Fi is switched off");
+            crate::log!("kindil: Wi-Fi is switched off");
             if let Err(error) = net.set(Power::Off, &saved) {
-                eprintln!("kindil: Wi-Fi off: {error}");
+                crate::log!("kindil: Wi-Fi off: {error}");
             }
             return;
         }
         match net.set(Power::On, &saved) {
             Ok(()) => {
-                eprintln!("kindil: Wi-Fi up with {} saved networks", saved.len());
+                crate::log!("kindil: Wi-Fi up with {} saved networks", saved.len());
                 return;
             }
             Err(error) if since.elapsed() < WIFI_START => {
-                eprintln!("kindil: Wi-Fi start: {error}; trying again");
+                crate::log!("kindil: Wi-Fi start: {error}; trying again");
                 std::thread::sleep(Duration::from_secs(5));
             }
             Err(error) => {
-                eprintln!("kindil: Wi-Fi start: {error}; switch Wi-Fi on to try again");
+                crate::log!("kindil: Wi-Fi start: {error}; switch Wi-Fi on to try again");
                 return;
             }
         }
@@ -604,9 +604,9 @@ fn sync_clock_once_online(net: &Net) {
     while since.elapsed() < CLOCK_SYNC_WAIT && net.power() == Power::On {
         if let Ok((Link::Associated { ip: Some(_), .. }, _)) = net.link() {
             match crate::clock::sync() {
-                Ok(Some(correction)) => eprintln!("kindil: {correction}"),
-                Ok(None) => eprintln!("kindil: clock: right by network time"),
-                Err(error) => eprintln!("kindil: clock: {error:#}"),
+                Ok(Some(correction)) => crate::log!("kindil: {correction}"),
+                Ok(None) => crate::log!("kindil: clock: right by network time"),
+                Err(error) => crate::log!("kindil: clock: {error:#}"),
             }
             return;
         }

@@ -490,7 +490,7 @@ fn prove(
     let ticket = match dhcp.ask(ssid, bssid)? {
         Ok(ticket) => ticket,
         Err(error) => {
-            eprintln!("kindil: Wi-Fi: asking for an address: {error}");
+            crate::log!("kindil: Wi-Fi: asking for an address: {error}");
             return Some(Ok(false));
         }
     };
@@ -721,7 +721,7 @@ impl Keeper {
                     Ok(None) => {
                         self.strikes = 0;
                         self.associated = false;
-                        eprintln!("kindil: Wi-Fi: lost the access point");
+                        crate::log!("kindil: Wi-Fi: lost the access point");
                         Some(State::Lost)
                     }
                 }
@@ -752,7 +752,7 @@ impl Keeper {
             Err(error) => return self.strike(cx, error, State::Attempt(None)),
         };
         if forgot {
-            eprintln!("kindil: Wi-Fi: left a network no longer saved");
+            crate::log!("kindil: Wi-Fi: left a network no longer saved");
             self.associated = false;
             self.last = None;
         }
@@ -906,14 +906,14 @@ impl Keeper {
                 self.failing_since = None;
                 self.blind_failures.clear();
                 if !self.associated {
-                    eprintln!("kindil: Wi-Fi: joined {ssid}");
+                    crate::log!("kindil: Wi-Fi: joined {ssid}");
                     cx.joined(ssid)?;
                 }
                 self.associated = true;
                 Some(State::Watch)
             }
             Ok(false) => {
-                eprintln!(
+                crate::log!(
                     "kindil: Wi-Fi: on {ssid} but no address within {} s (a wrong password?)",
                     LEASE_WAIT.as_secs()
                 );
@@ -934,7 +934,7 @@ impl Keeper {
     ) -> Option<State> {
         self.associated = false;
         if let Err(error) = cx.with(|d, _| disconnect(d))? {
-            eprintln!("kindil: Wi-Fi: leaving: {error}");
+            crate::log!("kindil: Wi-Fi: leaving: {error}");
         }
         if blind {
             *self.blind_failures.entry(ssid.to_owned()).or_default() += 1;
@@ -959,7 +959,7 @@ impl Keeper {
             }
         }
         let pause = self.backoff.pause();
-        eprintln!("kindil: Wi-Fi: {ssid} not joined; trying again in {pause:?}");
+        crate::log!("kindil: Wi-Fi: {ssid} not joined; trying again in {pause:?}");
         Some(State::Attempt(self.pause(cx, pause)?))
     }
 
@@ -1032,7 +1032,7 @@ impl Keeper {
                     Err(error) => {
                         cx.scanned(Err(error.to_string()))?;
                         self.strikes += 1;
-                        eprintln!("kindil: Wi-Fi: {error}");
+                        crate::log!("kindil: Wi-Fi: {error}");
                         if self.strikes >= STRIKES {
                             cx.fall_back(&format!("the Wi-Fi driver keeps failing ({error})"));
                             return None;
@@ -1047,7 +1047,7 @@ impl Keeper {
     /// A driver error: a pause and on, or giving up after [`STRIKES`].
     fn strike<X: Context>(&mut self, cx: &X, error: DriverError, next: State) -> Option<State> {
         self.strikes += 1;
-        eprintln!("kindil: Wi-Fi: {error}");
+        crate::log!("kindil: Wi-Fi: {error}");
         if self.strikes >= STRIKES {
             cx.fall_back(&format!("the Wi-Fi driver keeps failing ({error})"));
             return None;

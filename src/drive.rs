@@ -305,13 +305,13 @@ fn busy(ops: &dyn Ops) -> Option<Holder> {
 /// Mounts whatever isn't, as kindil had it; no check: nothing else wrote it.
 fn remount(ops: &dyn Ops) {
     if !may_mount(ops) {
-        eprintln!("kindil: USB drive: the LUN holds the storage; not mounting it");
+        crate::log!("kindil: USB drive: the LUN holds the storage; not mounting it");
         return;
     }
     for mount in [Mount::Base, Mount::Fsp] {
         if !ops.mounted(mount) {
             if let Err(error) = ops.mount(mount, false) {
-                eprintln!("kindil: USB drive: mounting {}: {error}", mount.path());
+                crate::log!("kindil: USB drive: mounting {}: {error}", mount.path());
             }
         }
     }
@@ -351,7 +351,7 @@ fn restore_gadget(ops: &dyn Ops, previous: Gadget) {
         ops.load(want)
     })();
     if let Err(error) = swapped {
-        eprintln!("kindil: USB drive: loading {want:?}: {error}");
+        crate::log!("kindil: USB drive: loading {want:?}: {error}");
     }
 }
 
@@ -374,9 +374,11 @@ pub struct Exported {
 /// place of USBNetwork's; and only then the partition in the LUN.
 pub fn export(ops: &dyn Ops) -> Result<Exported, Refusal> {
     if let Some(holder) = busy(ops) {
-        eprintln!(
+        crate::log!(
             "kindil: USB drive: {} ({}) holds {}",
-            holder.name, holder.pid, holder.path
+            holder.name,
+            holder.pid,
+            holder.path
         );
         return Err(Refusal::Busy {
             pid: holder.pid,
@@ -387,7 +389,7 @@ pub fn export(ops: &dyn Ops) -> Result<Exported, Refusal> {
     for mount in [Mount::Fsp, Mount::Base] {
         if ops.mounted(mount) {
             if let Err(error) = ops.umount(mount) {
-                eprintln!("kindil: USB drive: unmounting {}: {error}", mount.path());
+                crate::log!("kindil: USB drive: unmounting {}: {error}", mount.path());
                 remount(ops);
                 return Err(Refusal::Unmount(mount));
             }
@@ -397,34 +399,34 @@ pub fn export(ops: &dyn Ops) -> Result<Exported, Refusal> {
         .into_iter()
         .find(|&m| ops.mounted(m))
     {
-        eprintln!("kindil: USB drive: {} still mounted", mount.path());
+        crate::log!("kindil: USB drive: {} still mounted", mount.path());
         remount(ops);
         return Err(Refusal::Unmount(mount));
     }
     let previous = ops.gadget();
     if let Err(error) = swap_in(ops, previous) {
-        eprintln!("kindil: USB drive: the storage gadget: {error}");
+        crate::log!("kindil: USB drive: the storage gadget: {error}");
         return Err(undo(ops, previous, Refusal::Gadget));
     }
     if !ops.plugged() {
         return Err(undo(ops, previous, Refusal::Unplugged));
     }
     if !may_set_lun(ops) {
-        eprintln!("kindil: USB drive: the storage was mounted again; not exporting");
+        crate::log!("kindil: USB drive: the storage was mounted again; not exporting");
         return Err(undo(ops, previous, Refusal::Unmount(Mount::Base)));
     }
     if let Err(error) = ops.set_exported(true) {
-        eprintln!("kindil: USB drive: marking the storage away: {error}");
+        crate::log!("kindil: USB drive: marking the storage away: {error}");
         return Err(undo(ops, previous, Refusal::Flag));
     }
     if let Err(error) = ops.set_lun(DEVICE) {
-        eprintln!("kindil: USB drive: writing the LUN: {error}");
+        crate::log!("kindil: USB drive: writing the LUN: {error}");
         if empty(&ops.lun()) {
             let _ = ops.set_exported(false);
         }
         return Err(undo(ops, previous, Refusal::Gadget));
     }
-    eprintln!("kindil: USB drive: the computer has the storage");
+    crate::log!("kindil: USB drive: the computer has the storage");
     Ok(Exported { previous })
 }
 
@@ -436,7 +438,7 @@ fn release_lun(ops: &dyn Ops) -> bool {
             return true;
         }
         if let Err(error) = ops.set_lun("") {
-            eprintln!("kindil: USB drive: emptying the LUN: {error}");
+            crate::log!("kindil: USB drive: emptying the LUN: {error}");
         }
         if empty(&ops.lun()) {
             return true;
@@ -445,9 +447,9 @@ fn release_lun(ops: &dyn Ops) -> bool {
             ops.wait(LUN_EVERY);
         }
     }
-    eprintln!("kindil: USB drive: the LUN won't empty; unloading the gadget");
+    crate::log!("kindil: USB drive: the LUN won't empty; unloading the gadget");
     if let Err(error) = ops.unload(Gadget::Storage) {
-        eprintln!("kindil: USB drive: unloading g_file_storage: {error}");
+        crate::log!("kindil: USB drive: unloading g_file_storage: {error}");
     }
     empty(&ops.lun())
 }
@@ -481,13 +483,13 @@ fn check_and_mount(ops: &dyn Ops) -> Result<Back, Lost> {
     let check = ops.exported().then(|| {
         ops.flush();
         let check = Check::of(ops.fsck());
-        eprintln!("kindil: USB drive: storage check: {check:?}");
+        crate::log!("kindil: USB drive: storage check: {check:?}");
         check
     });
     let read_only = check.is_some_and(Check::read_only);
     // The invariant, again: nothing may have set the LUN since.
     if !may_mount(ops) {
-        eprintln!("kindil: USB drive: the LUN holds the storage; not mounting it");
+        crate::log!("kindil: USB drive: the LUN holds the storage; not mounting it");
         return Err(Lost);
     }
     for mount in [Mount::Base, Mount::Fsp] {
@@ -495,7 +497,7 @@ fn check_and_mount(ops: &dyn Ops) -> Result<Back, Lost> {
             // fsp over a read-only FAT is read-only too.
             let read_only = read_only && mount == Mount::Base;
             if let Err(error) = ops.mount(mount, read_only) {
-                eprintln!("kindil: USB drive: mounting {}: {error}", mount.path());
+                crate::log!("kindil: USB drive: mounting {}: {error}", mount.path());
                 return Err(Lost);
             }
         }
@@ -503,7 +505,7 @@ fn check_and_mount(ops: &dyn Ops) -> Result<Back, Lost> {
     // A storage left unchecked is checked again at the next start.
     if !read_only {
         if let Err(error) = ops.set_exported(false) {
-            eprintln!("kindil: USB drive: clearing {EXPORTED}: {error}");
+            crate::log!("kindil: USB drive: clearing {EXPORTED}: {error}");
         }
     }
     Ok(Back { check })
@@ -542,9 +544,11 @@ pub fn recover(ops: &dyn Ops) -> Found {
     }
     if mounted {
         if let Some(holder) = busy(ops) {
-            eprintln!(
+            crate::log!(
                 "kindil: USB drive: can't check the storage: {} ({}) holds {}",
-                holder.name, holder.pid, holder.path
+                holder.name,
+                holder.pid,
+                holder.path
             );
             return Found::Unchecked(Refusal::Busy {
                 pid: holder.pid,
@@ -555,7 +559,7 @@ pub fn recover(ops: &dyn Ops) -> Found {
         for mount in [Mount::Fsp, Mount::Base] {
             if ops.mounted(mount) {
                 if let Err(error) = ops.umount(mount) {
-                    eprintln!("kindil: USB drive: unmounting {}: {error}", mount.path());
+                    crate::log!("kindil: USB drive: unmounting {}: {error}", mount.path());
                     remount(ops);
                     return Found::Unchecked(Refusal::Unmount(mount));
                 }
@@ -718,7 +722,7 @@ impl<'a> Driver<'a> {
             ui.release();
         }
         let found = recover(ops);
-        eprintln!("kindil: USB drive: started; storage {found:?}");
+        crate::log!("kindil: USB drive: started; storage {found:?}");
         let notice = match found {
             Found::Checked(check) => Some(Notice::Checked(check)),
             Found::Unchecked(refusal) => Some(Notice::Unchecked(refusal)),
@@ -730,7 +734,7 @@ impl<'a> Driver<'a> {
         }
         if ops.gadget() == Gadget::None {
             if let Err(error) = ops.load(Gadget::Storage) {
-                eprintln!("kindil: USB drive: loading g_file_storage: {error}");
+                crate::log!("kindil: USB drive: loading g_file_storage: {error}");
             }
         }
         let state = if found == Found::Exported {
@@ -777,7 +781,7 @@ impl<'a> Driver<'a> {
         }
         if let State::Computer { .. } = self.state {
             if empty(&self.ops.lun()) {
-                eprintln!("kindil: USB drive: ejected by the computer");
+                crate::log!("kindil: USB drive: ejected by the computer");
                 self.input(Input::Ejected, now, ui);
             } else if !self.ops.plugged() {
                 // A remove event lost in a burst.
@@ -791,7 +795,7 @@ impl<'a> Driver<'a> {
             return;
         };
         if next != self.state {
-            eprintln!(
+            crate::log!(
                 "kindil: USB drive: {:?} -> {next:?} on {input:?}",
                 self.state
             );

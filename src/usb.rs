@@ -46,7 +46,7 @@ fn run(program: &str, args: &[&str]) -> std::io::Result<()> {
         .output()?;
     let text = String::from_utf8_lossy(&output.stderr);
     if !text.trim().is_empty() {
-        eprintln!("kindil: {program}: {}", text.trim());
+        crate::log!("kindil: {program}: {}", text.trim());
     }
     if output.status.success() {
         Ok(())
@@ -299,7 +299,7 @@ impl Ops for Device {
             .lines()
             .chain(String::from_utf8_lossy(&output.stderr).lines())
         {
-            eprintln!("kindil: fsck.vfat: {line}");
+            crate::log!("kindil: fsck.vfat: {line}");
         }
         output
             .status
@@ -373,7 +373,7 @@ impl Ui for Screen<'_> {
         let seen = self.released.count();
         (self.deliver)(crate::system::Event::StorageLeaving);
         if !self.released.wait_past(seen, RELEASE) {
-            eprintln!("kindil: USB drive: the UI didn't release the storage in time");
+            crate::log!("kindil: USB drive: the UI didn't release the storage in time");
         }
     }
 
@@ -417,7 +417,7 @@ pub fn run_drive(
         };
         if let Some(event) = listener.next_within(wait)? {
             if let Some(signal) = drive::signal(&event) {
-                eprintln!("kindil: USB drive: {event}");
+                crate::log!("kindil: USB drive: {event}");
                 driver.signal(signal, Instant::now(), &ui);
             }
         }

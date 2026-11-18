@@ -31,7 +31,7 @@ const START: &str = "/mnt/us/extensions/kindil/bin/start.sh";
 const SETTLE: Duration = Duration::from_secs(25);
 
 fn log(message: &str) {
-    eprintln!(
+    crate::log!(
         "{} lifeline: {message}",
         chrono::Local::now().format("%F %T")
     );

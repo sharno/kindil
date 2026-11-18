@@ -326,7 +326,7 @@ impl Slots {
         std::fs::remove_file(&self.trial)?;
         // The new binary is kept either way; an old launcher still runs it.
         if let Err(error) = self.install_launcher() {
-            eprintln!("kindil: launcher: {error}");
+            crate::log!("kindil: launcher: {error}");
         }
         Ok(Commit::Committed)
     }

@@ -117,7 +117,7 @@ fn wifi_joined(run: &Path) -> bool {
 }
 
 fn log(id: &str, message: &str) {
-    eprintln!(
+    crate::log!(
         "{} install {id}: {message}",
         chrono::Local::now().format("%F %T")
     );

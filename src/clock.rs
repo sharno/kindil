@@ -267,7 +267,7 @@ pub fn catch_up() -> Option<Correction> {
             source: Source::Rtc,
         }),
         Err(error) => {
-            eprintln!("kindil: clock: catching up with the RTC: {error}");
+            crate::log!("kindil: clock: catching up with the RTC: {error}");
             None
         }
     }
@@ -289,7 +289,7 @@ fn ask_servers() -> Vec<Reading> {
                             offset: result.clock_offset().as_secs_f64(),
                             delay: result.round_trip_delay().as_secs_f64(),
                         })
-                        .map_err(|error| eprintln!("kindil: clock: {server}: {error}"))
+                        .map_err(|error| crate::log!("kindil: clock: {server}: {error}"))
                         .ok()
                 })
             })
@@ -333,7 +333,7 @@ pub fn sync() -> anyhow::Result<Option<Correction>> {
     let (offset, min_step, source) = match consensus(&readings) {
         Some(reading) => (reading.offset, NTP_MIN_STEP, Source::Ntp(reading.server)),
         None => {
-            eprintln!(
+            crate::log!(
                 "kindil: clock: {} of {} time servers answered, not two agreeing; \
                  trying {HTTP_DATE_URL}",
                 readings.len(),
@@ -361,7 +361,7 @@ pub fn sync() -> anyhow::Result<Option<Correction>> {
     };
     if stale {
         if let Err(error) = write_rtc() {
-            eprintln!("kindil: clock: writing the RTC: {error}");
+            crate::log!("kindil: clock: writing the RTC: {error}");
         }
     }
     Ok(correction)
@@ -490,10 +490,10 @@ mod tests {
     #[ignore = "network"]
     fn the_servers_agree_with_each_other_and_with_http() {
         let readings = ask_servers();
-        eprintln!("{readings:?}");
+        crate::log!("{readings:?}");
         let ntp = consensus(&readings).expect("two servers agreeing");
         let http = ask_http_date().unwrap();
-        eprintln!("ntp {ntp:?}, http {http:.3}");
+        crate::log!("ntp {ntp:?}, http {http:.3}");
         assert!((ntp.offset - http).abs() < 1.5);
     }
 

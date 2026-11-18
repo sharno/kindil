@@ -1354,7 +1354,7 @@ impl Ctx {
     fn device(&self, event: DeviceEvent) {
         let mode = self.state.borrow().system;
         match mode.step(event, Instant::now()) {
-            Err(ignored) => eprintln!("kindil: {event:?} ignored: {ignored:?}"),
+            Err(ignored) => crate::log!("kindil: {event:?} ignored: {ignored:?}"),
             Ok(Step { next, effects }) => {
                 self.state.borrow_mut().system = next;
                 self.dozing_changed(
@@ -1405,7 +1405,7 @@ impl Ctx {
             move |_, charge| {
                 let mut ledger = lock(&ledger);
                 ledger.dhcp(crate::dhcpc::counts());
-                eprintln!("kindil: {}", ledger.close(now, charge));
+                crate::log!("kindil: {}", ledger.close(now, charge));
             },
         );
     }
@@ -1445,7 +1445,7 @@ impl Ctx {
                     .zip(gauge)
                     .and_then(|(from, to)| Drain::between(from, to))
                 {
-                    eprintln!(
+                    crate::log!(
                         "kindil: doze drew {} mA over {} min, {} mAh left",
                         drain.milliamps,
                         drain.over.num_minutes(),
@@ -1480,18 +1480,18 @@ impl Ctx {
                 if up.is_ok() {
                     match host.sync_clock() {
                         Ok(Some(correction)) => {
-                            eprintln!("kindil: {correction}");
+                            crate::log!("kindil: {correction}");
                             lock(&ledger).clock_corrected(correction);
                             *lock(&steps) += correction.delta();
                         }
                         Ok(None) => {}
-                        Err(error) => eprintln!("kindil: clock: {error:#}"),
+                        Err(error) => crate::log!("kindil: clock: {error:#}"),
                     }
                 }
                 up
             },
             move |_, result| {
-                then(result.map_err(|error| eprintln!("kindil: reconnect Wi-Fi: {error}")));
+                then(result.map_err(|error| crate::log!("kindil: reconnect Wi-Fi: {error}")));
             },
         );
     }
@@ -1626,7 +1626,7 @@ impl Ctx {
                 match host.suspend() {
                     Ok(()) => DeviceEvent::Resumed,
                     Err(error) => {
-                        eprintln!("kindil: suspend: {error}");
+                        crate::log!("kindil: suspend: {error}");
                         DeviceEvent::SuspendFailed
                     }
                 }
@@ -1679,7 +1679,7 @@ impl Ctx {
             Effect::StorageBack => self.storage_back(),
             Effect::DriveNotice(notice) => {
                 if let Some(text) = view::drive_notice(notice) {
-                    eprintln!("kindil: {text}");
+                    crate::log!("kindil: {text}");
                     notify(&ui, &text);
                 }
             }
@@ -1721,7 +1721,7 @@ impl Ctx {
                     }
                     Drawn::Sent(error) => {
                         if !display.panel_error_logged.swap(true, Ordering::Relaxed) {
-                            eprintln!(
+                            crate::log!(
                                 "kindil: doze redraw: the panel can't say when an update finished \
                              ({error}); napping {PANEL_UPDATE:?} after sending instead"
                             );
@@ -1735,7 +1735,7 @@ impl Ctx {
         }
         slint::Timer::single_shot(ceiling, move || {
             if claim(Settle::NotSeen) {
-                eprintln!(
+                crate::log!(
                     "kindil: doze redraw not seen on the panel; napping at the {ceiling:?} ceiling"
                 );
             }
@@ -1756,7 +1756,7 @@ impl Ctx {
             (hold, std::mem::replace(&mut state.held, hold))
         };
         if hold != was {
-            eprintln!(
+            crate::log!(
                 "kindil: doze: {}",
                 match hold {
                     Some(Hold::Window) => "maintenance window: awake and online for a while",
@@ -1810,7 +1810,7 @@ impl Ctx {
                     DeviceEvent::Resumed
                 }
                 Err(error) => {
-                    eprintln!("kindil: nap: {error}");
+                    crate::log!("kindil: nap: {error}");
                     DeviceEvent::SuspendFailed
                 }
             }
@@ -1999,14 +1999,14 @@ impl Ctx {
                 match host.commit_update() {
                     Ok(commit) => break commit,
                     Err(error) => {
-                        eprintln!("kindil: keeping the update failed, retrying: {error:#}");
+                        crate::log!("kindil: keeping the update failed, retrying: {error:#}");
                         std::thread::sleep(update::SETTLE);
                     }
                 }
             },
             |_, commit| match commit {
                 update::Commit::Nothing => {}
-                update::Commit::Committed => eprintln!("kindil: update kept"),
+                update::Commit::Committed => crate::log!("kindil: update kept"),
             },
         );
     }
@@ -2241,7 +2241,7 @@ impl Ctx {
                 // Only the name is lost if this fails: the place is saved.
                 if let Some(named) = location::named(&place) {
                     if let Err(error) = location::write_named(&named_path, &named) {
-                        eprintln!("kindil: {error:#}");
+                        crate::log!("kindil: {error:#}");
                     }
                 }
                 location::load(&miqat, location::read_named(&named_path).as_ref())
@@ -2433,7 +2433,7 @@ fn miqat_worker(
                     (None, Draw::Full)
                 }
                 Err(error) => {
-                    eprintln!("kindil: reloading {}: {error:#}", path.display());
+                    crate::log!("kindil: reloading {}: {error:#}", path.display());
                     (None, Draw::Full)
                 }
             },
