@@ -60,8 +60,9 @@ etherparse = "0.21"
 socket2 = { version = "0.6", features = ["all"] }
 rand = "0.10"
 # Step-by-step procedures as typestate (install, update trial, USB drive
-# mode): a step out of order doesn't compile.
-statum = "0.9"
+# mode): a step out of order doesn't compile. `introspection` exports each
+# machine's graph (docs/state-machines.md, src/state_machines.rs).
+statum = { version = "0.9", features = ["introspection"] }
 
 [features]
 default = []

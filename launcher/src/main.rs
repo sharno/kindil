@@ -22,6 +22,8 @@ mod boot;
 mod os;
 mod overlay;
 mod session;
+#[cfg(test)]
+mod state_machines;
 
 use std::path::PathBuf;
 

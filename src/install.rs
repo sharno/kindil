@@ -491,6 +491,13 @@ fn archive(dir: &Path, to: &Path) -> anyhow::Result<()> {
     result
 }
 
+/// The install's graph, for docs/state-machines.md.
+#[cfg(test)]
+pub(crate) fn graph() -> statum::StableGraphMetadata {
+    use statum::MachineIntrospection;
+    statum::StableGraphMetadata::from_graph(steps::Installing::<steps::Checked>::GRAPH)
+}
+
 /// For tests: a bundle of `files` under `extensions/kindil/`.
 #[cfg(test)]
 fn bundle(files: &[(&str, &str, u32)]) -> (Vec<u8>, String) {

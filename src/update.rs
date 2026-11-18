@@ -588,6 +588,13 @@ mod steps {
     }
 }
 
+/// The update's graph, for docs/state-machines.md.
+#[cfg(test)]
+pub(crate) fn graph() -> statum::StableGraphMetadata {
+    use statum::MachineIntrospection;
+    statum::StableGraphMetadata::from_graph(Ota::<Idle>::GRAPH)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

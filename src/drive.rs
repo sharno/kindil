@@ -1184,6 +1184,13 @@ impl<'a> Driver<'a> {
     }
 }
 
+/// USB drive mode's graph, for docs/state-machines.md.
+#[cfg(test)]
+pub(crate) fn graph() -> statum::StableGraphMetadata {
+    use statum::MachineIntrospection;
+    statum::StableGraphMetadata::from_graph(Storage::<Mounted>::GRAPH)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

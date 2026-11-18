@@ -38,6 +38,18 @@ pub fn test() -> anyhow::Result<()> {
     ]))
 }
 
+/// docs/state-machines.md from the statum machines' graphs: the app's
+/// (src/state_machines.rs) and the launcher's (launcher/src/state_machines.rs).
+pub fn state_machines() -> anyhow::Result<()> {
+    for package in ["kindil", "launcher"] {
+        run(cargo()
+            .args(["test", "--locked", "--package", package])
+            .args(["state_machines::docs_state_machines_is_current"])
+            .env("KINDIL_WRITE_STATE_MACHINES", "1"))?;
+    }
+    Ok(())
+}
+
 pub fn check() -> anyhow::Result<()> {
     run(cargo().args(["fmt", "--all", "--check"]))?;
     run(cargo().args([

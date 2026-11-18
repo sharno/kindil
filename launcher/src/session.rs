@@ -862,6 +862,16 @@ mod lifecycle {
     }
 }
 
+/// The session's and the trial's graphs, for docs/state-machines.md.
+#[cfg(test)]
+pub(crate) fn graphs() -> [statum::StableGraphMetadata; 2] {
+    use statum::MachineIntrospection;
+    [
+        statum::StableGraphMetadata::from_graph(Session::<lifecycle::Starting>::GRAPH),
+        statum::StableGraphMetadata::from_graph(Trial::<steps::Staged>::GRAPH),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
