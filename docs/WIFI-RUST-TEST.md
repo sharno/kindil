@@ -33,7 +33,11 @@ driver's profile under the keeper.
   udhcpc that holds it (SIGUSR1). The hook leaves a marker per udhcpc,
   `/var/run/kindil-lease.PID` (`bound|renew IP NANOS`), and only the
   running udhcpc's marker counts, with that IP on wlan0, while still on
-  the same access point. Settings' scans are done by the keeper between
+  the same access point. With kindil's own DHCP client switched on too
+  ([DHCP-TEST.md](DHCP-TEST.md)), there is no udhcpc: each join is a
+  numbered request to the client, and only a lease for that request, on
+  wlan0, counts (a lease kept from before the nap, on the same access
+  point and before T1, counts without a DHCP exchange). Settings' scans are done by the keeper between
   joins, never during one. It checks the access point (SIOCGIWAP) every 3 s; on a loss
   it gives the firmware 10 s to rejoin by itself, then joins again (PMK
   again), with pauses doubling from 2 s to a minute between failed tries.

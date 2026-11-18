@@ -320,6 +320,7 @@ faster.
 | `/mnt/us/extensions/kindil/` | KUAL launcher and the `kindil` binary; during an update also `kindil.next`, `kindil.trying`, and afterwards `kindil.previous` |
 | `/var/local/kindil/` | The running copy, the launcher and the log; off `/mnt/us`, which a computer takes in USB drive mode |
 | `/var/local/kindil/networks.toml` | The Wi-Fi networks joined in kindil, with their passwords (root only) |
+| `/var/local/kindil/dhcp` | `kindil` inside: kindil's own DHCP client instead of udhcpc (off by default; [docs/DHCP-TEST.md](docs/DHCP-TEST.md)) |
 | `/var/local/kindil/usb-drive` | `kindil` inside: kindil runs USB drive mode instead of volumd (off by default; [docs/USB-DRIVE-TEST.md](docs/USB-DRIVE-TEST.md)) |
 | `/var/local/kindil/usb-exported` | Present while a computer may have the storage: the next start checks it |
 | `/var/local/kindil/kindil-sshd`, `/var/local/kindil/ssh/` | kindil's SSH server, its host key, trusted and ignored keys (root only) |
@@ -436,7 +437,9 @@ someone nearby to press the power button, or must end on their own first.
 | `kindle.rs` | `Host` on the device: battery, charger and front light drivers, power button, volumd's events or kindil's USB drive mode, USBNetwork |
 | `power.rs` | powerd's rules kept by kindil: charging temperatures, critical battery |
 | `wifi.rs` | wpa_supplicant control socket, typed SSID/passphrase |
-| `net.rs` | Wi-Fi run by kindil: driver, supervised wpa_supplicant and udhcpc |
+| `net.rs` | Wi-Fi run by kindil: driver, supervised wpa_supplicant and udhcpc (or kindil's own DHCP client) |
+| `dhcp.rs` | udhcpc's hook, `kindil-dhcp`: the lease onto the interface, and its marker for kindil's own Wi-Fi |
+| `dhcpc.rs`, `dhcpc/` | kindil's own DHCP client, a thread in place of udhcpc, behind the `/var/local/kindil/dhcp` switch (see [docs/DHCP-TEST.md](docs/DHCP-TEST.md)): RFC 2131's states without I/O (`machine.rs`, messages by dhcproto), a packet socket's replies before there is an address (`wire.rs`, with its BPF filter), the lease onto the interface by ioctl (`apply.rs`), and lease times that count the time asleep |
 | `station.rs`, `wext.rs`, `pmk.rs` | kindil's own Wi-Fi without wpa_supplicant, behind the `/var/local/kindil/wifi` switch (see [docs/WIFI-RUST-TEST.md](docs/WIFI-RUST-TEST.md)): the AR6003 firmware's WPA2-PSK offload through wireless-extension ioctls |
 | `networks.rs` | The saved Wi-Fi networks |
 | `ssh.rs` | SSH run by kindil: its kindil-sshd, firewall port, supervised |
