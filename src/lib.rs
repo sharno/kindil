@@ -5,6 +5,7 @@ pub mod clock;
 pub mod config;
 pub mod dashboards;
 pub mod dhcp;
+pub mod dhcpc;
 pub mod drain;
 pub mod drive;
 pub mod files;

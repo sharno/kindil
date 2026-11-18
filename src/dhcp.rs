@@ -6,13 +6,15 @@
 //! udhcpc runs it with the event as its argument and the lease in its
 //! environment: `interface`, `ip`, `broadcast`, `subnet`, `router` and `dns`
 //! (space-separated lists) and `domain`.
+//!
+//! Behind its switch, kindil's own DHCP client (src/dhcpc.rs) runs instead
+//! of udhcpc and this hook.
+use crate::dhcpc::RESOLV;
 use std::collections::BTreeMap;
 use std::process::Command;
 
 /// The name kindil answers to as the hook.
 pub const NAME: &str = "kindil-dhcp";
-/// Where the resolver reads the name servers (`/etc/resolv.conf` links here).
-const RESOLV: &str = "/var/run/resolv.conf";
 /// Enough to clear any default routes an earlier lease left.
 const MAX_OLD_ROUTES: usize = 8;
 /// Where the hook leaves a marker of each lease it takes, one file per

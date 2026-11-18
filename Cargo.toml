@@ -50,6 +50,13 @@ fontique = { version = "0.11", default-features = false, features = ["std", "fon
 fontdb = { version = "0.24", default-features = false, features = ["std", "fs", "memmap"] }
 # Network time (src/clock.rs): the blocking SNTP client alone, no tokio.
 rsntp = { version = "4.1", default-features = false }
+# The in-process DHCP client (src/dhcpc.rs): DHCPv4 messages, the IPv4/UDP
+# headers of replies read off a packet socket, the sockets themselves (and
+# their BPF filter), and transaction ids with retransmit jitter.
+dhcproto = "0.15"
+etherparse = "0.21"
+socket2 = { version = "0.6", features = ["all"] }
+rand = "0.10"
 
 [features]
 default = []
