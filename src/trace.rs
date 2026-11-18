@@ -14,6 +14,9 @@
 //! `KINDIL_TRACE` names a directory: then each thread writes a file of its
 //! own there, named after it (a test's thread is named after the test).
 //! Off, it costs one load of a set-once flag per event.
+// Variants are matched by name, `{ .. }` even where they carry nothing yet:
+// a field added to a mode or an effect leaves this module as it is.
+#![allow(clippy::unneeded_struct_pattern)]
 use crate::system::{Doze, Drive, Effect, Event, Ignored, Mode, Sleep, Step};
 use std::cell::{Cell, RefCell};
 use std::io::Write;
@@ -98,14 +101,14 @@ fn per_thread(dir: &std::path::Path, mode: Mode, event: Event, result: &Result<S
 pub fn mode_name(mode: Mode) -> &'static str {
     match mode {
         Mode::Awake { .. } => "Awake",
-        Mode::Asleep(Sleep::DimmingLight) => "AsleepDimming",
+        Mode::Asleep(Sleep::DimmingLight { .. }) => "AsleepDimming",
         Mode::Asleep(Sleep::Settling { .. }) => "AsleepSettling",
         Mode::Asleep(Sleep::Suspended { .. }) => "AsleepSuspended",
-        Mode::Dozing(Doze::DimmingLight) => "DozeDimming",
+        Mode::Dozing(Doze::DimmingLight { .. }) => "DozeDimming",
         Mode::Dozing(Doze::Settling { .. }) => "DozeSettling",
         Mode::Dozing(Doze::Napping { .. }) => "DozeNapping",
         Mode::Dozing(Doze::Drawing { .. }) => "DozeDrawing",
-        Mode::UsbDrive => "UsbDrive",
+        Mode::UsbDrive { .. } => "UsbDrive",
         Mode::Returning { .. } => "Returning",
     }
 }
@@ -113,14 +116,16 @@ pub fn mode_name(mode: Mode) -> &'static str {
 /// Whether the mode carries a light level to put back.
 fn light(mode: Mode) -> bool {
     match mode {
-        Mode::Asleep(Sleep::Settling { light } | Sleep::Suspended { light })
+        Mode::Asleep(Sleep::Settling { light, .. } | Sleep::Suspended { light, .. })
         | Mode::Dozing(
-            Doze::Settling { light } | Doze::Napping { light } | Doze::Drawing { light },
+            Doze::Settling { light, .. }
+            | Doze::Napping { light, .. }
+            | Doze::Drawing { light, .. },
         ) => light.is_some(),
         Mode::Awake { .. }
-        | Mode::Asleep(Sleep::DimmingLight)
-        | Mode::Dozing(Doze::DimmingLight)
-        | Mode::UsbDrive
+        | Mode::Asleep(Sleep::DimmingLight { .. })
+        | Mode::Dozing(Doze::DimmingLight { .. })
+        | Mode::UsbDrive { .. }
         | Mode::Returning { .. } => false,
     }
 }
@@ -147,23 +152,25 @@ fn action(mode: Mode, event: Event) -> (&'static str, Option<bool>) {
     }
 }
 
+/// By name alone (`{ .. }`): what a variant carries can grow without this
+/// changing.
 fn effect_name(effect: &Effect) -> &'static str {
     match effect {
-        Effect::ShowSleep => "ShowSleep",
-        Effect::LightOff => "LightOff",
-        Effect::AwaitPanel => "AwaitPanel",
-        Effect::Suspend => "Suspend",
-        Effect::Nap => "Nap",
-        Effect::Redraw => "Redraw",
-        Effect::Wake => "Wake",
-        Effect::Rouse => "Rouse",
-        Effect::Reconnect => "Reconnect",
-        Effect::RestoreLight(_) => "RestoreLight",
-        Effect::ShowUsbDrive => "ShowUsbDrive",
-        Effect::ReleaseStorage => "ReleaseStorage",
-        Effect::AwaitDrive(_) => "AwaitDrive",
-        Effect::StorageBack => "StorageBack",
-        Effect::DriveNotice(_) => "DriveNotice",
+        Effect::ShowSleep { .. } => "ShowSleep",
+        Effect::LightOff { .. } => "LightOff",
+        Effect::AwaitPanel { .. } => "AwaitPanel",
+        Effect::Suspend { .. } => "Suspend",
+        Effect::Nap { .. } => "Nap",
+        Effect::Redraw { .. } => "Redraw",
+        Effect::Wake { .. } => "Wake",
+        Effect::Rouse { .. } => "Rouse",
+        Effect::Reconnect { .. } => "Reconnect",
+        Effect::RestoreLight { .. } => "RestoreLight",
+        Effect::ShowUsbDrive { .. } => "ShowUsbDrive",
+        Effect::ReleaseStorage { .. } => "ReleaseStorage",
+        Effect::AwaitDrive { .. } => "AwaitDrive",
+        Effect::StorageBack { .. } => "StorageBack",
+        Effect::DriveNotice { .. } => "DriveNotice",
     }
 }
 
