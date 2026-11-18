@@ -86,7 +86,8 @@ pub enum Slept {
     Woken,
     /// Never suspended: a sleep for the empty battery with a charger in.
     Charging,
-    /// The battery is at [`CRITICAL_PERCENT`]: power off.
+    /// The battery is at [`CRITICAL_PERCENT`], or its sleep couldn't arm the
+    /// check that would catch that: power off.
     Critical,
 }
 
@@ -125,7 +126,18 @@ pub fn sleep(device: &impl Sleeper, why: crate::system::Why) -> anyhow::Result<S
             .alarm()
             .map(|after| device.now() + after.as_secs() as i64);
         let presses = device.presses();
-        device.suspend(wake)?;
+        if let Err(error) = device.suspend(wake) {
+            if why == Why::BatteryEmpty {
+                // Without its check alarm, nothing would power the Kindle off
+                // at 1% and the cell would drain flat: off now, as powerd
+                // would at a critical battery.
+                device.note(&format!(
+                    "sleep: can't sleep with the battery check ({error:#}); powering off"
+                ));
+                return Ok(Slept::Critical);
+            }
+            return Err(error);
+        }
         if due.is_some_and(|due| alarm_woke(due, device.now())) {
             let battery = device.battery()?;
             if critical(battery) {
@@ -314,13 +326,26 @@ mod tests {
         let six_hours = CHECK_ASLEEP.as_millis() as u64;
         let mut device = Device::new(&[six_hours, 2 * six_hours], None, &[]);
         device.percent = 2;
-        // Each check finds 2% and sleeps on, until nothing is left to wake it.
-        assert!(sleep(&device, Why::BatteryEmpty).is_err());
+        // Each check finds 2% and sleeps on, until the fake can't suspend
+        // any more: then, with no check to come, it powers off.
+        assert_eq!(sleep(&device, Why::BatteryEmpty).unwrap(), Slept::Critical);
         assert_eq!(device.suspends(), 3);
-        assert!(device.notes.borrow().is_empty(), "no wake but the checks");
+        assert_eq!(device.notes.borrow().len(), 1, "no wake but the checks");
+        assert!(device.notes.borrow()[0].contains("powering off"));
         device = Device::new(&[six_hours], None, &[]);
         device.percent = 1;
         assert_eq!(sleep(&device, Why::BatteryEmpty).unwrap(), Slept::Critical);
+    }
+
+    #[test]
+    fn a_battery_sleep_that_cant_arm_its_check_powers_off_but_an_asked_one_reports_it() {
+        // No wake scripted: the fake's suspend fails, as an alarm that won't
+        // arm makes the real one fail.
+        let device = Device::new(&[], None, &[]);
+        assert_eq!(sleep(&device, Why::BatteryEmpty).unwrap(), Slept::Critical);
+        assert!(device.notes.borrow()[0].contains("powering off"));
+        let device = Device::new(&[], None, &[]);
+        assert!(sleep(&device, Why::Asked).is_err());
     }
 
     #[test]
