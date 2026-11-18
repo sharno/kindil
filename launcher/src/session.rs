@@ -10,7 +10,6 @@
 use crate::os::{log, Os};
 use crate::{Paths, SERVICES};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -511,7 +510,10 @@ impl UsbDrive {
     }
 }
 
-pub(super) fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
+/// The session: Amazon's UI and services step aside, kindil runs, and
+/// they come back. Its result, [`Ended`], comes only from refusing before
+/// anything was stopped or from restoring.
+pub fn session(paths: &Paths, os: &dyn Os) -> Ended {
     crate::os::ignore(libc::SIGHUP);
     // Before anything runs: the launcher itself (the boot job and KUAL run
     // it next time), and below, in pick, the binary it runs.
@@ -526,43 +528,17 @@ pub(super) fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
     // they ignore TERM.
     os.kill_orphaned_watchers();
     end_children(paths, os);
-    let slot = files.installed.clone();
-    let bin = files.pick(&slot);
-    if !executable(&bin) {
-        log(&format!("missing {}", bin.display()));
-        return ExitCode::FAILURE;
-    }
-    let usb = UsbDrive::read(paths, os);
-    // Stopping the GUI job signals its whole tree, which can include us.
-    crate::os::ignore(libc::SIGTERM);
-    // A standalone boot never started it.
-    let gui = os.running("lab126_gui");
-    if gui {
-        // Let KUAL close its menu before the UI goes away.
-        os.sleep(Duration::from_secs(2));
-        log("stopping the Kindle UI");
-        os.stop("lab126_gui");
-        os.sleep(Duration::from_secs(2));
-    }
-    // kindil draws to the framebuffer itself: X has nothing to do while it
-    // runs. The way back starts it again, and Amazon's UI with it.
-    if os.running("x") {
-        os.stop("x");
-    }
-    // kindil does powerd's work itself: battery, front light, charging
-    // limits, sleep and the power button. Stopped first, and before kindil
-    // starts: stopping powerd switches the front light off, which kindil
-    // then sets.
-    if os.running("powerd") {
-        log("stopping powerd");
-        os.stop("powerd");
-    }
+    let ready = match Session::start().pick(&files) {
+        Ok(ready) => ready,
+        Err(ended) => return ended,
+    };
+    let aside = ready.step_aside(paths, os);
     std::thread::scope(|scope| {
         // The rest in the background, so kindil starts at once. Ended before
         // anything is brought back, so the two never race. Through Builder:
         // scope.spawn panics if no thread can be made; then one round now.
         let (done, rounds) = mpsc::channel::<()>();
-        let usb_drive = usb.is_some();
+        let usb_drive = aside.state_data.usb.is_some();
         let stopper = std::thread::Builder::new()
             .spawn_scoped(scope, move || {
                 stop_services(os, &rounds, STOP_ROUNDS, usb_drive);
@@ -576,19 +552,19 @@ pub(super) fn session(paths: &Paths, os: &dyn Os) -> ExitCode {
         // Amazon's screen modules would draw over kindil in USB drive mode
         // and after it; kindil draws its own screens. Only Amazon's UI loads
         // them.
-        if gui {
+        if aside.state_data.gui {
             os.lipc_set("com.lab126.blanket", "unload", "usb");
             os.lipc_set("com.lab126.blanket", "unload", "splash");
         }
         os.clear_screen();
-        run(paths, os, &files, slot, bin);
+        aside.run(paths, os, &files);
         drop(done);
         if let Ok(stopper) = stopper {
             let _ = stopper.join();
         }
-        restore(paths, os, gui, usb);
-    });
-    ExitCode::SUCCESS
+        aside.restore(paths, os)
+    })
+    .end()
 }
 
 /// Up to `rounds` rounds STOP_EVERY apart, until `done` ends.
@@ -672,44 +648,6 @@ fn end_children(paths: &Paths, os: &dyn Os) {
     }
 }
 
-/// Amazon's UI back, with everything it needs.
-fn restore(paths: &Paths, os: &dyn Os, gui: bool, usb: Option<UsbDrive>) {
-    // A standalone boot skipped Amazon's framework: without it, Amazon's UI
-    // is an empty screen. `launcher boot` sets the flag again after a boot
-    // kindil stays up.
-    let _ = std::fs::remove_file(&paths.skip);
-    // kindil may have paused charging for the temperature (src/power.rs);
-    // powerd, back now, keeps its own range.
-    let _ = std::fs::write(&paths.charger, "1");
-    if !os.running("powerd") {
-        os.start("powerd");
-    }
-    // Before Amazon's UI, which expects the storage volumd's. Its start runs
-    // kindil's boot job again, which does nothing twice in a boot.
-    if let Some(usb) = usb {
-        usb.restore(os);
-    }
-    if gui {
-        os.lipc_set("com.lab126.blanket", "load", "usb");
-        os.lipc_set("com.lab126.blanket", "load", "splash");
-    }
-    log("starting the Kindle UI");
-    wifi_back(paths, os);
-    // kindil, even one that crashed, may have let its SSH port in.
-    os.close_port(crate::SSH_PORT);
-    for job in SERVICES {
-        if !os.running(job) {
-            os.start(job);
-        }
-    }
-    if os.running("x") {
-        os.start("lab126_gui");
-    } else {
-        os.start("x");
-    }
-    let _ = std::fs::remove_file(&paths.pid_file);
-}
-
 /// kindil ran Wi-Fi itself (src/net.rs): its DHCP client and wpa_supplicant
 /// go, and so does its SSH server (src/ssh.rs) with the sessions open over
 /// it, and wifid starts Amazon's supplicant afresh. The driver stays loaded:
@@ -733,11 +671,203 @@ fn wifi_back(paths: &Paths, os: &dyn Os) {
     }
 }
 
+pub use lifecycle::Ended;
+use lifecycle::Session;
+
+/// The session as typestate: once Amazon's UI, X or powerd have stopped
+/// (`Aside`), the only way to the session's result, [`Ended`], is
+/// `Session::restore`. What that covers, and what it can't:
+///
+/// - Every return: [`session`] must return an [`Ended`], which only
+///   `pick`'s refusal (before anything stopped) and a `Restored`
+///   session make; once `step_aside` took the `Ready` session, a refusal is
+///   no longer to be had. The transitions are `#[must_use]`.
+/// - Not a `Session<Aside>` dropped on purpose: Rust has no linear types,
+///   so code could drop one and then loop forever or exit the process.
+///   None does.
+/// - Not a panic: the release build aborts, so no `Drop` runs on one, and
+///   a drop guard would cover nothing the types don't. The launcher keeps
+///   to code that doesn't panic instead (no indexing, no unwraps), and a
+///   reboot is always a way back (see the module's head).
+/// - Not a kill: SIGKILL ends the launcher wherever it is; HUP and TERM
+///   are ignored.
+mod lifecycle {
+    use super::{executable, log, run, wifi_back, Files, UsbDrive};
+    use crate::os::Os;
+    use crate::{Paths, SERVICES};
+    use statum::{machine, state, transition};
+    use std::path::PathBuf;
+    use std::process::ExitCode;
+
+    /// What only this module can make.
+    pub(super) struct Seal(());
+
+    /// How a session ended: `main`'s exit code.
+    #[must_use = "the session's result is its exit code"]
+    pub struct Ended(ExitCode);
+
+    impl Ended {
+        pub fn code(self) -> ExitCode {
+            self.0
+        }
+    }
+
+    /// The binary to run, and the slot it came from.
+    pub(super) struct Picked {
+        slot: PathBuf,
+        bin: PathBuf,
+    }
+
+    /// What stepped aside, to bring back.
+    pub(super) struct Away {
+        pub(super) gui: bool,
+        pub(super) usb: Option<UsbDrive>,
+        picked: Picked,
+    }
+
+    #[state]
+    pub(super) enum SessionState {
+        /// Nothing picked or stopped yet.
+        Starting,
+        /// A runnable binary picked; nothing stopped yet.
+        Ready(Picked),
+        /// Amazon's UI, X and powerd stopped (the rest stop in the
+        /// background): only `restore` leaves.
+        Aside(Away),
+        /// Amazon's UI and everything it needs started again.
+        Restored,
+    }
+
+    #[machine]
+    pub(super) struct Session<SessionState> {
+        seal: Seal,
+    }
+
+    impl Session<Starting> {
+        /// Through a state without data: statum's builder for one with data
+        /// keeps a panic (an `expect` it never takes) in the release build.
+        pub(super) fn start() -> Self {
+            Self::builder().seal(Seal(())).build()
+        }
+    }
+
+    #[transition]
+    impl Session<Starting> {
+        /// The binary to run, or the session refused with nothing stopped.
+        pub(super) fn pick(self, files: &Files) -> ::core::result::Result<Session<Ready>, Ended> {
+            let slot = files.installed.clone();
+            let bin = files.pick(&slot);
+            if !executable(&bin) {
+                log(&format!("missing {}", bin.display()));
+                return Err(Ended(ExitCode::FAILURE));
+            }
+            Ok(self.transition_with(Picked { slot, bin }))
+        }
+    }
+
+    #[transition]
+    impl Session<Ready> {
+        /// Amazon's UI, X and powerd stop; what USB drive mode needs back is
+        /// read first.
+        #[must_use = "once Amazon's UI has stopped, only restore() brings it back"]
+        pub(super) fn step_aside(self, paths: &Paths, os: &dyn Os) -> Session<Aside> {
+            let usb = UsbDrive::read(paths, os);
+            // Stopping the GUI job signals its whole tree, which can include
+            // us.
+            crate::os::ignore(libc::SIGTERM);
+            // A standalone boot never started it.
+            let gui = os.running("lab126_gui");
+            if gui {
+                // Let KUAL close its menu before the UI goes away.
+                os.sleep(std::time::Duration::from_secs(2));
+                log("stopping the Kindle UI");
+                os.stop("lab126_gui");
+                os.sleep(std::time::Duration::from_secs(2));
+            }
+            // kindil draws to the framebuffer itself: X has nothing to do
+            // while it runs. The way back starts it again, and Amazon's UI
+            // with it.
+            if os.running("x") {
+                os.stop("x");
+            }
+            // kindil does powerd's work itself: battery, front light,
+            // charging limits, sleep and the power button. Stopped first,
+            // and before kindil starts: stopping powerd switches the front
+            // light off, which kindil then sets.
+            if os.running("powerd") {
+                log("stopping powerd");
+                os.stop("powerd");
+            }
+            self.transition_map(|picked| Away { gui, usb, picked })
+        }
+    }
+
+    impl Session<Aside> {
+        /// Runs kindil until it exits for good.
+        pub(super) fn run(&self, paths: &Paths, os: &dyn Os, files: &Files) {
+            let picked = &self.state_data.picked;
+            run(paths, os, files, picked.slot.clone(), picked.bin.clone());
+        }
+    }
+
+    #[transition]
+    impl Session<Aside> {
+        /// Amazon's UI back, with everything it needs.
+        #[must_use = "the session ends with end()"]
+        pub(super) fn restore(self, paths: &Paths, os: &dyn Os) -> Session<Restored> {
+            let (gui, usb) = (self.state_data.gui, self.state_data.usb);
+            // A standalone boot skipped Amazon's framework: without it,
+            // Amazon's UI is an empty screen. `launcher boot` sets the flag
+            // again after a boot kindil stays up.
+            let _ = std::fs::remove_file(&paths.skip);
+            // kindil may have paused charging for the temperature
+            // (src/power.rs); powerd, back now, keeps its own range.
+            let _ = std::fs::write(&paths.charger, "1");
+            if !os.running("powerd") {
+                os.start("powerd");
+            }
+            // Before Amazon's UI, which expects the storage volumd's. Its
+            // start runs kindil's boot job again, which does nothing twice in
+            // a boot.
+            if let Some(usb) = usb {
+                usb.restore(os);
+            }
+            if gui {
+                os.lipc_set("com.lab126.blanket", "load", "usb");
+                os.lipc_set("com.lab126.blanket", "load", "splash");
+            }
+            log("starting the Kindle UI");
+            wifi_back(paths, os);
+            // kindil, even one that crashed, may have let its SSH port in.
+            os.close_port(crate::SSH_PORT);
+            for job in SERVICES {
+                if !os.running(job) {
+                    os.start(job);
+                }
+            }
+            if os.running("x") {
+                os.start("lab126_gui");
+            } else {
+                os.start("x");
+            }
+            let _ = std::fs::remove_file(&paths.pid_file);
+            self.transition()
+        }
+    }
+
+    impl Session<Restored> {
+        pub(super) fn end(self) -> Ended {
+            Ended(ExitCode::SUCCESS)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::os::fake::Fake;
     use std::collections::BTreeSet;
+    use std::process::ExitCode;
 
     struct Env {
         dir: tempfile::TempDir,
@@ -821,7 +951,7 @@ mod tests {
         }
 
         fn session(&self, os: &Fake) -> ExitCode {
-            session(&self.paths, os)
+            session(&self.paths, os).code()
         }
     }
 
