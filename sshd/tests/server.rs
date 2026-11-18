@@ -283,6 +283,22 @@ async fn gives_a_shell_its_terminal_and_its_size() {
     read_until(&mut channel, &mut seen, "24 80").await;
     read_until(&mut channel, &mut seen, "/dev/").await;
     channel.window_change(100, 30, 0, 0).await.unwrap();
+    // The shell may read its next line before the resize reaches the
+    // terminal: ask until it reports the new size.
+    let mut asked = 0;
+    while !seen.contains("30 100") {
+        assert!(asked < 20, "never resized: {seen}");
+        asked += 1;
+        channel.data(&b"stty size\n"[..]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(Duration::from_millis(100), channel.wait()).await
+        {
+            if let ChannelMsg::Data { data } = msg {
+                seen.push_str(&String::from_utf8_lossy(&data));
+            }
+        }
+    }
     channel.data(&b"stty size; exit 7\n"[..]).await.unwrap();
     let rest = collect(&mut channel).await;
     assert!(rest.stdout().contains("30 100"), "{seen}{}", rest.stdout());
