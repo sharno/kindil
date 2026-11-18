@@ -247,12 +247,11 @@ impl Github {
             .read_to_vec()?)
     }
 
-    /// The release's binary, once its signature checks out.
-    pub fn download(&self, release: &Release) -> anyhow::Result<Vec<u8>> {
+    /// The release's binary and its signature, not yet trusted.
+    fn download(&self, release: &Release) -> anyhow::Result<(Vec<u8>, String)> {
         let signature = String::from_utf8(self.asset(&release.signature)?)?;
         let binary = self.asset(&release.binary)?;
-        verify(&binary, &signature)?;
-        Ok(binary)
+        Ok((binary, signature))
     }
 }
 
@@ -283,52 +282,27 @@ impl Slots {
         self.bin.join(name)
     }
 
-    /// Writes the binary where the launcher picks it up on the next start,
-    /// after checking it runs and reports the expected version.
-    pub fn stage(&self, binary: &[u8], version: Version) -> anyhow::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        let part = self.path("kindil.next.part");
-        std::fs::write(&part, binary)?;
-        std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755))?;
-        let reported = std::process::Command::new(&part)
-            .arg("--version")
-            .output()?;
-        let expected = format!("kindil {version}");
-        let reported = String::from_utf8_lossy(&reported.stdout);
-        if reported.trim() != expected {
-            let _ = std::fs::remove_file(&part);
-            anyhow::bail!(
-                "the download reports {:?}, not {expected:?}",
-                reported.trim()
-            );
-        }
-        std::fs::rename(&part, self.path("kindil.next"))?;
-        Ok(())
-    }
-
     /// After a trial run settles: the trial binary becomes the current one
-    /// and the current one becomes the previous one.
+    /// and the current one becomes the previous one. Only a run the trial
+    /// files say is a trial is kept ([`Ota::read`]).
     pub fn commit(&self) -> anyhow::Result<Commit> {
-        if !self.trial.exists() {
-            return Ok(Commit::Nothing);
+        match Ota::read(self) {
+            Ok(OtaFound::Trying(trial)) => {
+                trial.commit(self)?;
+                Ok(Commit::Committed)
+            }
+            Ok(_) => Ok(Commit::Nothing),
+            Err(Inconsistent::MarkerWithoutBinary) => {
+                // Replaced by hand mid-trial (a deploy): nothing left to keep.
+                std::fs::remove_file(&self.trial)?;
+                Ok(Commit::Nothing)
+            }
+            Err(error @ Inconsistent::BinaryWithoutMarker) => {
+                // Never tried: not kept. The launcher drops it.
+                crate::log!("kindil: update: {error}");
+                Ok(Commit::Nothing)
+            }
         }
-        let trying = self.path("kindil.trying");
-        if !trying.exists() {
-            // Replaced by hand mid-trial (a deploy): nothing left to keep.
-            std::fs::remove_file(&self.trial)?;
-            return Ok(Commit::Nothing);
-        }
-        let current = self.path(BINARY);
-        if current.exists() {
-            std::fs::rename(&current, self.path("kindil.previous"))?;
-        }
-        std::fs::rename(&trying, &current)?;
-        std::fs::remove_file(&self.trial)?;
-        // The new binary is kept either way; an old launcher still runs it.
-        if let Err(error) = self.install_launcher() {
-            crate::log!("kindil: launcher: {error}");
-        }
-        Ok(Commit::Committed)
     }
 
     /// Writes the launcher files that differ, each replaced in one rename so
@@ -355,6 +329,262 @@ impl Slots {
                 std::fs::rename(&part, &path)?;
                 Ok(())
             })
+    }
+}
+
+/// Trial files no step leaves for long: what [`Ota::read`] refuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Inconsistent {
+    /// The marker without `kindil.trying`: the trial binary was replaced by
+    /// hand (a deploy), or a commit stopped between its two steps.
+    MarkerWithoutBinary,
+    /// `kindil.trying` without the marker: the launcher stopped between
+    /// moving the update in and marking its trial. It never ran.
+    BinaryWithoutMarker,
+}
+
+impl fmt::Display for Inconsistent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Inconsistent::MarkerWithoutBinary => {
+                "the trial marker is there but kindil.trying isn't: nothing on trial to keep"
+            }
+            Inconsistent::BinaryWithoutMarker => {
+                "kindil.trying is there but the trial marker isn't: it never had its trial"
+            }
+        })
+    }
+}
+
+impl std::error::Error for Inconsistent {}
+
+pub use steps::ota::SomeState as OtaFound;
+pub use steps::{Available, Idle, Kept, Ota, RolledBack, Staged, Trying, Verified};
+
+/// An over-the-air update as typestate: a binary is staged only once its
+/// signature checked out, and kept only from a run the launcher marked as
+/// its trial; any trial state can be rolled back. A run between the launcher
+/// and kindil spans processes: [`Ota::read`] rebuilds the state from the
+/// files each leaves. No state can be made outside this module but through
+/// [`Ota::available`] and [`Ota::read`] (the [`steps::Seal`] can't be).
+mod steps {
+    use super::*;
+    use statum::{machine, state, transition, validators, Error};
+
+    /// What only this module can make.
+    #[derive(Debug)]
+    pub struct Seal(());
+
+    #[state]
+    #[derive(Debug)]
+    pub enum OtaState {
+        /// Nothing staged or on trial.
+        Idle,
+        /// A newer release than this build.
+        Available(Release),
+        /// Its binary, signed by CI's key.
+        Verified(Signed),
+        /// `kindil.next`, reporting its version, for the launcher's next
+        /// start.
+        Staged,
+        /// This run is the trial: `kindil.trying` and the launcher's marker.
+        Trying,
+        /// The trial binary is now `kindil`.
+        Kept,
+        /// The staged or trial binary is gone, the current one stays.
+        RolledBack,
+    }
+
+    /// A binary that matched its signature, and the version it should report.
+    #[derive(Debug)]
+    pub struct Signed {
+        binary: Vec<u8>,
+        version: Version,
+    }
+
+    #[machine]
+    #[derive(Debug)]
+    pub struct Ota<OtaState> {
+        seal: Seal,
+    }
+
+    impl Ota<Available> {
+        /// Where every update starts.
+        pub fn available(release: Release) -> Self {
+            Self::builder().state_data(release).seal(Seal(())).build()
+        }
+    }
+
+    #[transition]
+    impl Ota<Available> {
+        /// Downloads the release, refusing anything not signed by CI's key.
+        pub fn download(
+            self,
+            github: &Github,
+        ) -> ::core::result::Result<Ota<Verified>, anyhow::Error> {
+            let (binary, signature) = github.download(&self.state_data)?;
+            self.verify(binary, &signature, PUBLIC_KEY)
+        }
+
+        pub(super) fn verify(
+            self,
+            binary: Vec<u8>,
+            signature: &str,
+            public_key: &str,
+        ) -> ::core::result::Result<Ota<Verified>, anyhow::Error> {
+            verify_with(public_key, &binary, signature)?;
+            let version = self.state_data.version;
+            Ok(self.transition_with(Signed { binary, version }))
+        }
+    }
+
+    #[transition]
+    impl Ota<Verified> {
+        /// Writes the binary where the launcher picks it up on the next
+        /// start, after checking it runs and reports the expected version.
+        pub fn stage(self, slots: &Slots) -> ::core::result::Result<Ota<Staged>, anyhow::Error> {
+            use std::os::unix::fs::PermissionsExt;
+            let Signed { binary, version } = &self.state_data;
+            let part = slots.path("kindil.next.part");
+            std::fs::write(&part, binary)?;
+            std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755))?;
+            let reported = std::process::Command::new(&part)
+                .arg("--version")
+                .output()?;
+            let expected = format!("kindil {version}");
+            let reported = String::from_utf8_lossy(&reported.stdout);
+            if reported.trim() != expected {
+                let _ = std::fs::remove_file(&part);
+                anyhow::bail!(
+                    "the download reports {:?}, not {expected:?}",
+                    reported.trim()
+                );
+            }
+            std::fs::rename(&part, slots.path("kindil.next"))?;
+            Ok(self.transition())
+        }
+    }
+
+    #[transition]
+    impl Ota<Staged> {
+        /// The staged binary dropped before its trial.
+        pub fn roll_back(self, slots: &Slots) -> Ota<RolledBack> {
+            let _ = std::fs::remove_file(slots.path("kindil.next"));
+            self.transition()
+        }
+    }
+
+    #[transition]
+    impl Ota<Trying> {
+        /// After a trial run settles: the trial binary becomes the current
+        /// one and the current one the previous one.
+        pub fn commit(self, slots: &Slots) -> ::core::result::Result<Ota<Kept>, anyhow::Error> {
+            let current = slots.path(BINARY);
+            if current.exists() {
+                std::fs::rename(&current, slots.path("kindil.previous"))?;
+            }
+            std::fs::rename(slots.path("kindil.trying"), &current)?;
+            std::fs::remove_file(&slots.trial)?;
+            // The new binary is kept either way; an old launcher still runs it.
+            if let Err(error) = slots.install_launcher() {
+                crate::log!("kindil: launcher: {error}");
+            }
+            Ok(self.transition())
+        }
+
+        /// What the launcher does when the trial ends first; here for
+        /// completeness: any trial state can go back.
+        pub fn roll_back(self, slots: &Slots) -> Ota<RolledBack> {
+            let _ = std::fs::remove_file(&slots.trial);
+            let _ = std::fs::remove_file(slots.path("kindil.trying"));
+            self.transition()
+        }
+    }
+
+    /// Which trial files exist.
+    pub(super) struct Files {
+        next: bool,
+        trying: bool,
+        marker: bool,
+    }
+
+    impl Files {
+        pub(super) fn of(slots: &Slots) -> Self {
+            Self {
+                next: slots.path("kindil.next").is_file(),
+                trying: slots.path("kindil.trying").exists(),
+                marker: slots.trial.exists(),
+            }
+        }
+
+        fn inconsistent(&self) -> Inconsistent {
+            if self.marker {
+                Inconsistent::MarkerWithoutBinary
+            } else {
+                Inconsistent::BinaryWithoutMarker
+            }
+        }
+    }
+
+    fn when(holds: bool) -> statum::Result<()> {
+        if holds {
+            Ok(())
+        } else {
+            Err(Error::InvalidState)
+        }
+    }
+
+    /// Only the launcher's and kindil's own files on disk: an update
+    /// available or verified lives in one run's memory, and kept or rolled
+    /// back look like nothing on trial.
+    #[validators(Ota)]
+    impl Files {
+        fn is_idle(&self) -> statum::Result<()> {
+            when(!self.next && !self.trying && !self.marker)
+        }
+        fn is_available(&self) -> statum::Result<Release> {
+            Err(Error::InvalidState)
+        }
+        fn is_verified(&self) -> statum::Result<Signed> {
+            Err(Error::InvalidState)
+        }
+        fn is_staged(&self) -> statum::Result<()> {
+            when(self.next && !self.trying && !self.marker)
+        }
+        /// An update staged during the trial waits for the next start.
+        fn is_trying(&self) -> statum::Result<()> {
+            when(self.trying && self.marker)
+        }
+        fn is_kept(&self) -> statum::Result<()> {
+            Err(Error::InvalidState)
+        }
+        fn is_rolled_back(&self) -> statum::Result<()> {
+            Err(Error::InvalidState)
+        }
+    }
+
+    /// For tests: a binary as if signed, since the tests can't sign one.
+    #[cfg(test)]
+    pub(super) fn signed(binary: &[u8], version: Version) -> Ota<Verified> {
+        Ota::<Verified>::builder()
+            .state_data(Signed {
+                binary: binary.to_vec(),
+                version,
+            })
+            .seal(Seal(()))
+            .build()
+    }
+
+    impl Ota<Idle> {
+        /// The update's state from the files on disk, or what is wrong with
+        /// them.
+        pub fn read(slots: &Slots) -> ::core::result::Result<ota::SomeState, Inconsistent> {
+            let files = Files::of(slots);
+            Ota::rebuild(&files)
+                .seal(Seal(()))
+                .build()
+                .map_err(|_| files.inconsistent())
+        }
     }
 }
 
@@ -459,9 +689,100 @@ SW/I/JX/SBpxgS4DThvhL91wP3EJoH7taYJoyf43DW8zZZ3wB65CwRxKLqoEs5+fTbZ4yzLmtSU3WMSU
         let dir = tempfile::tempdir().unwrap();
         let slots = Slots::new(dir.path(), dir.path().join("trying"));
         let script = b"#!/bin/sh\necho kindil 9.9.9\n";
-        assert!(slots.stage(script, v("0.5.1")).is_err());
+        assert!(steps::signed(script, v("0.5.1")).stage(&slots).is_err());
         assert!(!dir.path().join("kindil.next").exists());
-        slots.stage(script, v("9.9.9")).unwrap();
+        steps::signed(script, v("9.9.9")).stage(&slots).unwrap();
         assert!(dir.path().join("kindil.next").exists());
+        assert!(matches!(Ota::read(&slots), Ok(OtaFound::Staged(_))));
+    }
+
+    #[test]
+    fn only_a_signed_binary_is_verified() {
+        let release = || Ota::available(Release::decode(RELEASE).unwrap());
+        let fixture = b"kindil test fixture".to_vec();
+        assert!(release()
+            .verify(fixture.clone(), TEST_SIGNATURE, TEST_KEY)
+            .is_ok());
+        let error = release()
+            .verify(fixture, TEST_SIGNATURE, PUBLIC_KEY)
+            .unwrap_err();
+        assert!(!error.to_string().is_empty());
+    }
+
+    /// Every combination of `kindil.next`, `kindil.trying` and the marker.
+    #[test]
+    fn the_trial_files_rebuild_one_state_or_say_whats_wrong() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let slots = Slots::new(&bin, dir.path().join("trying"));
+        let state = |found: Result<OtaFound, Inconsistent>| match found {
+            Ok(OtaFound::Idle(_)) => "idle".to_owned(),
+            Ok(OtaFound::Staged(_)) => "staged".to_owned(),
+            Ok(OtaFound::Trying(_)) => "trying".to_owned(),
+            Ok(_) => "in memory only".to_owned(),
+            Err(error) => format!("{error:?}"),
+        };
+        for (next, trying, marker, want) in [
+            (false, false, false, "idle"),
+            (true, false, false, "staged"),
+            (false, true, true, "trying"),
+            (true, true, true, "trying"),
+            (false, false, true, "MarkerWithoutBinary"),
+            (true, false, true, "MarkerWithoutBinary"),
+            (false, true, false, "BinaryWithoutMarker"),
+            (true, true, false, "BinaryWithoutMarker"),
+        ] {
+            for (on, path) in [
+                (next, bin.join("kindil.next")),
+                (trying, bin.join("kindil.trying")),
+                (marker, dir.path().join("trying")),
+            ] {
+                let _ = std::fs::remove_file(&path);
+                if on {
+                    std::fs::write(&path, "").unwrap();
+                }
+            }
+            assert_eq!(
+                state(Ota::read(&slots)),
+                want,
+                "next {next}, trying {trying}, marker {marker}"
+            );
+        }
+        assert!(Inconsistent::BinaryWithoutMarker
+            .to_string()
+            .contains("never had its trial"));
+    }
+
+    #[test]
+    fn a_binary_without_its_marker_is_never_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let slots = Slots::new(dir.path(), dir.path().join("trying"));
+        std::fs::write(dir.path().join("kindil"), "old").unwrap();
+        std::fs::write(dir.path().join("kindil.trying"), "new").unwrap();
+        assert_eq!(slots.commit().unwrap(), Commit::Nothing);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("kindil")).unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn any_trial_state_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let slots = Slots::new(dir.path(), dir.path().join("trying"));
+        std::fs::write(dir.path().join("kindil.next"), "").unwrap();
+        let Ok(OtaFound::Staged(staged)) = Ota::read(&slots) else {
+            panic!("staged")
+        };
+        staged.roll_back(&slots);
+        assert!(matches!(Ota::read(&slots), Ok(OtaFound::Idle(_))));
+        std::fs::write(dir.path().join("kindil.trying"), "").unwrap();
+        std::fs::write(dir.path().join("trying"), "").unwrap();
+        let Ok(OtaFound::Trying(trying)) = Ota::read(&slots) else {
+            panic!("trying")
+        };
+        trying.roll_back(&slots);
+        assert!(matches!(Ota::read(&slots), Ok(OtaFound::Idle(_))));
     }
 }

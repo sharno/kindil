@@ -3057,6 +3057,7 @@ dependencies = [
  "slint-backend-kindle",
  "slint-build",
  "socket2",
+ "statum",
  "tar",
  "tempfile",
  "textwrap",
@@ -3114,6 +3115,7 @@ name = "launcher"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "statum",
  "tempfile",
 ]
 
@@ -5711,6 +5713,33 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "statum"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eabbdd1e888a8ea2342491cf0cddc2a4461b783f90fadde11cab830f05d051ab"
+dependencies = [
+ "statum-core",
+ "statum-macros",
+]
+
+[[package]]
+name = "statum-core"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b037b6ba7725e42cd326aaaab63f0754652f43c9d37786a21649abcecca929e"
+
+[[package]]
+name = "statum-macros"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db58eb6bd16486019b08bd8a2a588b5d1fe87a1e8f03555bfc0c65a379f4d60"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "strict-num"

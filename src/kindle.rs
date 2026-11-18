@@ -12,7 +12,7 @@ use crate::net::Net;
 use crate::networks::{self, Networks};
 use crate::system::{self, Event};
 use crate::uevent::Uevent;
-use crate::update::{Check, Commit, Github, Release, Slots, Version};
+use crate::update::{Check, Commit, Github, Ota, Release, Slots, Version};
 use crate::wifi::{Credentials, Link, Network, Ssid};
 use std::io::BufRead;
 use std::path::Path;
@@ -461,8 +461,10 @@ impl Host for KindleHost {
     }
 
     fn stage_update(&self, release: &Release) -> anyhow::Result<()> {
-        let binary = Github::default().download(release)?;
-        Slots::new(EXTENSION_BIN, UPDATE_TRIAL).stage(&binary, release.version)
+        Ota::available(release.clone())
+            .download(&Github::default())?
+            .stage(&Slots::new(EXTENSION_BIN, UPDATE_TRIAL))
+            .map(drop)
     }
 
     fn commit_update(&self) -> anyhow::Result<Commit> {
