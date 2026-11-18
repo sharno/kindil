@@ -25,7 +25,8 @@ const CHECKS: &[(&str, &str, Expect)] = &[
     (
         "Sleep",
         "SleepCharger",
-        Expect::Fails("plugged in, the low-battery sleep can last for good"),
+        // Since lowbat, only through a power-off with a charger just plugged in.
+        Expect::Fails("a battery sleep powers off with a charger just plugged in"),
     ),
     (
         "Sleep",
@@ -42,11 +43,8 @@ const CHECKS: &[(&str, &str, Expect)] = &[
         "SleepAlarmFails",
         Expect::Fails("without its check alarm, a later press is taken for it"),
     ),
-    (
-        "Sleep",
-        "SleepRefused",
-        Expect::Fails("a refused low-battery suspend is never tried again"),
-    ),
+    // Holds since d674cfd: the battery's sleep powers off when it can't suspend.
+    ("Sleep", "SleepRefused", Expect::Holds),
     (
         "Sleep",
         "SleepPowerOff",
