@@ -405,7 +405,9 @@ impl Host for KindleHost {
             // battery, a check of its own every few hours does (src/power.rs).
             let check = (!plugged().unwrap_or(false)).then_some(crate::power::CHECK_ASLEEP);
             let due = check.map(|after| epoch_seconds() + after.as_secs() as i64);
-            sleep_once(&recorder, "sleep", check)?;
+            // The user asked for this sleep: without its check's alarm it
+            // still sleeps, until the button, rather than stay up.
+            sleep_once(&recorder, "sleep", check.map(Alarm::Wanted))?;
             let now = epoch_seconds();
             if !due.is_some_and(|due| crate::power::alarm_woke(due, now)) {
                 // The power button: the app wakes.
@@ -428,7 +430,7 @@ impl Host for KindleHost {
             recorder.note(&format!("nap: {left:?} left; not suspending"));
             return Ok(());
         }
-        sleep_once(&recorder, "nap", Some(left))
+        sleep_once(&recorder, "nap", Some(Alarm::Required(left)))
     }
 
     /// [`sleep_once`] caught up already, before anything read the clock.
@@ -483,34 +485,51 @@ impl Host for KindleHost {
 /// The last suspend's clock correction, for the doze's ledger.
 static CAUGHT_UP: Mutex<Option<crate::clock::Correction>> = Mutex::new(None);
 
-/// Every suspend goes through here: the wake alarm armed `after` from now
-/// (or moved out of the way, for a sleep only the power button ends) as the
-/// very last thing before the suspend, read back from the RTC's registers,
-/// and no suspend at all if that fails: a suspend without a trusted alarm
-/// could last until someone presses the button. Each step is noted in the
-/// flight recorder first. Back awake, the alarm is moved out of the way and
-/// the clock put back within the RTC's second.
+/// A suspend's wake alarm, this far ahead.
+#[derive(Clone, Copy, Debug)]
+enum Alarm {
+    /// No suspend without it: a nap's.
+    Required(Duration),
+    /// Without it the suspend lasts until the power button: a sleep's.
+    Wanted(Duration),
+}
+
+/// Every suspend goes through here: the wake alarm armed (or moved out of
+/// the way, for a sleep only the power button ends) as the very last thing
+/// before the suspend, read back from the RTC's registers, and no suspend
+/// at all if a [`Alarm::Required`] one fails: such a suspend could last
+/// until someone presses the button. Each step is noted in the flight
+/// recorder first. Back awake, the alarm is moved out of the way and the
+/// clock put back within the RTC's second.
 fn sleep_once(
     recorder: &crate::flight::Recorder,
     what: &str,
-    after: Option<Duration>,
+    alarm: Option<Alarm>,
 ) -> anyhow::Result<()> {
     let rtc = crate::wakealarm::WakeRtc::find();
-    let armed = match (after, &rtc) {
-        (Some(after), Ok(rtc)) => Some(rtc.arm(after)),
-        (Some(_), Err(error)) => Some(Err(anyhow::anyhow!("{error}"))),
-        (None, Ok(rtc)) => {
-            rtc.disarm()?;
-            None
-        }
-        // No wake alarm at all: only the button can wake it anyway.
-        (None, Err(_)) => None,
+    let arm = |after| match &rtc {
+        Ok(rtc) => rtc.arm(after),
+        Err(error) => Err(anyhow::anyhow!("{error}")),
     };
-    let armed = match armed.transpose() {
-        Ok(armed) => armed,
-        Err(error) => {
-            recorder.note(&format!("{what}: not suspending: {error:#}"));
-            return Err(error.context("arming the wake alarm"));
+    let armed = match alarm {
+        Some(Alarm::Required(after)) => match arm(after) {
+            Ok(armed) => Some(armed),
+            Err(error) => {
+                recorder.note(&format!("{what}: not suspending: {error:#}"));
+                return Err(error.context("arming the wake alarm"));
+            }
+        },
+        Some(Alarm::Wanted(after)) => match arm(after) {
+            Ok(armed) => Some(armed),
+            Err(error) => {
+                crate::log!("kindil: {what}: no wake alarm ({error:#}); until the power button");
+                disarm(&rtc, recorder, what);
+                None
+            }
+        },
+        None => {
+            disarm(&rtc, recorder, what);
+            None
         }
     };
     let rtc_name = rtc.as_ref().map(|rtc| rtc.name()).unwrap_or_default();
@@ -523,11 +542,7 @@ fn sleep_once(
     // The power button may have woken it first: the alarm must not wake a
     // later suspend that didn't ask for it.
     let rtc_now = rtc.as_ref().ok().and_then(|rtc| rtc.now().ok());
-    if let Ok(rtc) = &rtc {
-        if let Err(error) = rtc.disarm() {
-            recorder.note(&format!("{what}: moving the alarm away: {error:#}"));
-        }
-    }
+    disarm(&rtc, recorder, what);
     let correction = crate::clock::catch_up();
     recorder.note(&format!(
         "{what}: {} after {} s by the clock, {rtc_name} at {}{}",
@@ -543,6 +558,19 @@ fn sleep_once(
         *lock(&CAUGHT_UP) = Some(correction);
     }
     Ok(slept?)
+}
+
+/// Moves the alarm out of the way, if there is one; a failure is noted.
+fn disarm(
+    rtc: &anyhow::Result<crate::wakealarm::WakeRtc>,
+    recorder: &crate::flight::Recorder,
+    what: &str,
+) {
+    if let Ok(rtc) = rtc {
+        if let Err(error) = rtc.disarm() {
+            recorder.note(&format!("{what}: moving the alarm away: {error:#}"));
+        }
+    }
 }
 
 fn epoch_seconds() -> i64 {
