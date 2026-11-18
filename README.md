@@ -22,27 +22,75 @@ replaces Amazon's software for the screen, Wi-Fi, power and sleep, so
 nothing of Amazon's store, sync or ads runs, and it never changes the
 Kindle's system: exit kindil, or remove it, and the Kindle is stock again.
 
-## What it does
+## Screenshots
 
-<p align="center">
-  <img src="crates/miqat/docs/preview.png" alt="The prayer-time dashboard" width="320">
-</p>
+<table>
+<tr>
+<td align="center"><img src="docs/screenshots/dashboard-miqat.png" alt="The prayer dashboard" width="240"><br><sub>Prayer dashboard</sub></td>
+<td align="center"><img src="docs/screenshots/dashboard-miqat-rain.png" alt="The dashboard with the rain radar" width="240"><br><sub>Rain radar when rain is coming</sub></td>
+<td align="center"><img src="docs/screenshots/dashboard-clock.png" alt="The clock home screen" width="240"><br><sub>Or just a big clock</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/screenshots/library.png" alt="The library" width="240"><br><sub>Library</sub></td>
+<td align="center"><img src="docs/screenshots/reader.png" alt="The reader" width="240"><br><sub>Reader</sub></td>
+<td align="center"><img src="docs/screenshots/reader-panel.png" alt="The reader's quick panel" width="240"><br><sub>Light and text size</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/screenshots/settings.png" alt="Settings" width="240"><br><sub>Settings</sub></td>
+<td align="center"><img src="docs/screenshots/settings-prayer.png" alt="Prayer calculation methods" width="240"><br><sub>Prayer methods, with today's times</sub></td>
+<td align="center"><img src="docs/screenshots/settings-location.png" alt="Location settings" width="240"><br><sub>Location</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/screenshots/settings-wifi.png" alt="Wi-Fi settings" width="240"><br><sub>Wi-Fi</sub></td>
+<td align="center"><img src="docs/screenshots/settings-about.png" alt="About" width="240"><br><sub>About</sub></td>
+<td align="center"><img src="docs/screenshots/asleep.png" alt="The sleep screen" width="240"><br><sub>Asleep</sub></td>
+</tr>
+</table>
 
-- **Prayer dashboard**: the next prayer and a countdown, today's six times in
-  Arabic and English, the Hijri date, the weather, tomorrow's forecast, and a
-  rain radar when rain is coming. Twelve calculation methods and both Asr
-  schools, chosen in Settings.
-- **Always on, low power**: after two minutes untouched the light goes off and
-  the Kindle sleeps between updates, waking each minute to move the clock and
-  every 30 minutes to fetch the weather.
-- **Reader**: EPUB and text books from the Kindle's `books` folder, with your
-  place, text size and light remembered.
-- **Settings on the device**: location (search a city or use your approximate
-  location), prayer method, Wi-Fi, light, sleep, start at boot.
-- **Updates over Wi-Fi**: signed releases from this repository, tried first and
-  rolled back automatically if they don't run well.
-- **Safe by design**: if kindil crashes it restarts; if it keeps crashing the
-  previous version runs; if that fails too, Amazon's own interface comes back.
+## Features
+
+**Prayer dashboard**
+- The next prayer and the time left until it, large enough to read across a
+  room.
+- Today's six times in Arabic and English, with the current one highlighted,
+  and the Gregorian and Hijri dates.
+- Twelve calculation methods (Muslim World League, ISNA, Egyptian, Umm
+  al-Qura, Karachi, Dubai, Moonsighting Committee, Kuwait, Qatar, Singapore,
+  Tehran, Turkey) and both Asr schools. Each choice shows today's times, so
+  you can match your mosque's timetable.
+- Weather now, the next six hours and tomorrow, from Open-Meteo, and a rain
+  radar map that appears when rain is expected.
+- Or a plain big clock as the home screen.
+
+**Always on, for days**
+- After two minutes untouched the light goes off and the Kindle sleeps
+  between updates: it wakes each minute to move the clock and the countdown,
+  redrawing only that strip, and every 30 minutes to fetch the weather.
+- Keeps its own time: corrected after every sleep and checked against
+  internet time servers when online.
+- Charging is paused when the battery is too hot or cold; at 1% it powers
+  off instead of draining flat.
+
+**Reader**
+- EPUB and plain text books from the Kindle's `books` folder.
+- Tap or swipe to turn pages; your place in every book, the text size and
+  the light are remembered.
+- Rename books, or move them to a Trash you can undo.
+
+**Set up on the Kindle itself**
+- Location: search for a city, use your approximate location, or type
+  coordinates. The clock's time zone follows.
+- Wi-Fi: scan, join, and forget networks, with an on-screen keyboard.
+- Front light, home screen, sleep when idle, start at boot.
+
+**Looks after itself**
+- Updates over Wi-Fi, signed, tried first and kept only if they run well.
+- A crash restarts it; a version that keeps crashing makes way for the
+  previous one, then for Amazon's own interface.
+- Its own Wi-Fi, SSH server and power management, so Amazon's store, sync
+  and background services don't run while it does.
+- Never changes the Kindle's system: exit or remove it and the Kindle is
+  stock.
 
 ## Install
 
