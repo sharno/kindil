@@ -58,7 +58,9 @@ too.
 
 At boot the bind should come well before `framework` starts: kindil's job
 runs at `started volumd`, `framework` at `contentpack_font_ready`, after X
-and `lab126_gui`. Step 3's probe confirms it.
+and `lab126_gui`. Step 3's probe confirms it. Amazon's services, by
+contrast, all get their start goal before kindil's job runs, so no overlay
+can keep them from starting: see [BOOT-JOBS.md](BOOT-JOBS.md).
 
 ## 1. By hand, without a reboot
 
