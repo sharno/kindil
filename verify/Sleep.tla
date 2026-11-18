@@ -125,7 +125,7 @@ VARIABLES
     overlap,     \* a nap or sleep thread started while the last was still running
     badClaim,    \* a wake ended Done or Timed without its frame accepted by the panel
     longNap,     \* a nap was armed on a clock stepped back since its minute was taken
-    misjudged    \* a sleep took a press (or a cable) for its check alarm
+    misjudged    \* a sleep took a press for its check alarm
 
 observed == <<mode, light, fresh, effects, ignored, handled>>
 app == <<sleepWhy, screen, pend, autoSleep, dashboard>>
@@ -521,8 +521,8 @@ SleeperSuspends ==
             THEN /\ ChargerSettled
                  /\ cpu' = "off" /\ sleeper' = "idle"
                  /\ UNCHANGED <<alarm, wokeBy, due, pressed, pend>>
-            ELSE \* `due` is taken from the alarm asked for, armed or not.
-                 /\ due' = ~connected
+            ELSE \* Only an armed alarm can wake it (`Back::armed`).
+                 /\ due' = (~connected /\ armed)
                  /\ alarm' = IF ~connected /\ armed THEN "check" ELSE "none"
                  /\ sleeper' = "suspended" /\ cpu' = "suspended" /\ wokeBy' = "none"
                  /\ pressed' = FALSE
@@ -548,11 +548,13 @@ SleeperRefused ==
     /\ UNCHANGED <<observed, sleepWhy, screen, autoSleep, dashboard, draw,
                    alarm, wokeBy, due, napper, holdTimer, sleepFor, pressed, world, ghosts>>
 
-(* Back from a sleep, `alarm_woke` judges by the time: from 2 s before the *)
-(* due time on, it was the alarm. That is the alarm itself; a press in its *)
-(* last 2 s; or, with no alarm armed, a press after the due time. Else a   *)
-(* sleep the user asked for wakes the app (Resumed); the battery's watches *)
-(* for the button or a charger (`woke`).                                   *)
+(* Back from a sleep: it was the alarm if one was armed (`due`), it is its *)
+(* time by `alarm_woke` (from 2 s before), and the power button wasn't     *)
+(* pressed since the suspend (`pressed_within` BUTTON_GRACE: the listener  *)
+(* counts a press within it). The time alone also says so for a press in  *)
+(* the alarm's last 2 s (PressNearAlarm). Else a sleep the user asked for  *)
+(* wakes the app (Resumed); the battery's watches for the button or a      *)
+(* charger (`woke`).                                                       *)
 SleeperResumes ==
     /\ ~OpenWorld
     /\ cpu = "up" /\ sleeper = "suspended"
@@ -560,13 +562,13 @@ SleeperResumes ==
     /\ \E late \in (IF wokeBy = "alarm" THEN {TRUE}
                     ELSE IF alarm = "none" \/ PressNearAlarm THEN BOOLEAN
                     ELSE {FALSE}) :
-         /\ IF due /\ late
+         /\ IF due /\ late /\ ~pressed
             THEN sleeper' = "check" /\ pend' = pend
             \* (With ExternalOpen the button and the charger are open too: no watch.)
             ELSE IF sleepFor = "battery" /\ ~ExternalOpen
             THEN sleeper' = "detect" /\ pend' = pend
             ELSE sleeper' = "idle" /\ pend' = Add(pend, "Resumed", 1)
-         /\ misjudged' = (misjudged \/ (due /\ late /\ wokeBy # "alarm"))
+         /\ misjudged' = (misjudged \/ (due /\ late /\ ~pressed /\ wokeBy = "press"))
     /\ UNCHANGED <<observed, sleepWhy, screen, autoSleep, dashboard, draw,
                    cpu, napper, holdTimer, sleepFor, pressed, world, pressWaiting, overlap,
                    badClaim, longNap>>
@@ -784,8 +786,8 @@ NapsEndOnTheMinute == ~longNap
 (* panel; any other ended NotSeen, logged, or with the doze.               *)
 ClaimedFrameIsOnPanel == ~badClaim
 
-(* The sleep takes the button for the button: never a press (or a cable) *)
-(* for its check alarm, which would put the device straight back to sleep. *)
+(* The sleep takes the button for the button: never a press for its check *)
+(* alarm, which would put the device straight back to sleep.               *)
 PressNotTakenForAlarm == ~misjudged
 
 (* Never powered off on a charger.                                         *)

@@ -29,16 +29,10 @@ const CHECKS: &[(&str, &str, Expect)] = &[
         "SleepRaces",
         Expect::Fails("a nap or sleep that the app left still suspends"),
     ),
-    (
-        "Sleep",
-        "SleepNearAlarm",
-        Expect::Fails("a press just before the check alarm is taken for it"),
-    ),
-    (
-        "Sleep",
-        "SleepAlarmFails",
-        Expect::Fails("without its check alarm, a later press is taken for it"),
-    ),
+    // Failed on 0.15.0; holds since the press count decides alarm or button.
+    ("Sleep", "SleepNearAlarm", Expect::Holds),
+    // Failed on 0.15.0; holds since only an armed alarm can be the alarm.
+    ("Sleep", "SleepAlarmFails", Expect::Holds),
     // Holds since d674cfd: the battery's sleep powers off when it can't suspend.
     ("Sleep", "SleepRefused", Expect::Holds),
     // Failed on 0.15.0; holds since power::sleep looks for a charger before powering off.

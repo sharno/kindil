@@ -424,7 +424,7 @@ impl Host for KindleHost {
             recorder.note(&format!("nap: {left:?} left; not suspending"));
             return Ok(());
         }
-        sleep_once(&recorder, "nap", crate::suspend::Wake::Alarm(left))
+        sleep_once(&recorder, "nap", crate::suspend::Wake::Alarm(left)).map(drop)
     }
 
     /// [`sleep_once`] caught up already, before anything read the clock.
@@ -498,7 +498,7 @@ impl crate::power::Sleeper for Sleeping {
     /// The user asked for the sleep, or the battery did: a sleep the user
     /// asked for still sleeps without its check's alarm, until the button,
     /// rather than stay up; the battery's doesn't (src/power.rs).
-    fn suspend(&self, wake: crate::suspend::Wake) -> anyhow::Result<()> {
+    fn suspend(&self, wake: crate::suspend::Wake) -> anyhow::Result<bool> {
         sleep_once(&self.recorder, "sleep", wake)
     }
     fn now(&self) -> i64 {
@@ -541,12 +541,13 @@ impl crate::suspend::Kernel for Kernel<'_> {
 /// Every suspend goes through here (src/suspend.rs): the wake alarm armed
 /// and read back as the very last thing before it, or, for a sleep the user
 /// asked for, moved out of the way; no suspend at all if an alarm it needs
-/// fails. The clock's correction is kept for the doze's ledger.
+/// fails. The clock's correction is kept for the doze's ledger. Whether a
+/// wake alarm was armed for it.
 fn sleep_once(
     recorder: &crate::flight::Recorder,
     what: &'static str,
     wake: crate::suspend::Wake,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let rtc = crate::wakealarm::WakeRtc::find();
     let env = crate::suspend::Env {
         rtc: rtc.as_ref().map(|rtc| rtc as &dyn crate::suspend::Rtc),
@@ -558,7 +559,7 @@ fn sleep_once(
     }
     match back.refused {
         Some(error) => Err(error.into()),
-        None => Ok(()),
+        None => Ok(back.armed),
     }
 }
 

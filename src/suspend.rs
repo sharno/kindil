@@ -223,7 +223,7 @@ impl Suspend<Armed> {
             env.rtc_name(),
             self.state_data
         ));
-        let back = suspend(env, self.what);
+        let back = suspend(env, self.what, true);
         self.transition_with(back)
     }
 }
@@ -233,7 +233,7 @@ impl Suspend<UntilButton> {
     pub fn suspend(self, env: &Env) -> Suspend<Resumed> {
         env.kernel
             .note(&format!("{}: suspending until the power button", self.what));
-        let back = suspend(env, self.what);
+        let back = suspend(env, self.what, false);
         self.transition_with(back)
     }
 }
@@ -245,10 +245,12 @@ pub struct Back {
     pub refused: Option<std::io::Error>,
     /// The clock's step on the way back, if it needed one.
     pub correction: Option<Correction>,
+    /// Whether a wake alarm was armed for it: only then can it have woken it.
+    pub armed: bool,
 }
 
 /// The suspend itself, and the way back.
-fn suspend(env: &Env, what: &str) -> Back {
+fn suspend(env: &Env, what: &str, armed: bool) -> Back {
     let since = env.kernel.epoch();
     let slept = env.kernel.mem();
     // The power button may have woken it first: the alarm must not wake a
@@ -270,6 +272,7 @@ fn suspend(env: &Env, what: &str) -> Back {
     Back {
         refused: slept.err(),
         correction,
+        armed,
     }
 }
 
@@ -384,7 +387,8 @@ mod tests {
     #[test]
     fn a_nap_arms_reads_back_suspends_and_moves_the_alarm_away() {
         let (rtc, kernel, back) = run(false, false, "nap", Wake::Alarm(Duration::from_secs(40)));
-        assert!(back.unwrap().refused.is_none());
+        let back = back.unwrap();
+        assert!(back.refused.is_none() && back.armed);
         assert_eq!(*rtc.log.borrow(), ["arm", "disarm"]);
         assert_eq!(
             *kernel.notes.borrow(),
@@ -424,7 +428,7 @@ mod tests {
             "sleep",
             Wake::AlarmOrButton(Duration::from_secs(40), asked),
         );
-        assert!(back.is_ok());
+        assert!(!back.unwrap().armed, "no alarm: only the button wakes it");
         assert_eq!(*rtc.log.borrow(), ["arm", "disarm", "disarm"]);
         assert_eq!(
             kernel.notes.borrow()[0],
