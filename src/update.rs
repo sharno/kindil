@@ -479,12 +479,7 @@ mod steps {
         /// After a trial run settles: the trial binary becomes the current
         /// one and the current one the previous one.
         pub fn commit(self, slots: &Slots) -> ::core::result::Result<Ota<Kept>, anyhow::Error> {
-            let current = slots.path(BINARY);
-            if current.exists() {
-                std::fs::rename(&current, slots.path("kindil.previous"))?;
-            }
-            std::fs::rename(slots.path("kindil.trying"), &current)?;
-            std::fs::remove_file(&slots.trial)?;
+            keep(slots, usize::MAX)?;
             // The new binary is kept either way; an old launcher still runs it.
             if let Err(error) = slots.install_launcher() {
                 crate::log!("kindil: launcher: {error}");
@@ -499,6 +494,34 @@ mod steps {
             let _ = std::fs::remove_file(slots.path("kindil.trying"));
             self.transition()
         }
+    }
+
+    /// The commit's file steps, the first `steps` of them (all, but in
+    /// tests). Each leaves files the launcher reads right if it stops
+    /// there (a crash, a kill, a power cut; launcher/src/session.rs): the
+    /// current binary is copied to `kindil.previous`, never moved, so
+    /// `kindil` is always there, and the trial binary then replaces it in
+    /// one rename. Stopped before that rename, the marker and
+    /// `kindil.trying` are a trial cut short: rolled back, the current
+    /// binary runs. Stopped after it, the marker alone is dropped and the
+    /// new binary runs. (Moving `kindil` away first left no `kindil` at all
+    /// between the renames, and the rollback deleted the binary being
+    /// kept.)
+    pub(super) fn keep(slots: &Slots, steps: usize) -> std::io::Result<()> {
+        let current = slots.path(BINARY);
+        let previous = || -> std::io::Result<()> {
+            if current.exists() {
+                let part = slots.path("kindil.previous.part");
+                std::fs::copy(&current, &part)?;
+                std::fs::File::open(&part)?.sync_all()?;
+                std::fs::rename(&part, slots.path("kindil.previous"))?;
+            }
+            Ok(())
+        };
+        let replace = || std::fs::rename(slots.path("kindil.trying"), &current);
+        let unmark = || std::fs::remove_file(&slots.trial);
+        let all: [&dyn Fn() -> std::io::Result<()>; 3] = [&previous, &replace, &unmark];
+        all.iter().take(steps).try_for_each(|step| step())
     }
 
     /// Which trial files exist.
@@ -656,6 +679,43 @@ SW/I/JX/SBpxgS4DThvhL91wP3EJoH7taYJoyf43DW8zZZ3wB65CwRxKLqoEs5+fTbZ4yzLmtSU3WMSU
         assert!(verify_with(TEST_KEY, fixture, "not a signature").is_err());
         // The release key did not sign it.
         assert!(verify(fixture, TEST_SIGNATURE).is_err());
+    }
+
+    /// verify/LauncherCommitCut.cfg's counterexample: kindil stopped between
+    /// the commit's steps. 0.15.0 moved `kindil` to `kindil.previous` first;
+    /// stopped there, no `kindil` was left, and the launcher's rollback of
+    /// the trial (the marker still there) deleted `kindil.trying`, the
+    /// binary being kept.
+    #[test]
+    fn a_commit_stopped_at_any_step_leaves_a_binary_the_launcher_runs() {
+        for steps in 0..=3 {
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let marker = dir.path().join("trying");
+            let slots = Slots::new(&bin, &marker);
+            std::fs::write(bin.join("kindil"), "old").unwrap();
+            std::fs::write(bin.join("kindil.previous"), "older").unwrap();
+            std::fs::write(bin.join("kindil.trying"), "new").unwrap();
+            std::fs::write(&marker, "").unwrap();
+            steps::keep(&slots, steps).unwrap();
+            // What the launcher does next (launcher/src/session.rs): the
+            // marker means a trial cut short, rolled back.
+            if marker.exists() {
+                let _ = std::fs::remove_file(&marker);
+                let _ = std::fs::remove_file(bin.join("kindil.trying"));
+            }
+            let read = |name: &str| std::fs::read_to_string(bin.join(name)).ok();
+            let runs = read("kindil");
+            assert!(runs.is_some(), "stopped after {steps} steps: no kindil");
+            match steps {
+                0 | 1 => assert_eq!(runs.as_deref(), Some("old"), "{steps}"),
+                _ => assert_eq!(runs.as_deref(), Some("new"), "{steps}"),
+            }
+            if steps >= 1 {
+                assert_eq!(read("kindil.previous").as_deref(), Some("old"));
+            }
+        }
     }
 
     #[test]

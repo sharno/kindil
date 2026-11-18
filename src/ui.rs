@@ -322,6 +322,10 @@ struct Ctx {
     timers: Rc<RefCell<Vec<DeviceEvent>>>,
     /// The doze wake whose redraw is awaited.
     draw_wake: Arc<DrawWake>,
+    /// Voided when the app leaves a nap or a sleep: a nap's or sleep's
+    /// thread still on its way to suspend then doesn't (src/suspend.rs),
+    /// and what it reports is dropped.
+    suspends: crate::suspend::Gate,
     /// Where this doze's time went; shared with the threads that end wakes.
     ledger: Arc<Mutex<DozeLedger>>,
     /// Steps of the clock from network time not yet applied to the doze's
@@ -446,6 +450,20 @@ fn notify(ui: &AppWindow, text: &str) {
     k.set_notice(text.into());
 }
 
+/// Whether a step leaves a nap or a sleep, whose thread (if still on its
+/// way to suspend) must then not: a press, or a computer taking the
+/// storage. Its own end (Resumed, a refusal) leaves it too, harmlessly.
+fn leaves_suspend(mode: Mode, next: Mode) -> bool {
+    let suspending = |mode| {
+        matches!(
+            mode,
+            Mode::Dozing(Doze::Napping { .. })
+                | Mode::Asleep(crate::system::Sleep::Suspended { .. })
+        )
+    };
+    suspending(mode) && !suspending(next)
+}
+
 /// Time until the next wall-clock minute, so the clock flips on the minute.
 pub fn until_next_minute(now: DateTime<Utc>) -> Duration {
     let into_minute = Duration::new(u64::from(now.second()), now.nanosecond() % 1_000_000_000);
@@ -501,6 +519,7 @@ impl App {
             doze_gauge: Arc::default(),
             timers: Rc::default(),
             draw_wake: Arc::default(),
+            suspends: crate::suspend::Gate::default(),
             ledger,
             clock_steps: Arc::new(Mutex::new(chrono::TimeDelta::zero())),
             timezone: Arc::new(Mutex::new(timezone)),
@@ -1357,6 +1376,9 @@ impl Ctx {
             Err(ignored) => crate::log!("kindil: {event:?} ignored: {ignored:?}"),
             Ok(Step { next, effects }) => {
                 self.state.borrow_mut().system = next;
+                if leaves_suspend(mode, next) {
+                    self.suspends.void();
+                }
                 self.dozing_changed(
                     matches!(mode, Mode::Dozing(_)),
                     matches!(next, Mode::Dozing(_)),
@@ -1412,12 +1434,21 @@ impl Ctx {
 
     /// Runs slow device work off the UI thread and feeds its outcome back as an event.
     fn device_later(&self, work: impl FnOnce(&dyn Host) -> DeviceEvent + Send + 'static) {
+        self.device_later_if(move |host| Some(work(host)));
+    }
+
+    /// Like [`Ctx::device_later`], for work whose outcome may be stale by
+    /// then: `None` delivers nothing.
+    fn device_later_if(
+        &self,
+        work: impl FnOnce(&dyn Host) -> Option<DeviceEvent> + Send + 'static,
+    ) {
         match self.execution {
-            Execution::Inline => self.device(work(&*self.host)),
+            Execution::Inline => work(&*self.host).into_iter().for_each(|e| self.device(e)),
             Execution::Background => {
                 let host = self.host.clone();
                 let deliver = self.deliver();
-                std::thread::spawn(move || deliver(work(&*host)));
+                std::thread::spawn(move || work(&*host).into_iter().for_each(&deliver));
             }
         }
     }
@@ -1635,16 +1666,22 @@ impl Ctx {
             Effect::AwaitPanel => self.after(PANEL_SETTLE, DeviceEvent::PanelSettled),
             Effect::AwaitDrive(since) => self.after(DRIVE_SETTLE, DeviceEvent::DriveSettled(since)),
             // Parked first: wpa_supplicant would join again after the resume.
-            Effect::Suspend(why) => self.device_later(move |host| {
-                host.park_wifi();
-                match host.suspend(why) {
-                    Ok(()) => DeviceEvent::Resumed,
-                    Err(error) => {
-                        crate::log!("kindil: suspend: {error}");
-                        DeviceEvent::SuspendFailed
-                    }
-                }
-            }),
+            // A press while Wi-Fi parks voids the ticket: no suspend, and no
+            // stale Resumed to wake a later sleep.
+            Effect::Suspend(why) => {
+                let ticket = self.suspends.ticket();
+                self.device_later_if(move |host| {
+                    host.park_wifi();
+                    let slept = host.suspend(why, &ticket);
+                    ticket.valid().then(|| match slept {
+                        Ok(()) => DeviceEvent::Resumed,
+                        Err(error) => {
+                            crate::log!("kindil: suspend: {error}");
+                            DeviceEvent::SuspendFailed
+                        }
+                    })
+                })
+            }
             Effect::Nap => {
                 let now = (self.now)();
                 // On the redraw's minute, plus a second so the clock has turned.
@@ -1654,7 +1691,8 @@ impl Ctx {
                     state.naps += 1;
                     state.naps
                 };
-                self.nap_or_hold(now, until, nap);
+                let deadline = crate::system::nap_deadline(now, until, Instant::now());
+                self.nap_or_hold(now, deadline, nap);
             }
             Effect::Redraw => self.redraw_doze(),
             Effect::Rouse => {
@@ -1781,12 +1819,12 @@ impl Ctx {
         });
     }
 
-    /// Naps until `until` (the next minute), unless a maintenance window or
+    /// Naps until `deadline` (the next minute), unless a maintenance window or
     /// an SSH session holds the device awake: then Wi-Fi stays up, the
     /// sessions are looked at every [`HOLD_CHECK`], and the minute's wake
     /// comes without a suspend. `nap` is the nap under way; a hold's timer
     /// stops once another nap, or the end of the doze, has replaced it.
-    fn nap_or_hold(&self, now: DateTime<Utc>, until: DateTime<Utc>, nap: u64) {
+    fn nap_or_hold(&self, now: DateTime<Utc>, deadline: Instant, nap: u64) {
         self.apply_clock_steps();
         let sessions = self.host.ssh_sessions();
         let (hold, was) = {
@@ -1804,9 +1842,9 @@ impl Ctx {
                 }
             );
         }
-        let left = (until - now).to_std().unwrap_or_default();
+        let left = deadline.saturating_duration_since(Instant::now());
         let Some(hold) = hold else {
-            return self.nap(now, until, left);
+            return self.nap(now, deadline, left, nap);
         };
         lock(&self.ledger).holding(now, hold);
         let Execution::Background = self.execution else {
@@ -1822,45 +1860,64 @@ impl Ctx {
             match (current, last) {
                 (false, _) => {}
                 (true, true) => ctx.device(DeviceEvent::Resumed),
-                (true, false) => ctx.nap_or_hold((ctx.now)(), until, nap),
+                (true, false) => ctx.nap_or_hold((ctx.now)(), deadline, nap),
             }
         });
     }
 
-    /// Suspends until `until`, `left` from now, Wi-Fi parked; a nap too
+    /// Suspends until `deadline`, `left` from now, Wi-Fi parked; a nap too
     /// short to be worth it waits awake instead. A nap the host refused (its
     /// alarm couldn't be armed and read back) waits awake for the minute too,
     /// rather than redrawing at once and trying again in a loop.
-    fn nap(&self, now: DateTime<Utc>, until: DateTime<Utc>, left: Duration) {
+    fn nap(&self, now: DateTime<Utc>, deadline: Instant, left: Duration, nap: u64) {
         lock(&self.ledger).napping(now, Instant::now());
         if left < MIN_NAP {
-            return self.after(left, DeviceEvent::Resumed);
+            return self.after_nap(left, nap);
         }
+        let ticket = self.suspends.ticket();
         lock(&self.ledger).wifi_off(now);
         self.state.borrow_mut().wifi_parked = true;
         let ledger = self.ledger.clone();
-        let clock = self.now;
         // Previews and tests have no time to wait in.
         let wait = matches!(self.execution, Execution::Background);
-        self.device_later(move |host| {
+        self.device_later_if(move |host| {
             // Down until a fetch is due: nothing joins after the resume.
             host.park_wifi();
-            match host.nap(until) {
+            match host.nap(deadline, &ticket) {
                 Ok(()) => {
                     // Before the wake reads the clock: the resume lost time.
                     if let Some(correction) = host.catch_up_clock() {
                         lock(&ledger).clock_corrected(correction);
                     }
-                    DeviceEvent::Resumed
+                    // Left meanwhile (a press): the app is up, the nap stale.
+                    ticket.valid().then_some(DeviceEvent::Resumed)
                 }
                 Err(error) => {
                     crate::log!("kindil: nap: {error:#}; awake until the minute");
                     if wait {
-                        let left = (until - clock()).to_std().unwrap_or_default();
+                        let left = deadline.saturating_duration_since(Instant::now());
                         std::thread::sleep(left.min(Duration::from_secs(60)));
                     }
-                    DeviceEvent::SuspendFailed
+                    ticket.valid().then_some(DeviceEvent::SuspendFailed)
                 }
+            }
+        });
+    }
+
+    /// The minute's wake of a nap too short to suspend, `left` from now:
+    /// only for that nap, still under way (a press since left it).
+    fn after_nap(&self, left: Duration, nap: u64) {
+        let Execution::Background = self.execution else {
+            return self.after(left, DeviceEvent::Resumed);
+        };
+        let ctx = self.clone();
+        slint::Timer::single_shot(left, move || {
+            let current = {
+                let state = ctx.state.borrow();
+                state.naps == nap && matches!(state.system, Mode::Dozing(Doze::Napping { .. }))
+            };
+            if current {
+                ctx.device(DeviceEvent::Resumed);
             }
         });
     }
@@ -2512,6 +2569,34 @@ fn miqat_worker(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+
+    /// verify/SleepRaces.cfg's counterexample: a press handled while the
+    /// nap's (or sleep's) thread parks Wi-Fi leaves it, and voids its
+    /// ticket; so does a computer taking the storage. Nothing else does.
+    #[test]
+    fn a_press_or_a_computer_leaving_a_nap_or_sleep_voids_its_suspend() {
+        use crate::system::{Drive, Event, Sleep, Why};
+        let now = Instant::now();
+        let napping = Mode::Dozing(Doze::Napping { light: None });
+        let asleep = Mode::Asleep(Sleep::Suspended {
+            light: None,
+            why: Why::Asked,
+        });
+        for (mode, event) in [
+            (napping, Event::PowerButton),
+            (napping, Event::Drive(Drive::Computer)),
+            (asleep, Event::PowerButton),
+            (asleep, Event::Drive(Drive::Computer)),
+        ] {
+            let next = mode.step(event, now).unwrap().next;
+            assert!(leaves_suspend(mode, next), "{mode:?} {event:?}");
+        }
+        // Still asleep after a refusal; not yet napping while settling.
+        let refused = asleep.step(Event::SuspendFailed, now).unwrap().next;
+        assert!(!leaves_suspend(asleep, refused));
+        let settling = Mode::Dozing(Doze::Settling { light: None });
+        assert!(!leaves_suspend(settling, napping));
+    }
 
     #[test]
     fn a_wake_is_ended_once_and_only_while_current() {

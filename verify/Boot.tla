@@ -25,6 +25,7 @@ VARIABLES
     ovOn,        \* the OVERLAYS switch
     ovTries,     \* /var/local/kindil/overlay-tries
     step,        \* where this boot is: "overlays", "guard", "settle", "prove", "up"
+    decided,     \* `count`'s `Start` for this boot: "nothing", "over", "try"
     bound,       \* this boot applied overlays
     ui,          \* Amazon's UI comes up in this boot
     started,     \* this boot started kindil
@@ -34,28 +35,33 @@ VARIABLES
     dark,        \* ... with neither Amazon's UI nor kindil staying up
     unproven     \* ... that applied overlays and didn't prove them
 
-vars == <<flag, skip, tries, ovOn, ovTries, step, bound, ui, started, kup, failing, dark, unproven>>
+vars == <<flag, skip, tries, ovOn, ovTries, step, decided, bound, ui, started, kup, failing, dark, unproven>>
 
 Init ==
     /\ flag \in {"off", "after", "standalone"}
     /\ skip \in (IF flag = "standalone" THEN BOOLEAN ELSE {FALSE})
     /\ tries = 0 /\ ovTries = 0
     /\ ovOn \in BOOLEAN
-    /\ step = "overlays" /\ bound = FALSE /\ started = FALSE /\ kup = FALSE
+    /\ step = "overlays" /\ decided = "nothing" /\ bound = FALSE /\ started = FALSE /\ kup = FALSE
     \* Amazon's framework job skips its UI while the flag file exists.
     /\ ui = ~skip
     /\ failing = 0 /\ dark = 0 /\ unproven = 0
 
 Min(a, b) == IF a < b THEN a ELSE b
 
-(* `overlay::apply`: counted before binding; skipped from the limit on. *)
+(* `count`, then `overlay::apply`: the boot is counted among kindil's tries *)
+(* first (a boot the overlays hang is one kindil didn't stay up in); the     *)
+(* overlays are counted before binding, and skipped from their limit on.   *)
 Overlays ==
     /\ step = "overlays"
+    /\ IF flag = "off" THEN decided' = "nothing" /\ tries' = tries
+       ELSE IF tries >= LIMIT THEN decided' = "over" /\ tries' = tries
+       ELSE decided' = "try" /\ tries' = tries + 1
     /\ IF ovOn /\ ovTries < OVERLAY_LIMIT
        THEN bound' = TRUE /\ ovTries' = ovTries + 1
        ELSE UNCHANGED <<bound, ovTries>>
     /\ step' = "guard"
-    /\ UNCHANGED <<flag, skip, tries, ovOn, ui, started, kup, failing, dark, unproven>>
+    /\ UNCHANGED <<flag, skip, ovOn, ui, started, kup, failing, dark, unproven>>
 
 (* `amazon_ui`: with the skip flag set, it goes and Amazon's UI starts. *)
 AmazonUi == IF skip THEN skip' = FALSE /\ ui' = TRUE ELSE UNCHANGED <<skip, ui>>
@@ -64,18 +70,15 @@ AmazonUi == IF skip THEN skip' = FALSE /\ ui' = TRUE ELSE UNCHANGED <<skip, ui>>
 (* failed: the same as `amazon_ui`.                                        *)
 Guard ==
     /\ step = "guard"
-    /\ \/ flag = "off" /\ step' = "prove" /\ UNCHANGED <<skip, tries, ui, started>>
-       \/ flag # "off" /\ tries >= LIMIT /\ AmazonUi /\ step' = "prove"
-          /\ UNCHANGED <<tries, started>>
-       \/ flag # "off" /\ tries < LIMIT
-          /\ tries' = tries + 1 /\ started' = TRUE /\ step' = "settle"
-          /\ UNCHANGED <<skip, ui>>
-    /\ UNCHANGED <<flag, ovOn, ovTries, bound, kup, failing, dark, unproven>>
+    /\ \/ decided = "nothing" /\ step' = "prove" /\ UNCHANGED <<skip, ui, started>>
+       \/ decided = "over" /\ AmazonUi /\ step' = "prove" /\ UNCHANGED started
+       \/ decided = "try" /\ started' = TRUE /\ step' = "settle" /\ UNCHANGED <<skip, ui>>
+    /\ UNCHANGED <<decided, tries, flag, ovOn, ovTries, bound, kup, failing, dark, unproven>>
 
 LauncherFails ==
     /\ step = "guard" /\ flag # "off"
     /\ AmazonUi /\ step' = "prove"
-    /\ UNCHANGED <<flag, tries, ovOn, ovTries, bound, started, kup, failing, dark, unproven>>
+    /\ UNCHANGED <<decided, flag, tries, ovOn, ovTries, bound, started, kup, failing, dark, unproven>>
 
 (* SETTLE later: kindil's session is up (the boot-tries go, a standalone  *)
 (* flag skips Amazon's UI from the next boot) or not (Amazon's UI).        *)
@@ -86,7 +89,7 @@ Settle ==
        \/ AmazonUi /\ UNCHANGED <<tries, kup>>
           /\ failing' = failing + 1
     /\ step' = "prove"
-    /\ UNCHANGED <<flag, ovOn, ovTries, bound, started, dark, unproven>>
+    /\ UNCHANGED <<decided, flag, ovOn, ovTries, bound, started, dark, unproven>>
 
 (* `overlay::prove`: upstart still knows their jobs (the count goes) or   *)
 (* not (undone; the count stays).                                          *)
@@ -97,7 +100,7 @@ Prove ==
             \/ UNCHANGED ovTries /\ unproven' = unproven + 1
        ELSE UNCHANGED <<ovTries, unproven>>
     /\ step' = "up"
-    /\ UNCHANGED <<flag, skip, tries, ovOn, bound, ui, started, kup, failing, dark>>
+    /\ UNCHANGED <<decided, flag, skip, tries, ovOn, bound, ui, started, kup, failing, dark>>
 
 (* The next boot: after this one finished, or hung, or rebooted at any    *)
 (* step once kindil's job ran (a boot that hangs before it isn't kindil's  *)
@@ -107,7 +110,7 @@ Reboot ==
     /\ step # "overlays"
     \* Between the overlays and the guard, only an overlay can hang it.
     /\ step = "guard" => bound
-    /\ step' = "overlays" /\ bound' = FALSE /\ started' = FALSE /\ kup' = FALSE
+    /\ step' = "overlays" /\ decided' = "nothing" /\ bound' = FALSE /\ started' = FALSE /\ kup' = FALSE
     /\ ui' = ~skip
     /\ failing' = IF step = "settle" THEN failing + 1 ELSE failing
     /\ dark' = IF ui \/ kup THEN 0 ELSE dark + 1
@@ -124,7 +127,7 @@ User ==
             /\ failing' = 0 /\ dark' = 0
             /\ UNCHANGED ovOn
        \/ ovOn' = ~ovOn /\ UNCHANGED <<flag, tries, skip, failing, dark>>
-    /\ UNCHANGED <<ovTries, step, bound, ui, started, kup, unproven>>
+    /\ UNCHANGED <<decided, ovTries, step, bound, ui, started, kup, unproven>>
 
 Next == Overlays \/ Guard \/ LauncherFails \/ Settle \/ Prove \/ Reboot \/ User
 
@@ -137,6 +140,7 @@ Small == failing <= LIMIT + 2 /\ dark <= LIMIT + 2 /\ unproven <= OVERLAY_LIMIT 
 TypeOK ==
     /\ flag \in {"off", "after", "standalone"}
     /\ tries \in 0..LIMIT
+    /\ decided \in {"nothing", "over", "try"}
     /\ ovTries \in 0..OVERLAY_LIMIT
     /\ skip => flag = "standalone"
 

@@ -110,15 +110,15 @@ Stage ==
     /\ UNCHANGED <<phase, up, usb, installed, previous, trial, trying, copy, runs, slot,
                    crashes, commit, failed, before, wrongNext>>
 
-(* kindil, on trial for SETTLE, commits (`Slots::commit`): kindil →        *)
-(* kindil.previous, kindil.trying → kindil, the marker removed; each a     *)
-(* step of its own.                                                        *)
+(* kindil, on trial for SETTLE, commits (`Slots::commit`, `steps::keep`): *)
+(* kindil copied to kindil.previous, kindil.trying renamed over kindil,     *)
+(* the marker removed; each a step of its own.                             *)
 Commit ==
     /\ phase = "running" /\ trying
     /\ \/ /\ commit = 0 /\ trial # None /\ commit' = 1
+          \* Copied, not moved: `kindil` stays until the trial replaces it.
           /\ previous' = IF installed # None THEN installed ELSE previous
-          /\ installed' = None
-          /\ UNCHANGED <<trial, trying>>
+          /\ UNCHANGED <<installed, trial, trying>>
        \/ /\ commit = 1 /\ commit' = 2
           /\ installed' = trial /\ trial' = None
           /\ UNCHANGED <<previous, trying>>

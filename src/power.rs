@@ -43,12 +43,20 @@ pub fn critical(battery: Battery) -> bool {
     )
 }
 
-/// Whether a suspend ended by its alarm (due at `due`, in seconds since the
-/// epoch) rather than the power button, judged by the time: the PW1's RTC
-/// doesn't read its alarm back.
+/// Whether a suspend could have ended by its alarm (due at `due`, in
+/// seconds since the epoch), judged by the time: the PW1's RTC doesn't read
+/// its alarm back. Only a suspend with its alarm armed, and no press of the
+/// power button within [`BUTTON_GRACE`], counts as the alarm's
+/// ([`sleep`]): a press in the alarm's last seconds, or after the time of
+/// an alarm that couldn't be armed, is the button's.
 pub fn alarm_woke(due: i64, now: i64) -> bool {
     now >= due - 2
 }
+
+/// How long after a wake the power button's listener may take to count the
+/// press that woke it (the kernel reports it as the device resumes): a wake
+/// at its alarm's time waits this long before taking it for the alarm.
+pub const BUTTON_GRACE: Duration = Duration::from_secs(2);
 
 /// How long after a wake the charger may take to say it is connected.
 /// Plugging a charger in wakes the PW1 at once, but the charger driver
@@ -68,14 +76,18 @@ pub trait Sleeper {
     fn plugged(&self) -> bool;
     /// How many times the power button was pressed since kindil started.
     fn presses(&self) -> u64;
-    /// Suspends until `wake` (src/suspend.rs); returns once awake.
-    fn suspend(&self, wake: crate::suspend::Wake) -> anyhow::Result<()>;
+    /// Suspends until `wake` (src/suspend.rs); returns once awake, with
+    /// whether a wake alarm was armed for it.
+    fn suspend(&self, wake: crate::suspend::Wake) -> anyhow::Result<bool>;
     /// Seconds since the epoch.
     fn now(&self) -> i64;
     fn battery(&self) -> anyhow::Result<Battery>;
     fn wait(&self, time: Duration);
     /// A line for the flight recorder.
     fn note(&self, line: &str);
+    /// Whether the app has woken meanwhile (its ticket is void,
+    /// src/suspend.rs): the sleep is over, whatever woke it.
+    fn cancelled(&self) -> bool;
 }
 
 /// How a [`sleep`] ended.
@@ -110,13 +122,14 @@ pub fn sleep(device: &impl Sleeper, why: crate::system::Why) -> anyhow::Result<S
     use crate::system::Why;
     loop {
         let plugged = device.plugged();
-        // A nap's alarm must not wake a sleep the user asked for; on
-        // battery, a check of its own every few hours does. Only a sleep
-        // the user asked for may go without it: the battery's must check.
+        // A nap's alarm must not wake a sleep the user asked for; a check of
+        // its own every few hours does, on a charger too: one unplugged
+        // while the Kindle is suspended may not wake it, and on battery
+        // only the check powers it off at 1%. Only a sleep the user asked
+        // for may go without it: the battery's must check.
         let wake = match (plugged, Asked::of(why)) {
-            (false, Some(asked)) => Wake::AlarmOrButton(CHECK_ASLEEP, asked),
+            (_, Some(asked)) => Wake::AlarmOrButton(CHECK_ASLEEP, asked),
             (false, None) => Wake::Alarm(CHECK_ASLEEP),
-            (true, Some(asked)) => Wake::Button(asked),
             (true, None) => {
                 device.note("sleep: a charger is connected; no sleep for the battery");
                 return Ok(Slept::Charging);
@@ -126,21 +139,43 @@ pub fn sleep(device: &impl Sleeper, why: crate::system::Why) -> anyhow::Result<S
             .alarm()
             .map(|after| device.now() + after.as_secs() as i64);
         let presses = device.presses();
-        if let Err(error) = device.suspend(wake) {
-            if why == Why::BatteryEmpty {
+        let armed = match device.suspend(wake) {
+            // A press handled while Wi-Fi parked (or since): the app is up.
+            Ok(_) if device.cancelled() => {
+                device.note("sleep: the app woke meanwhile");
+                return Ok(Slept::Woken);
+            }
+            Ok(armed) => armed,
+            Err(error) if why == Why::BatteryEmpty => {
                 // Without its check alarm, nothing would power the Kindle off
                 // at 1% and the cell would drain flat: off now, as powerd
-                // would at a critical battery.
+                // would at a critical battery; unless a charger is on its way.
+                if charger_comes(device) {
+                    device.note("sleep: can't sleep, but a charger is connected");
+                    return Ok(Slept::Charging);
+                }
                 device.note(&format!(
                     "sleep: can't sleep with the battery check ({error:#}); powering off"
                 ));
                 return Ok(Slept::Critical);
             }
-            return Err(error);
-        }
-        if due.is_some_and(|due| alarm_woke(due, device.now())) {
+            Err(error) => return Err(error),
+        };
+        // The alarm's only if one was armed, it is its time, and the power
+        // button wasn't pressed: the time alone took a press in the alarm's
+        // last seconds, or after an alarm that couldn't be armed, for it.
+        if armed
+            && due.is_some_and(|due| alarm_woke(due, device.now()))
+            && !pressed_within(device, presses, BUTTON_GRACE)
+        {
             let battery = device.battery()?;
             if critical(battery) {
+                // A charger plugged in as the alarm fired isn't connected
+                // yet: the gauge read "discharging".
+                if charger_comes(device) {
+                    device.note("sleep: battery critical, but a charger is connected");
+                    continue;
+                }
                 device.note(&format!("sleep: battery critical ({battery:?})"));
                 return Ok(Slept::Critical);
             }
@@ -161,6 +196,36 @@ pub fn sleep(device: &impl Sleeper, why: crate::system::Why) -> anyhow::Result<S
             },
         }
     }
+}
+
+/// Whether the power button is pressed since `presses` was read, within
+/// `time`.
+fn pressed_within(device: &impl Sleeper, presses: u64, time: Duration) -> bool {
+    let polls = time.as_millis() / CHARGER_POLL.as_millis();
+    for poll in 0..=polls {
+        if device.presses() != presses {
+            return true;
+        }
+        if poll < polls {
+            device.wait(CHARGER_POLL);
+        }
+    }
+    false
+}
+
+/// Whether a charger is connected within [`CHARGER_DETECT`]: asked before
+/// powering off, which a charger plugged in moments ago makes needless.
+fn charger_comes(device: &impl Sleeper) -> bool {
+    let polls = CHARGER_DETECT.as_millis() / CHARGER_POLL.as_millis();
+    for poll in 0..=polls {
+        if device.plugged() {
+            return true;
+        }
+        if poll < polls {
+            device.wait(CHARGER_POLL);
+        }
+    }
+    false
 }
 
 /// Watches for [`CHARGER_DETECT`] after a wake: the power button, pressed
@@ -215,8 +280,14 @@ mod tests {
         clock: std::cell::Cell<u64>,
         wakes: std::cell::RefCell<std::collections::VecDeque<u64>>,
         connected: Option<u64>,
+        /// The charger goes from then on.
+        unplugged: Option<u64>,
         presses: Vec<u64>,
         percent: u8,
+        /// Whether its RTC arms the alarms asked for.
+        arms: bool,
+        /// The app wakes (voids the sleep's ticket) from then on.
+        cancelled_at: Option<u64>,
         alarms: std::cell::RefCell<Vec<Option<Duration>>>,
         wakes_asked: std::cell::RefCell<Vec<crate::suspend::Wake>>,
         notes: std::cell::RefCell<Vec<String>>,
@@ -228,8 +299,11 @@ mod tests {
                 clock: std::cell::Cell::new(0),
                 wakes: std::cell::RefCell::new(wakes.iter().copied().collect()),
                 connected,
+                unplugged: None,
                 presses: presses.to_vec(),
                 percent: 4,
+                arms: true,
+                cancelled_at: None,
                 alarms: std::cell::RefCell::default(),
                 wakes_asked: std::cell::RefCell::default(),
                 notes: std::cell::RefCell::default(),
@@ -244,6 +318,7 @@ mod tests {
     impl Sleeper for Device {
         fn plugged(&self) -> bool {
             self.connected.is_some_and(|at| self.clock.get() >= at)
+                && self.unplugged.is_none_or(|at| self.clock.get() < at)
         }
         fn presses(&self) -> u64 {
             self.presses
@@ -251,16 +326,22 @@ mod tests {
                 .filter(|&&at| at <= self.clock.get())
                 .count() as u64
         }
-        fn suspend(&self, wake: crate::suspend::Wake) -> anyhow::Result<()> {
+        fn suspend(&self, wake: crate::suspend::Wake) -> anyhow::Result<bool> {
             self.alarms.borrow_mut().push(wake.alarm());
             self.wakes_asked.borrow_mut().push(wake);
+            let armed = match wake {
+                crate::suspend::Wake::Alarm(_) if !self.arms => {
+                    anyhow::bail!("the alarm doesn't arm")
+                }
+                _ => self.arms && wake.alarm().is_some(),
+            };
             let wake = self
                 .wakes
                 .borrow_mut()
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("asleep with nothing left to wake it"))?;
             self.clock.set(wake);
-            Ok(())
+            Ok(armed)
         }
         fn now(&self) -> i64 {
             1_794_000_000 + (self.clock.get() / 1000) as i64
@@ -280,6 +361,9 @@ mod tests {
         }
         fn note(&self, line: &str) {
             self.notes.borrow_mut().push(line.to_owned());
+        }
+        fn cancelled(&self) -> bool {
+            self.cancelled_at.is_some_and(|at| self.clock.get() >= at)
         }
     }
 
@@ -337,6 +421,27 @@ mod tests {
         assert_eq!(sleep(&device, Why::BatteryEmpty).unwrap(), Slept::Critical);
     }
 
+    /// verify/SleepPowerOff.cfg's counterexample: at 1%, the check alarm
+    /// fires and a charger is plugged in as it does, before its driver
+    /// says it is connected. 0.15.0 powered off on the charger.
+    #[test]
+    fn a_charger_plugged_in_as_the_check_finds_one_percent_keeps_it_on() {
+        let six_hours = CHECK_ASLEEP.as_millis() as u64;
+        let mut device = Device::new(&[six_hours], Some(six_hours + 2_500), &[]);
+        device.percent = 1;
+        assert_eq!(sleep(&device, Why::BatteryEmpty).unwrap(), Slept::Charging);
+        assert_eq!(
+            *device.notes.borrow(),
+            [
+                "sleep: battery critical, but a charger is connected",
+                "sleep: a charger is connected; no sleep for the battery"
+            ]
+        );
+        // And when its suspend fails, the same charger keeps it on.
+        let device = Device::new(&[], Some(2_500), &[]);
+        assert_eq!(sleep(&device, Why::BatteryEmpty).unwrap(), Slept::Charging);
+    }
+
     #[test]
     fn a_battery_sleep_that_cant_arm_its_check_powers_off_but_an_asked_one_reports_it() {
         // No wake scripted: the fake's suspend fails, as an alarm that won't
@@ -353,10 +458,10 @@ mod tests {
         let device = Device::new(&[45_000], None, &[]);
         assert_eq!(sleep(&device, Why::Asked).unwrap(), Slept::Woken);
         assert_eq!(device.suspends(), 1);
-        // Plugged in, it sleeps until the button, with no check.
+        // Plugged in, it keeps its check (see below).
         let device = Device::new(&[45_000], Some(0), &[]);
         assert_eq!(sleep(&device, Why::Asked).unwrap(), Slept::Woken);
-        assert_eq!(*device.alarms.borrow(), [None]);
+        assert_eq!(*device.alarms.borrow(), [Some(CHECK_ASLEEP)]);
     }
 
     /// The battery's sleep never goes without its check's alarm: no alarm,
@@ -376,6 +481,67 @@ mod tests {
             [Wake::AlarmOrButton(CHECK_ASLEEP, asked)]
         );
         assert_eq!(Asked::of(Why::BatteryEmpty), None);
+    }
+
+    /// verify/SleepRaces.cfg's counterexample, for the sleep: the battery's
+    /// sleep woken by its check, then a press handled by the app before the
+    /// sleep suspends again (its ticket void): no second suspend.
+    #[test]
+    fn a_sleep_the_app_has_left_doesnt_suspend_again() {
+        let six_hours = CHECK_ASLEEP.as_millis() as u64;
+        let mut device = Device::new(&[six_hours], None, &[]);
+        device.cancelled_at = Some(six_hours);
+        assert_eq!(sleep(&device, Why::BatteryEmpty).unwrap(), Slept::Woken);
+        assert_eq!(device.suspends(), 1);
+        assert_eq!(*device.notes.borrow(), ["sleep: the app woke meanwhile"]);
+    }
+
+    /// verify/SleepCableQuiet.cfg's counterexample, if unplugging doesn't
+    /// wake a suspended PW1 (not measured yet): a sleep the user asked for
+    /// on a charger, unplugged while suspended. 0.15.0 slept with no alarm
+    /// then, and the 1% power-off never came.
+    #[test]
+    fn a_sleep_on_a_charger_keeps_its_check_for_when_it_is_unplugged() {
+        let six_hours = CHECK_ASLEEP.as_millis() as u64;
+        let mut device = Device::new(&[six_hours], Some(0), &[]);
+        device.unplugged = Some(60_000);
+        device.percent = 1;
+        assert_eq!(sleep(&device, Why::Asked).unwrap(), Slept::Critical);
+        assert_eq!(device.suspends(), 1);
+    }
+
+    /// verify/SleepNearAlarm.cfg's counterexample: the power button pressed
+    /// a second before the 6-hourly check was due. 0.15.0 took it for the
+    /// alarm by the time, and slept again.
+    #[test]
+    fn a_press_just_before_the_check_alarm_wakes_the_app() {
+        let six_hours = CHECK_ASLEEP.as_millis() as u64;
+        let device = Device::new(&[six_hours - 1_000], None, &[six_hours - 1_000]);
+        assert_eq!(sleep(&device, Why::Asked).unwrap(), Slept::Woken);
+        assert_eq!(device.suspends(), 1);
+        // Counted by the listener a moment after the resume: still the button.
+        let device = Device::new(&[six_hours], None, &[six_hours + 800]);
+        assert_eq!(sleep(&device, Why::Asked).unwrap(), Slept::Woken);
+        assert_eq!(device.suspends(), 1);
+        // The alarm itself still checks the battery and sleeps on.
+        let device = Device::new(
+            &[six_hours, six_hours + 60_000],
+            None,
+            &[six_hours + 60_000],
+        );
+        assert_eq!(sleep(&device, Why::Asked).unwrap(), Slept::Woken);
+        assert_eq!(device.suspends(), 2);
+    }
+
+    /// verify/SleepAlarmFails.cfg's counterexample: a sleep the user asked
+    /// for whose check alarm couldn't be armed sleeps until the button; a
+    /// press after the alarm's time was taken for it.
+    #[test]
+    fn without_its_alarm_armed_a_press_after_its_time_wakes_the_app() {
+        let mut device = Device::new(&[7 * 3_600_000], None, &[7 * 3_600_000]);
+        device.arms = false;
+        assert_eq!(sleep(&device, Why::Asked).unwrap(), Slept::Woken);
+        assert_eq!(device.suspends(), 1);
     }
 
     #[test]

@@ -224,12 +224,22 @@ pub trait Host: Send + Sync {
     fn note(&self, _line: &str) {}
     /// Suspends to RAM for this reason; returns once the app should wake
     /// (see [`crate::power::sleep`]). For an empty battery it returns at
-    /// once, without suspending, if a charger is in.
-    fn suspend(&self, why: crate::system::Why) -> anyhow::Result<()>;
-    /// Suspends to RAM with a timed wake at `until` (on the wall clock, taken
-    /// right before arming); returns once awake, by the timer or the power
-    /// button. An error means it didn't suspend.
-    fn nap(&self, until: chrono::DateTime<chrono::Utc>) -> anyhow::Result<()>;
+    /// once, without suspending, if a charger is in; and at once, without
+    /// suspending, if the app voided `ticket` meanwhile (src/suspend.rs).
+    fn suspend(
+        &self,
+        why: crate::system::Why,
+        ticket: &crate::suspend::Ticket,
+    ) -> anyhow::Result<()>;
+    /// Suspends to RAM with a timed wake at `deadline` (on the monotonic
+    /// clock, measured right before arming: no wall-clock step moves it);
+    /// returns once awake, by the timer or the power button. An error means
+    /// it didn't suspend; nor does it once the app voided `ticket`.
+    fn nap(
+        &self,
+        deadline: std::time::Instant,
+        ticket: &crate::suspend::Ticket,
+    ) -> anyhow::Result<()>;
     /// Back from a suspend or a nap: catches the clock up with the RTC if
     /// the resume lost a second or more (src/clock.rs). Quick.
     fn catch_up_clock(&self) -> Option<crate::clock::Correction> {
@@ -593,7 +603,14 @@ impl Host for Simulated {
     /// Wakes at once, as if the power button were pressed right away, or
     /// by a charger plugged in while asleep ([`Simulated::plug_in_asleep`]).
     /// Like the device, it doesn't sleep for an empty battery while charging.
-    fn suspend(&self, why: crate::system::Why) -> anyhow::Result<()> {
+    fn suspend(
+        &self,
+        why: crate::system::Why,
+        ticket: &crate::suspend::Ticket,
+    ) -> anyhow::Result<()> {
+        if !ticket.valid() {
+            return Ok(());
+        }
         self.with(|s| {
             let charging = matches!(
                 s.battery,
@@ -619,7 +636,10 @@ impl Host for Simulated {
         Ok(())
     }
     /// Wakes at once, as if the minute were up.
-    fn nap(&self, _: chrono::DateTime<chrono::Utc>) -> anyhow::Result<()> {
+    fn nap(&self, _: std::time::Instant, ticket: &crate::suspend::Ticket) -> anyhow::Result<()> {
+        if !ticket.valid() {
+            return Ok(());
+        }
         if self.with(|s| {
             s.refused_naps += u32::from(s.refuse_naps);
             s.refuse_naps

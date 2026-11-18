@@ -398,9 +398,14 @@ impl Host for KindleHost {
         self.released.notify();
     }
 
-    fn suspend(&self, why: crate::system::Why) -> anyhow::Result<()> {
+    fn suspend(
+        &self,
+        why: crate::system::Why,
+        ticket: &crate::suspend::Ticket,
+    ) -> anyhow::Result<()> {
         let device = Sleeping {
             recorder: crate::flight::Recorder::device(),
+            ticket,
         };
         match crate::power::sleep(&device, why)? {
             crate::power::Slept::Woken | crate::power::Slept::Charging => Ok(()),
@@ -415,16 +420,21 @@ impl Host for KindleHost {
         crate::flight::Recorder::device().note(line);
     }
 
-    fn nap(&self, until: chrono::DateTime<chrono::Utc>) -> anyhow::Result<()> {
+    fn nap(
+        &self,
+        deadline: std::time::Instant,
+        ticket: &crate::suspend::Ticket,
+    ) -> anyhow::Result<()> {
         let recorder = crate::flight::Recorder::device();
         // Measured now, after parking Wi-Fi and right before arming: the
-        // time it took doesn't make the nap overshoot its minute.
-        let left = (until - chrono::Utc::now()).to_std().unwrap_or_default();
+        // time it took doesn't make the nap overshoot its minute. On the
+        // monotonic clock: the wall clock may have been stepped meanwhile.
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left < Duration::from_secs(1) {
             recorder.note(&format!("nap: {left:?} left; not suspending"));
             return Ok(());
         }
-        sleep_once(&recorder, "nap", crate::suspend::Wake::Alarm(left))
+        sleep_once(&recorder, "nap", crate::suspend::Wake::Alarm(left), ticket).map(drop)
     }
 
     /// [`sleep_once`] caught up already, before anything read the clock.
@@ -484,11 +494,12 @@ impl Host for KindleHost {
 static PRESSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The device under a sleep (src/power.rs).
-struct Sleeping {
+struct Sleeping<'a> {
     recorder: crate::flight::Recorder,
+    ticket: &'a crate::suspend::Ticket,
 }
 
-impl crate::power::Sleeper for Sleeping {
+impl crate::power::Sleeper for Sleeping<'_> {
     fn plugged(&self) -> bool {
         plugged().unwrap_or(false)
     }
@@ -498,8 +509,11 @@ impl crate::power::Sleeper for Sleeping {
     /// The user asked for the sleep, or the battery did: a sleep the user
     /// asked for still sleeps without its check's alarm, until the button,
     /// rather than stay up; the battery's doesn't (src/power.rs).
-    fn suspend(&self, wake: crate::suspend::Wake) -> anyhow::Result<()> {
-        sleep_once(&self.recorder, "sleep", wake)
+    fn suspend(&self, wake: crate::suspend::Wake) -> anyhow::Result<bool> {
+        sleep_once(&self.recorder, "sleep", wake, self.ticket)
+    }
+    fn cancelled(&self) -> bool {
+        !self.ticket.valid()
     }
     fn now(&self) -> i64 {
         epoch_seconds()
@@ -541,16 +555,19 @@ impl crate::suspend::Kernel for Kernel<'_> {
 /// Every suspend goes through here (src/suspend.rs): the wake alarm armed
 /// and read back as the very last thing before it, or, for a sleep the user
 /// asked for, moved out of the way; no suspend at all if an alarm it needs
-/// fails. The clock's correction is kept for the doze's ledger.
+/// fails. The clock's correction is kept for the doze's ledger. Whether a
+/// wake alarm was armed for it.
 fn sleep_once(
     recorder: &crate::flight::Recorder,
     what: &'static str,
     wake: crate::suspend::Wake,
-) -> anyhow::Result<()> {
+    ticket: &crate::suspend::Ticket,
+) -> anyhow::Result<bool> {
     let rtc = crate::wakealarm::WakeRtc::find();
     let env = crate::suspend::Env {
         rtc: rtc.as_ref().map(|rtc| rtc as &dyn crate::suspend::Rtc),
         kernel: &Kernel { recorder },
+        ticket,
     };
     let back = crate::suspend::once(&env, what, wake)?;
     if let Some(correction) = back.correction {
@@ -558,7 +575,7 @@ fn sleep_once(
     }
     match back.refused {
         Some(error) => Err(error.into()),
-        None => Ok(()),
+        None => Ok(back.armed),
     }
 }
 

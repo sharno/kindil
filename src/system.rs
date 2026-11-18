@@ -439,6 +439,15 @@ pub fn next_redraw(now: DateTime<Utc>) -> DateTime<Utc> {
     now.duration_trunc(TimeDelta::minutes(1)).unwrap_or(now) + TimeDelta::minutes(1)
 }
 
+/// When a nap planned at `now` (the wall clock) to end at `until` ends, as
+/// an instant of the monotonic clock read at `monotonic`: fixed when the nap
+/// is planned, so a step of the wall clock before its alarm is armed (an
+/// online wake's sync, still under way) doesn't move it. The monotonic
+/// clock stops while the device is suspended: only time awake counts down.
+pub fn nap_deadline(now: DateTime<Utc>, until: DateTime<Utc>, monotonic: Instant) -> Instant {
+    monotonic + (until - now).to_std().unwrap_or_default()
+}
+
 /// What a dozing wake redraws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Redraw {
@@ -1156,6 +1165,25 @@ mod tests {
         use chrono::TimeZone;
         Utc.with_ymd_and_hms(2026, 11, 16, hour, minute, second)
             .unwrap()
+    }
+
+    /// verify/SleepNapClock.cfg's counterexample: a nap planned at :30 for
+    /// the next minute, and network time stepping the clock back 600 s
+    /// while its thread parks Wi-Fi. 0.15.0 measured the nap against the
+    /// wall clock then, and napped 631 s.
+    #[test]
+    fn a_clock_step_after_a_nap_is_planned_doesnt_lengthen_it() {
+        let planned = Instant::now();
+        let now = wall(9, 0, 30);
+        let deadline = nap_deadline(now, next_redraw(now), planned);
+        let armed = planned + Duration::from_secs(1);
+        // The wall clock now reads 8:50:31; the nap still ends on 9:01.
+        assert_eq!(deadline.duration_since(armed), Duration::from_secs(29));
+        // A minute already past (a step forward) is no nap at all.
+        assert_eq!(
+            nap_deadline(wall(9, 2, 0), next_redraw(now), planned),
+            planned
+        );
     }
 
     #[test]

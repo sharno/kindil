@@ -100,15 +100,15 @@ events: sleeping, dozing and the battery, the launcher's session and update
 trial, and start at boot. [everystate](https://github.com/mattzcarey/everystate)
 (a TLA+ model checker in Rust, TLC's language and output; in the dev shell)
 checks every reachable state of each, and checks recorded runs of the code
-against the model. `cargo xtask verify` runs it all, in under two minutes,
-and CI runs it after `cargo xtask check`; without everystate it says so and
-skips.
+against the model. `cargo xtask verify` runs it all, in about three
+minutes, and CI runs it after `cargo xtask check`; without everystate it
+says so and skips.
 
 | Model | What it holds | Configurations |
 |---|---|---|
-| `Sleep.tla` | `Mode::step` (src/system.rs) arm for arm, the effects `Ctx::apply` runs (src/ui.rs: timers, workers, a doze wake ended by its frame on the panel or its ceiling), the host's nap and sleep loop with its 6-hourly check (src/kindle.rs, src/power.rs), and the world: the button, the charger and its `connected` file appearing late, the gauge around 5%, the RTC alarm, volumd | `Sleep`: sleep, the battery, the charger; `SleepDoze`: dozing in detail; `SleepUsb`: USB drive mode; `SleepOpen`: the reducer alone, any event at any time; `SleepTrace`: for the UI tests' traces |
-| `Launcher.tla` | The session (launcher/src/session.rs): every way out restores what it stopped; crash limits; the update trial and `Slots::commit` (src/update.rs) | `Launcher` |
-| `Boot.tla` | `launcher boot` (launcher/src/boot.rs, overlay.rs) and bin/boot.sh, boot after boot: the guard's tries and limit, the standalone boot's way back, overlays skipped after an unproven boot | `Boot` |
+| `Sleep.tla` | `Mode::step` (src/system.rs) arm for arm, the effects `Ctx::apply` runs (src/ui.rs: timers, workers, a doze wake ended by its frame on the panel or its ceiling), the host's nap and `power::sleep` with its `Why`, its 6-hourly check and the charger's wait (src/kindle.rs, src/power.rs, src/suspend.rs with the app's suspend `Gate`), and the world: the button, the charger and its `connected` file appearing late, the gauge around 5%, the RTC alarm, volumd | `Sleep`: sleep, the battery, the charger; `SleepDoze`: dozing in detail; `SleepUsb`: USB drive mode; `SleepRaces`: presses racing the nap's and sleep's threads; `SleepNearAlarm`, `SleepAlarmFails`, `SleepPowerOff`, `SleepNapClock`, `SleepCableQuiet`: one finding each; `SleepOpen`: the reducer alone, any event at any time; `SleepTrace`: for the UI tests' traces |
+| `Launcher.tla` | The session (launcher/src/session.rs): every way out restores what it stopped; crash limits; the update trial and `Slots::commit` (src/update.rs) | `Launcher`; `LauncherCommitCut`: a stop between the commit's steps |
+| `Boot.tla` | `launcher boot` (launcher/src/boot.rs, overlay.rs) and bin/boot.sh, boot after boot: the guard's tries and limit, the standalone boot's way back, overlays skipped after an unproven boot | `Boot`; `BootDark`: dark boots in a row |
 
 Actions are named after the code's events and functions, with a comment
 saying which function each stands for. Each property is an `INVARIANT` or a
@@ -117,11 +117,12 @@ the timing the models abstract away is written there as named assumptions
 (the idle timer comes after the short timers; the charger's `connected`
 appears within seconds; Sleep's `Races`).
 
-Some configurations fail on purpose: each reproduces a finding on the code
-as it is (the header of the .cfg says which), and `xtask/src/verify.rs`
-lists it as `Expect::Fails`. Once the code is fixed it holds, `verify` says
-so and fails, and the entry becomes `Expect::Holds`: a fixed bug stays
-checked. A configuration that should hold and doesn't fails the task with
+The configurations named after a finding each reproduced a bug of 0.15.0
+(the header of the .cfg says which, and the commit that fixed it adds the
+counterexample as a Rust test); all hold now, and stay checked. A new
+finding is kept as `Expect::Fails` in `xtask/src/verify.rs` until the code
+is fixed: then it holds, `verify` says so and fails, and the entry becomes
+`Expect::Holds`. A configuration that should hold and doesn't fails the task with
 everystate's counterexample: read it as a story in the code's words (the
 actions are the events, in order) and decide against the code which side is
 wrong.
@@ -131,7 +132,7 @@ To check one by hand, from `verify/`:
 ```sh
 everystate -workers auto -config SleepDoze.cfg Sleep.tla   # safety on every core
 everystate -config Sleep.cfg Sleep.tla                     # with PROPERTIES: one thread
-everystate -json -config SleepCharger.cfg Sleep.tla        # the counterexample as JSON
+everystate -json -config SleepRaces.cfg Sleep.tla          # a counterexample as JSON
 ```
 
 **Traces.** src/trace.rs writes every event `Ctx::device` handles as a JSON
@@ -150,7 +151,10 @@ Kindle, `touch /var/local/kindil/trace` records the next start's events to
 the same way.
 
 A pass covers the models at their bounds, under their assumptions; the
-models were last confirmed against the code at 0.15.0. Change `system.rs`,
+models were last confirmed against the code once the findings of 0.15.0
+were fixed (the press-versus-thread check right before `/sys/power/state`
+is atomic in the model; in the code a press can still land between it and
+the write, and then wakes that suspend). Change `system.rs`,
 the effects in `ui.rs`, `kindle.rs`'s nap or suspend, or the launcher, and
 `verify` says whether the model still describes it.
 

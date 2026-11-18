@@ -11,6 +11,12 @@
 //! which only [`Why::Asked`] gives: a nap, or a sleep for the empty battery,
 //! never suspends without an alarm that would wake it.
 //!
+//! And none suspends once the app has moved on: each nap or sleep carries a
+//! [`Ticket`] from the app's [`Gate`], taken as the app sets it out; a
+//! press (or a computer taking the storage) handled while its thread parks
+//! Wi-Fi voids it, and a void ticket stops the suspend right before
+//! `/sys/power/state` is written.
+//!
 //! ```compile_fail
 //! // No suspend before the alarm is armed:
 //! fn f(env: &kindil::suspend::Env) {
@@ -36,7 +42,43 @@ use crate::clock::Correction;
 use crate::system::Why;
 use crate::wakealarm::Armed as Alarm;
 use statum::{machine, state, transition};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+
+/// The app's word on the naps and sleeps it set out: [`Gate::void`] once it
+/// has left them (a press woke it, a computer took the storage).
+#[derive(Clone, Debug, Default)]
+pub struct Gate(Arc<AtomicU64>);
+
+/// A nap's or sleep's leave to suspend, good until the app voids it.
+#[derive(Clone, Debug)]
+pub struct Ticket {
+    gate: Gate,
+    issued: u64,
+}
+
+impl Gate {
+    /// For the nap or sleep the app sets out now.
+    pub fn ticket(&self) -> Ticket {
+        Ticket {
+            gate: self.clone(),
+            issued: self.0.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Every ticket taken so far is void.
+    pub fn void(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Ticket {
+    /// Whether the app still wants this suspend.
+    pub fn valid(&self) -> bool {
+        self.gate.0.load(Ordering::SeqCst) == self.issued
+    }
+}
 
 /// The RTC with the wake alarm ([`crate::wakealarm::WakeRtc`]).
 pub trait Rtc {
@@ -76,10 +118,12 @@ pub trait Kernel {
     fn catch_up(&self) -> Option<Correction>;
 }
 
-/// What a suspend needs: the RTC, if there is one, and the kernel.
+/// What a suspend needs: the RTC, if there is one, the kernel, and the
+/// app's leave.
 pub struct Env<'a> {
     pub rtc: Result<&'a dyn Rtc, &'a anyhow::Error>,
     pub kernel: &'a dyn Kernel,
+    pub ticket: &'a Ticket,
 }
 
 impl Env<'_> {
@@ -223,7 +267,7 @@ impl Suspend<Armed> {
             env.rtc_name(),
             self.state_data
         ));
-        let back = suspend(env, self.what);
+        let back = suspend(env, self.what, true);
         self.transition_with(back)
     }
 }
@@ -233,7 +277,7 @@ impl Suspend<UntilButton> {
     pub fn suspend(self, env: &Env) -> Suspend<Resumed> {
         env.kernel
             .note(&format!("{}: suspending until the power button", self.what));
-        let back = suspend(env, self.what);
+        let back = suspend(env, self.what, false);
         self.transition_with(back)
     }
 }
@@ -245,10 +289,29 @@ pub struct Back {
     pub refused: Option<std::io::Error>,
     /// The clock's step on the way back, if it needed one.
     pub correction: Option<Correction>,
+    /// Whether a wake alarm was armed for it: only then can it have woken it.
+    pub armed: bool,
+    /// The app voided its ticket first: it never suspended.
+    pub cancelled: bool,
 }
 
 /// The suspend itself, and the way back.
-fn suspend(env: &Env, what: &str) -> Back {
+fn suspend(env: &Env, what: &str, armed: bool) -> Back {
+    // Checked as the very last thing: a press handled while Wi-Fi parked
+    // woke the app, which mustn't be left on screen with the device asleep.
+    // (The press can still come between this and the write: then the
+    // kernel suspends, and that press, its wake source, ends it.)
+    if !env.ticket.valid() {
+        env.disarm(what);
+        env.kernel
+            .note(&format!("{what}: the app woke meanwhile; not suspending"));
+        return Back {
+            refused: None,
+            correction: None,
+            armed: false,
+            cancelled: true,
+        };
+    }
     let since = env.kernel.epoch();
     let slept = env.kernel.mem();
     // The power button may have woken it first: the alarm must not wake a
@@ -270,6 +333,8 @@ fn suspend(env: &Env, what: &str) -> Back {
     Back {
         refused: slept.err(),
         correction,
+        armed,
+        cancelled: false,
     }
 }
 
@@ -362,6 +427,16 @@ mod tests {
         what: &'static str,
         wake: Wake,
     ) -> (FakeRtc, FakeKernel, anyhow::Result<Back>) {
+        run_with(fails, refuses, what, wake, &Gate::default().ticket())
+    }
+
+    fn run_with(
+        fails: bool,
+        refuses: bool,
+        what: &'static str,
+        wake: Wake,
+        ticket: &Ticket,
+    ) -> (FakeRtc, FakeKernel, anyhow::Result<Back>) {
         let rtc = FakeRtc {
             fails,
             log: RefCell::default(),
@@ -374,6 +449,7 @@ mod tests {
             &Env {
                 rtc: Ok(&rtc),
                 kernel: &kernel,
+                ticket,
             },
             what,
             wake,
@@ -384,7 +460,8 @@ mod tests {
     #[test]
     fn a_nap_arms_reads_back_suspends_and_moves_the_alarm_away() {
         let (rtc, kernel, back) = run(false, false, "nap", Wake::Alarm(Duration::from_secs(40)));
-        assert!(back.unwrap().refused.is_none());
+        let back = back.unwrap();
+        assert!(back.refused.is_none() && back.armed);
         assert_eq!(*rtc.log.borrow(), ["arm", "disarm"]);
         assert_eq!(
             *kernel.notes.borrow(),
@@ -424,7 +501,7 @@ mod tests {
             "sleep",
             Wake::AlarmOrButton(Duration::from_secs(40), asked),
         );
-        assert!(back.is_ok());
+        assert!(!back.unwrap().armed, "no alarm: only the button wakes it");
         assert_eq!(*rtc.log.borrow(), ["arm", "disarm", "disarm"]);
         assert_eq!(
             kernel.notes.borrow()[0],
@@ -432,6 +509,37 @@ mod tests {
         );
         let (rtc, kernel, _) = run(false, false, "sleep", Wake::Button(asked));
         assert_eq!(*rtc.log.borrow(), ["disarm", "disarm"], "never armed");
+        assert_eq!(*kernel.suspends.borrow(), 1);
+    }
+
+    /// verify/SleepRaces.cfg's counterexample: the app handled a press while
+    /// the nap's thread parked Wi-Fi; the nap mustn't suspend behind it.
+    #[test]
+    fn a_ticket_voided_while_wifi_parks_stops_the_suspend() {
+        let gate = Gate::default();
+        let ticket = gate.ticket();
+        gate.void();
+        for wake in [
+            Wake::Alarm(Duration::from_secs(40)),
+            Wake::Button(Asked::of(Why::Asked).unwrap()),
+        ] {
+            let (rtc, kernel, back) = run_with(false, false, "nap", wake, &ticket);
+            assert!(back.unwrap().cancelled);
+            assert_eq!(*kernel.suspends.borrow(), 0, "{wake:?}");
+            assert_eq!(rtc.log.borrow().last().map(String::as_str), Some("disarm"));
+            assert_eq!(
+                kernel.notes.borrow().last().map(String::as_str),
+                Some("nap: the app woke meanwhile; not suspending")
+            );
+        }
+        // A ticket taken after the void is good.
+        let (_, kernel, _) = run_with(
+            false,
+            false,
+            "nap",
+            Wake::Alarm(Duration::from_secs(40)),
+            &gate.ticket(),
+        );
         assert_eq!(*kernel.suspends.borrow(), 1);
     }
 
@@ -447,9 +555,11 @@ mod tests {
     fn without_an_rtc_only_the_power_button_wakes() {
         let kernel = FakeKernel::default();
         let missing = anyhow::anyhow!("no RTC with a wake alarm");
+        let ticket = Gate::default().ticket();
         let env = Env {
             rtc: Err(&missing),
             kernel: &kernel,
+            ticket: &ticket,
         };
         assert!(once(&env, "nap", Wake::Alarm(Duration::from_secs(40))).is_err());
         assert_eq!(
