@@ -47,6 +47,13 @@ enum Mode {
         #[arg(long)]
         usb: bool,
     },
+    /// Print the fuel gauge read from the chip beside the driver's cached
+    /// values (src/gauge.rs), once or every SECS seconds of the wall clock,
+    /// so it keeps time through suspends
+    Gauge {
+        #[arg(long, value_name = "SECS")]
+        every: Option<u64>,
+    },
     /// Install the uploaded release bundle, rolling back unless it comes up
     /// (run on the Kindle by `cargo xtask release`)
     Install { id: String },
@@ -208,6 +215,42 @@ fn uevents(usb_only: bool) -> anyhow::Result<()> {
     }
 }
 
+/// For comparing the chip with the driver's cache by hand (src/gauge.rs).
+fn gauge(every: Option<u64>) -> anyhow::Result<()> {
+    use kindil::gauge::{read, Cached, Window, DIR};
+    use std::io::Write;
+    let show = |value: Option<String>| value.unwrap_or_else(|| "?".into());
+    let mut last: Option<i64> = None;
+    loop {
+        let now = chrono::Utc::now();
+        if last.is_none_or(|at| now.timestamp() >= at + every.unwrap_or(0) as i64) {
+            last = Some(now.timestamp());
+            let cached = Cached::read(std::path::Path::new(DIR));
+            let fresh = match read(&Window::default()) {
+                Ok(reading) => format!(
+                    "{}% {} mAh {} mA {} °F",
+                    reading.percent, reading.charge.0, reading.current, reading.temperature
+                ),
+                Err(error) => format!("failed: {error:#}"),
+            };
+            println!(
+                "{} chip {fresh} | cached {}% {} mAh {} mA {} °F",
+                now.format("%Y-%m-%dT%H:%M:%SZ"),
+                show(cached.percent.map(|p| p.to_string())),
+                show(cached.charge.map(|c| c.0.to_string())),
+                show(cached.current.map(|c| c.to_string())),
+                show(cached.temperature.map(|t| t.to_string())),
+            );
+            std::io::stdout().flush()?;
+            if every.is_none() {
+                return Ok(());
+            }
+        }
+        // Short sleeps: they don't count the time suspended, the clock does.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 fn main() -> std::process::ExitCode {
     // Run as udhcpc's hook (a link named kindil-dhcp): no command line.
     let mut args = std::env::args();
@@ -235,6 +278,7 @@ fn main() -> std::process::ExitCode {
         #[cfg(feature = "kindle")]
         Mode::Kindle => kindle(&cli),
         Mode::Uevents { usb } => uevents(*usb).map(|()| Exit::Quit),
+        Mode::Gauge { every } => gauge(*every).map(|()| Exit::Quit),
         Mode::Install { id } => kindil::install::install(
             id,
             &kindil::install::Paths::default(),

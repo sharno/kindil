@@ -21,8 +21,8 @@ pub struct Drain {
     pub left: MilliampHours,
 }
 
-/// The gauge counts whole mAh and stalls while suspended, so a shorter
-/// stretch says little.
+/// The gauge counts whole mAh (0.18 mAh steps, rounded down), so a
+/// shorter stretch says little.
 pub const MIN_STRETCH: TimeDelta = TimeDelta::minutes(20);
 
 impl Drain {

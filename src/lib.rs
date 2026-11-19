@@ -11,6 +11,7 @@ pub mod drive;
 pub mod files;
 pub mod flight;
 pub mod frontlight;
+pub mod gauge;
 pub mod ghosting;
 pub mod host;
 pub mod install;

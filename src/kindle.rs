@@ -24,19 +24,10 @@ use std::time::Duration;
 const WIFI_START: Duration = Duration::from_secs(180);
 /// How long the start's clock sync waits for Wi-Fi to have an address.
 const CLOCK_SYNC_WAIT: Duration = Duration::from_secs(120);
-/// The PW1's fuel gauge; it stalls while suspended and catches up on resume.
-const GAUGE_CHARGE: &str = "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_mAH";
-/// The gauge's average current in mA, negative on battery.
-const GAUGE_CURRENT: &str = "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_current";
-/// The gauge's state of charge, as `71%`; powerd's `battLevel` is this.
-const GAUGE_CAPACITY: &str = "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_capacity";
 /// `1` while the charger may charge; writing `0` pauses it (src/power.rs).
 const CHARGER: &str = "/sys/devices/platform/aplite_charger.0/charging";
 /// `1` while a charger is plugged in.
 const CHARGER_CONNECTED: &str = "/sys/devices/platform/aplite_charger.0/connected";
-/// The cell's temperature, in °F.
-const GAUGE_TEMPERATURE: &str =
-    "/sys/devices/system/yoshi_battery/yoshi_battery0/battery_temperature";
 /// Whether kindil paused charging for the temperature (src/power.rs); only
 /// a pause of kindil's own is ever lifted.
 static CHARGING_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -87,13 +78,14 @@ impl KindleHost {
     }
 }
 
-/// The PW1's fuel gauge and charger, read where powerd reads them; the
-/// gauge has no `power_supply` class entry. Plugged in counts as charging,
-/// even while full or paused for the temperature: not on its own power.
-fn gauge_battery() -> anyhow::Result<Battery> {
-    let text = std::fs::read_to_string(GAUGE_CAPACITY)?;
-    let percent =
-        parse_capacity(&text).ok_or_else(|| anyhow::anyhow!("unexpected capacity {text:?}"))?;
+/// The PW1's fuel gauge, read from the chip now (src/gauge.rs), and the
+/// charger; the gauge has no `power_supply` class entry. Plugged in counts
+/// as charging, even while full or paused for the temperature: not on its
+/// own power.
+fn gauge_battery(gauge: &crate::gauge::Cached) -> anyhow::Result<Battery> {
+    let percent = gauge
+        .percent
+        .ok_or_else(|| anyhow::anyhow!("no state of charge from the gauge"))?;
     let charge = if plugged()? {
         Charge::Charging
     } else {
@@ -118,10 +110,12 @@ fn plugged_from(read: std::io::Result<String>) -> anyhow::Result<bool> {
 
 /// powerd's charging temperature range, kept by kindil: pauses the charger
 /// outside it, and lifts a pause of its own once well inside again.
-fn guard_charging() -> anyhow::Result<()> {
+fn guard_charging(gauge: &crate::gauge::Cached) -> anyhow::Result<()> {
     use std::sync::atomic::Ordering;
     let paused = CHARGING_PAUSED.load(Ordering::Relaxed);
-    let temperature: i32 = std::fs::read_to_string(GAUGE_TEMPERATURE)?.trim().parse()?;
+    let temperature = gauge
+        .temperature
+        .ok_or_else(|| anyhow::anyhow!("no temperature from the gauge"))?;
     let pause = plugged()? && crate::power::pause_charging(temperature, paused);
     if pause != paused {
         std::fs::write(CHARGER, if pause { "0" } else { "1" })?;
@@ -132,12 +126,6 @@ fn guard_charging() -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-/// The gauge reports `71%`.
-pub fn parse_capacity(text: &str) -> Option<u8> {
-    let percent: u8 = text.trim().trim_end_matches('%').parse().ok()?;
-    Some(percent.min(100))
 }
 
 impl Host for KindleHost {
@@ -347,16 +335,16 @@ impl Host for KindleHost {
     }
 
     fn info(&self) -> DeviceInfo {
-        // Read each minute and each doze wake: the charging guard rides along.
-        if let Err(error) = guard_charging() {
+        // Read each minute and each doze wake: the charging guard rides
+        // along. One reading of the chip for all of it.
+        let gauge = crate::gauge::now();
+        if let Err(error) = guard_charging(&gauge) {
             crate::log!("kindil: charging guard: {error}");
         }
         DeviceInfo {
-            battery: gauge_battery().unwrap_or_else(|_| crate::battery::read(Path::new("/sys"))),
-            charge: std::fs::read_to_string(GAUGE_CHARGE)
-                .ok()
-                .and_then(|text| text.trim().parse().ok())
-                .map(crate::drain::MilliampHours),
+            battery: gauge_battery(&gauge)
+                .unwrap_or_else(|_| crate::battery::read(Path::new("/sys"))),
+            charge: gauge.charge,
             memory: std::fs::read_to_string("/proc/meminfo")
                 .ok()
                 .and_then(|text| parse_meminfo(&text)),
@@ -364,9 +352,7 @@ impl Host for KindleHost {
             uptime: std::fs::read_to_string("/proc/uptime")
                 .ok()
                 .and_then(|text| parse_uptime(&text)),
-            current: std::fs::read_to_string(GAUGE_CURRENT)
-                .ok()
-                .and_then(|text| text.trim().parse().ok()),
+            current: gauge.current,
         }
     }
 
@@ -518,8 +504,10 @@ impl crate::power::Sleeper for Sleeping<'_> {
     fn now(&self) -> i64 {
         epoch_seconds()
     }
+    /// The chip now: the driver's cache wasn't refreshed in the hours
+    /// asleep.
     fn battery(&self) -> anyhow::Result<Battery> {
-        gauge_battery()
+        gauge_battery(&crate::gauge::now())
     }
     fn wait(&self, time: Duration) {
         std::thread::sleep(time);
@@ -817,13 +805,6 @@ mod tests {
         assert!(listens_on(table, 22));
         assert!(!listens_on(table, 8092), "established, not listening");
         assert!(!listens_on("header\n", 22));
-    }
-
-    #[test]
-    fn reads_the_gauges_capacity() {
-        assert_eq!(parse_capacity("71%\n"), Some(71));
-        assert_eq!(parse_capacity("100%"), Some(100));
-        assert_eq!(parse_capacity("%"), None);
     }
 
     #[test]
