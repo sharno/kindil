@@ -64,6 +64,7 @@ someone nearby to press the power button, or must end on their own first.
 | `host.rs` | The `Host` trait the UI uses, and the `Simulated` device |
 | `kindle.rs` | `Host` on the device: battery, charger and front light drivers, power button, volumd's events or kindil's USB drive mode, USBNetwork |
 | `power.rs` | powerd's rules kept by kindil: charging temperatures, critical battery |
+| `gauge.rs` | The fuel gauge read from the chip through the driver's register window, not its cached files |
 | `wifi.rs` | wpa_supplicant control socket, typed SSID/passphrase |
 | `net.rs` | Wi-Fi run by kindil: driver, supervised wpa_supplicant and udhcpc (or kindil's own DHCP client) |
 | `dhcp.rs` | udhcpc's hook, `kindil-dhcp`: the lease onto the interface, and its marker for kindil's own Wi-Fi |

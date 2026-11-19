@@ -158,6 +158,23 @@ against them: see [Formal models](DEVELOP.md#formal-models).
     in, it doesn't sleep at all.
   - **Charging**: the charger charges by itself; kindil pauses it outside
     32-113 °F, powerd's range, and resumes 3 °F back inside.
+  - **Battery gauge**: the PW1's fuel gauge is a TI bq27000-family chip
+    (bq27200's registers) on I2C, run by Lab126's `yoshi_battery` driver.
+    The driver's files (`battery_capacity`, `battery_mAH`,
+    `battery_current`, `battery_temperature`) only show what it last read,
+    and it reads every 20 s while awake only: each suspend cancels its
+    poll and each resume puts it 20 s off, so a dozing Kindle, awake about
+    1.5 s a minute, would see values hours old, refreshed in its 2-minute
+    maintenance windows. The chip keeps measuring while the Kindle is
+    suspended, so every reading kindil takes (the percentage on screen, low
+    battery, the 6-hourly check asleep, the charging temperature, the doze
+    ledger's mAh and current) comes from the chip itself, through the
+    driver's register window: kindil writes a register's number to
+    `battreg` and reads `battreg_value`, which reads that register from the
+    chip there and then (src/gauge.rs has the registers and their scaling,
+    the driver's own). It only reads; should that fail, it says so in the
+    log once and uses the driver's files until it works again.
+    `kindil gauge [--every SECS]` prints the two side by side.
   - **Crash restart**: the launcher restarts kindil after a crash. After 3
     crashes within 5 minutes it runs the previous version (kept by the last
     update), and after 3 more it returns to Amazon's UI.
