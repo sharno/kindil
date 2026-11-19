@@ -338,6 +338,36 @@ mod tests {
         );
     }
 
+    /// The PW1's chip on 2026-11-19 at 02:50:04 UTC, through `battreg_value`,
+    /// a second after a doze wake: the driver's files still said 100%, 803
+    /// mAh, +26 mA (its last poll, hours before); 20 s later it polled and
+    /// said 97%, 782 mAh, 73 °F, as read here.
+    #[test]
+    fn reads_the_pw1s_chip_as_its_driver_does() {
+        let chip = Chip::new(&[
+            (0x06, 0xa1),
+            (0x07, 0x04),
+            (0x0a, 0x14),
+            (0x10, 0x21),
+            (0x11, 0x11),
+            (0x14, 0xaa),
+            (0x15, 0x02),
+            (0x2c, 0x61),
+        ]);
+        assert_eq!(
+            read(&chip).unwrap(),
+            Reading {
+                percent: 97,
+                charge: MilliampHours(782),
+                current: -121,
+                temperature: 73,
+            }
+        );
+        // As `battreg_value` printed it.
+        let text = "Battery Register 44\n\n Value: 0x61\n\n";
+        assert_eq!(parse_value(text, 0x2c).unwrap(), 97);
+    }
+
     #[test]
     fn a_word_rolling_over_between_its_bytes_is_read_again() {
         let mut chip = Chip::new(&[(CACT, 0xff), (CACT + 1, 0x0a)]);
