@@ -119,7 +119,7 @@ mod tests {
 
     use crate::config::{ClockFormat, Config};
     use crate::layout::Page;
-    use crate::prayer::{DayTimes, local_date};
+    use crate::prayer::DayTimes;
     use crate::sources::Snapshot;
     use crate::weather::{Quarter, WET_MM};
     use chrono::{DateTime, Duration, Utc};
@@ -160,9 +160,7 @@ mod tests {
                 // Through a day, each prayer's countdown in turn, and past Isha.
                 for hours in (1..24).step_by(2) {
                     let now: DateTime<Utc> = start + Duration::hours(hours) + Duration::minutes(7);
-                    let date = local_date(&config.location, now);
-                    let prayers =
-                        DayTimes::compute(&config.location, &config.prayer, date).unwrap();
+                    let prayers = DayTimes::current(&config.location, &config.prayer, now).unwrap();
                     for weather in [None, Some(&dry), Some(&wet)] {
                         let frame = Frame {
                             now,
@@ -230,8 +228,7 @@ mod tests {
             fetched_at: start,
         };
         let now = start + Duration::hours(1);
-        let date = local_date(&config.location, now);
-        let prayers = DayTimes::compute(&config.location, &config.prayer, date).unwrap();
+        let prayers = DayTimes::current(&config.location, &config.prayer, now).unwrap();
         let renderer = Renderer::new(config.display.contrast);
         let frame = |page| Frame {
             now,

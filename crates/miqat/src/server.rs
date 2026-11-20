@@ -6,7 +6,7 @@ use tiny_http::{Header, Response, Server};
 
 use crate::config::Config;
 use crate::layout::{Frame, Page};
-use crate::prayer::{self, DayTimes};
+use crate::prayer::DayTimes;
 use crate::render::Renderer;
 use crate::sources::Sources;
 
@@ -25,8 +25,7 @@ impl App {
 
     pub fn frame(&mut self, config: &Config, now: DateTime<Utc>) -> anyhow::Result<Vec<u8>> {
         self.sources.refresh(config, now);
-        let date = prayer::local_date(&config.location, now);
-        let prayers = DayTimes::compute(&config.location, &config.prayer, date)?;
+        let prayers = DayTimes::current(&config.location, &config.prayer, now)?;
         self.renderer.png(&Frame {
             now,
             config,

@@ -142,6 +142,7 @@ fn rain_gray(pixel: [u8; 4]) -> u8 {
         .map_or(255, |&(_, gray)| gray)
 }
 
+#[derive(Clone)]
 pub struct RadarClient {
     agent: ureq::Agent,
 }

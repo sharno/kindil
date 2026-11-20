@@ -728,9 +728,12 @@ pub fn format_time(t: DateTime<Utc>, tz: Tz, clock: ClockFormat) -> String {
     }
 }
 
-/// Whole minutes remaining, rounded up so "in 1m" shows until the moment arrives.
+/// Whole minutes remaining, rounded up so "in 1m" shows until the moment
+/// arrives: any part of a minute counts, a fraction of a second included.
 fn countdown(now: DateTime<Utc>, at: DateTime<Utc>) -> String {
-    let minutes = (at - now).num_seconds().max(0).unsigned_abs().div_ceil(60);
+    let left = (at - now).max(Duration::zero());
+    let whole = left.num_minutes();
+    let minutes = whole + i64::from(left > Duration::minutes(whole));
     match (minutes / 60, minutes % 60) {
         (0, m) => format!("in {m}m"),
         (h, 0) => format!("in {h}h"),
@@ -960,6 +963,11 @@ mod tests {
         );
         assert_eq!(countdown(t(12, 0), t(13, 0)), "in 1h");
         assert_eq!(countdown(t(12, 0), t(14, 5)), "in 2h 5m");
+        // A minute and a fraction of a second: two.
+        let at = t(12, 2);
+        assert_eq!(countdown(at - Duration::milliseconds(60_213), at), "in 2m");
+        assert_eq!(countdown(at - Duration::seconds(60), at), "in 1m");
+        assert_eq!(countdown(at + Duration::seconds(1), at), "in 0m");
     }
 
     #[test]
@@ -1027,6 +1035,50 @@ mod tests {
                 .to_string()
                 .contains("a&lt;b&amp;c")
         );
+    }
+
+    /// Any moment, anywhere: the header names the next prayer (as every
+    /// solar day around it says, Jumu'ah on Fridays) and counts the whole
+    /// minutes to it, rounded up.
+    #[test]
+    fn the_header_counts_down_to_the_next_prayer() {
+        use crate::prayer::oracle;
+        for index in 0..oracle::PLACES.len() {
+            let config = oracle::place(index);
+            let mut random = oracle::Random(index as u64 + 100);
+            for second in oracle::moments(index as u64 + 50, 400) {
+                // Anywhere in the second, its end included.
+                let now = second + Duration::milliseconds(random.below(1_000) as i64);
+                let (salah, at, weekday) = oracle::next(&config.location, &config.prayer, now);
+                let prayers = DayTimes::current(&config.location, &config.prayer, now).unwrap();
+                let header = header_svg(&Frame {
+                    now,
+                    config: &config,
+                    prayers: &prayers,
+                    weather: None,
+                    radar: None,
+                    page: Page::below(56),
+                });
+                let left = (at - now).num_milliseconds();
+                let minutes = (left + 59_999) / 60_000;
+                let remaining = match (minutes / 60, minutes % 60) {
+                    (0, m) => format!("{m}m"),
+                    (h, 0) => format!("{h}h"),
+                    (h, m) => format!("{h}h {m}m"),
+                };
+                let (english, arabic) = salah.names(weekday);
+                for shown in [
+                    format!(">{remaining}</tspan>"),
+                    format!(">{english}</text>"),
+                    format!(">{arabic}</text>"),
+                ] {
+                    assert!(
+                        header.contains(&shown),
+                        "{now}, {left} ms to {at}: {shown}\n{header}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

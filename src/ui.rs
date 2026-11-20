@@ -256,6 +256,9 @@ enum Tick {
     Fetch(Option<u64>),
     /// Read Miqat's file again, as a fresh start would, then render.
     Reload,
+    /// The worker's fetch has ended, on its own thread: render with what
+    /// it fetched.
+    Fetched,
 }
 
 /// UI-thread state. Borrowed briefly inside one callback, never across a
@@ -2388,11 +2391,11 @@ impl Ctx {
             (Worker::Idle, Execution::Background) => {}
         }
         let (sender, ticks) = mpsc::channel();
-        self.state.borrow_mut().miqat = Worker::Started(sender);
+        self.state.borrow_mut().miqat = Worker::Started(sender.clone());
         let path = self.config.miqat_config.clone();
         let weak = self.weak.clone();
         let display = self.display.clone();
-        std::thread::spawn(move || miqat_worker(&path, &weak, &display, &ticks));
+        std::thread::spawn(move || miqat_worker(&path, &weak, &display, (sender, &ticks)));
     }
 }
 
@@ -2473,20 +2476,18 @@ fn miqat_worker(
     path: &std::path::Path,
     weak: &slint::Weak<AppWindow>,
     display: &Display,
-    ticks: &mpsc::Receiver<Tick>,
+    (sender, ticks): (mpsc::Sender<Tick>, &mpsc::Receiver<Tick>),
 ) {
-    let Some(mut config) = load_miqat(path, weak, ticks) else {
+    let Some(config) = load_miqat(path, weak, ticks) else {
         return;
     };
-    let mut renderer = miqat::render::Renderer::new(config.display.contrast);
-    let mut sources = miqat::sources::Sources::new(&config);
     // The board of the full frame on screen.
     let mut shown = None;
-    let mut show = |config: &miqat::config::Config,
-                    renderer: &miqat::render::Renderer,
-                    sources: &miqat::sources::Sources,
-                    wake: Option<u64>,
-                    asked: Draw| {
+    let show = |config: &miqat::config::Config,
+                renderer: &miqat::render::Renderer,
+                sources: &miqat::sources::Sources,
+                wake: Option<u64>,
+                asked: Draw| {
         let (frame, drew, board) =
             render_miqat(config, renderer, sources, Utc::now(), asked, shown);
         shown = board;
@@ -2518,47 +2519,214 @@ fn miqat_worker(
             }
             display.dashboard_shown(wake);
         })
+        .map_err(drop)
     };
-    // First paint before any network, so a slow fetch never leaves it blank.
-    if show(&config, &renderer, &sources, None, Draw::Full).is_err() {
-        return;
+    let dozing = || display.is_dozing();
+    run_dashboard(
+        config,
+        path,
+        (sender, ticks),
+        &dozing,
+        Arc::new(fetch_sources),
+        show,
+    );
+}
+
+/// Fetches what is due: [`miqat::sources::Sources::refresh`].
+fn fetch_sources(
+    sources: &mut miqat::sources::Sources,
+    config: &miqat::config::Config,
+    now: DateTime<Utc>,
+) {
+    sources.refresh(config, now);
+}
+
+/// How the dashboard worker fetches: on a copy of its sources, on a
+/// thread of its own, at a time.
+type Fetch =
+    Arc<dyn Fn(&mut miqat::sources::Sources, &miqat::config::Config, DateTime<Utc>) + Send + Sync>;
+
+/// The dashboard worker's fetch, which runs on a thread of its own: no
+/// draw waits on the network. An online doze wake's fetch can outlive the
+/// wake (it naps at its ceiling, Wi-Fi parked under the fetch, whose
+/// timeouts count only time awake); done in the worker, it held up every
+/// wake's minute after it, and the panel kept an old countdown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fetching {
+    Idle,
+    /// Under way; its frame is `wake`'s, if a doze wake waits for it.
+    Running {
+        wake: Option<u64>,
+        then: Then,
+    },
+}
+
+/// Asked for while a fetch was under way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Then {
+    Done,
+    /// Another, once it ends (if still due), for this wake.
+    Again(Option<u64>),
+}
+
+/// What the worker does next: start a fetch, draw (for a wake), or both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Plan {
+    start: bool,
+    draw: Option<(Option<u64>, Draw)>,
+}
+
+impl Plan {
+    fn draw(wake: Option<u64>, asked: Draw) -> Self {
+        Self {
+            start: false,
+            draw: Some((wake, asked)),
+        }
     }
+}
+
+impl Fetching {
+    /// A fetch asked for, for `wake`, with something `due`. Without a wake
+    /// the minute is drawn now as well, with what is there; a doze wake's
+    /// frame is the fetched one.
+    fn asked(self, wake: Option<u64>, due: bool) -> (Self, Plan) {
+        if !due {
+            return (self, Plan::draw(wake, Draw::Full));
+        }
+        let draw = match wake {
+            None => Some((None, Draw::Full)),
+            Some(_) => None,
+        };
+        match self {
+            Fetching::Idle => (
+                Fetching::Running {
+                    wake,
+                    then: Then::Done,
+                },
+                Plan { start: true, draw },
+            ),
+            Fetching::Running { wake: running, .. } => (
+                Fetching::Running {
+                    wake: running,
+                    then: Then::Again(wake),
+                },
+                Plan { start: false, draw },
+            ),
+        }
+    }
+
+    /// The fetch under way ended; `due` is what is still due after it.
+    fn ended(self, due: bool) -> (Self, Plan) {
+        match self {
+            Fetching::Running {
+                wake,
+                then: Then::Done,
+            } => (Fetching::Idle, Plan::draw(wake, Draw::Full)),
+            // Its wake is over (a later one asked since): the next fetch
+            // is that one's.
+            Fetching::Running {
+                wake,
+                then: Then::Again(next),
+            } if due => (
+                Fetching::Running {
+                    wake: next,
+                    then: Then::Done,
+                },
+                Plan {
+                    start: true,
+                    draw: Some((wake, Draw::Full)),
+                },
+            ),
+            Fetching::Running {
+                wake,
+                then: Then::Again(next),
+            } => (Fetching::Idle, Plan::draw(next.or(wake), Draw::Full)),
+            // Only a fetch the worker started ends; drawing is harmless.
+            Fetching::Idle => (Fetching::Idle, Plan::draw(None, Draw::Full)),
+        }
+    }
+}
+
+/// The dashboard worker's loop: renders what each tick asks for through
+/// `show` (which fails once the window is gone), fetching with `fetch` on
+/// a thread that reports back as [`Tick::Fetched`] through `sender`.
+fn run_dashboard(
+    mut config: miqat::config::Config,
+    path: &std::path::Path,
+    (sender, ticks): (mpsc::Sender<Tick>, &mpsc::Receiver<Tick>),
+    dozing: &dyn Fn() -> bool,
+    fetch: Fetch,
+    mut show: impl FnMut(
+        &miqat::config::Config,
+        &miqat::render::Renderer,
+        &miqat::sources::Sources,
+        Option<u64>,
+        Draw,
+    ) -> Result<(), ()>,
+) {
+    let mut renderer = miqat::render::Renderer::new(config.display.contrast);
+    let mut sources = miqat::sources::Sources::new(&config);
+    // What a fetch brought back, and for which sources: a reload to
+    // another place drops what was fetched for the old one.
+    let fetched: Arc<Mutex<Option<(u64, miqat::sources::Sources)>>> = Arc::default();
+    let mut generation = 0_u64;
+    let mut fetching = Fetching::Idle;
+    // The first paint comes before any network: the fetch is on its way.
     let mut tick = Tick::Fetch(None);
     loop {
-        let (wake, asked) = match tick {
-            Tick::Fetch(wake) => {
-                sources.refresh(&config, Utc::now());
-                (wake, Draw::Full)
+        let now = Utc::now();
+        let (next, plan) = match tick {
+            Tick::Draw(wake) => (fetching, Plan::draw(wake, Draw::Full)),
+            Tick::Minute(wake) => (fetching, Plan::draw(wake, Draw::Header)),
+            Tick::Fetch(wake) => fetching.asked(wake, sources.due(now)),
+            Tick::Fetched => {
+                match lock(&fetched).take() {
+                    Some((of, new)) if of == generation => sources = new,
+                    Some(_) | None => {}
+                }
+                fetching.ended(sources.due(now))
             }
-            Tick::Draw(wake) => (wake, Draw::Full),
-            Tick::Minute(wake) => (wake, Draw::Header),
             // A file that no longer reads keeps the dashboard as it was.
             Tick::Reload => match miqat::config::Config::load(path) {
                 Ok(fresh) => {
                     if !same_sources(&config, &fresh) {
                         sources = miqat::sources::Sources::new(&fresh);
-                        sources.refresh(&fresh, Utc::now());
+                        generation += 1;
                     }
                     renderer = miqat::render::Renderer::new(fresh.display.contrast);
                     config = fresh;
-                    (None, Draw::Full)
+                    fetching.asked(None, sources.due(now))
                 }
                 Err(error) => {
                     crate::log!("kindil: reloading {}: {error:#}", path.display());
-                    (None, Draw::Full)
+                    (fetching, Plan::draw(None, Draw::Full))
                 }
             },
         };
-        if show(&config, &renderer, &sources, wake, asked).is_err() {
-            return;
+        fetching = next;
+        if plan.start {
+            let (fetch, fetched, sender) = (fetch.clone(), fetched.clone(), sender.clone());
+            let (mut copy, config) = (sources.clone(), config.clone());
+            std::thread::spawn(move || {
+                fetch(&mut copy, &config, now);
+                *lock(&fetched) = Some((generation, copy));
+                let _ = sender.send(Tick::Fetched);
+            });
+        }
+        if let Some((wake, asked)) = plan.draw {
+            if show(&config, &renderer, &sources, wake, asked).is_err() {
+                return;
+            }
         }
         tick = loop {
             match ticks.recv_timeout(until_next_minute(Utc::now())) {
                 Ok(tick) => break tick,
                 // Dozing, wakes ask for draws and fetches: this clock only
                 // runs while the device is up, and Wi-Fi is parked.
-                Err(mpsc::RecvTimeoutError::Timeout) if display.is_dozing() => {}
+                Err(mpsc::RecvTimeoutError::Timeout) if dozing() => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => break Tick::Fetch(None),
+                // The worker keeps a sender for its fetches: never, as
+                // long as the worker runs.
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         };
@@ -2732,6 +2900,137 @@ mod tests {
                 .unwrap();
         assert_eq!(elsewhere.prayer.method, method);
         assert!(!same_sources(&config, &elsewhere));
+    }
+
+    /// The dashboard worker on a thread, dozing, with a fetch that returns
+    /// only when told to: what it draws (each wake and draw asked), and a
+    /// way to send ticks and to let each fetch return.
+    struct DashboardWorker {
+        ticks: mpsc::Sender<Tick>,
+        drawn: mpsc::Receiver<(Option<u64>, Draw)>,
+        release: mpsc::Sender<()>,
+        fetches: Arc<AtomicU64>,
+    }
+
+    impl DashboardWorker {
+        fn start() -> Self {
+            let config: miqat::config::Config =
+                toml::from_str(include_str!("../examples/miqat.toml")).unwrap();
+            let (ticks, receiver) = mpsc::channel();
+            let (drew, drawn) = mpsc::channel();
+            let (release, released) = mpsc::channel::<()>();
+            let released = Mutex::new(released);
+            let fetches = Arc::new(AtomicU64::new(0));
+            let started = fetches.clone();
+            let sender = ticks.clone();
+            std::thread::spawn(move || {
+                let fetch = move |_: &mut miqat::sources::Sources,
+                                  _: &miqat::config::Config,
+                                  _: DateTime<Utc>| {
+                    started.fetch_add(1, Ordering::AcqRel);
+                    let _ = lock(&released).recv();
+                };
+                run_dashboard(
+                    config,
+                    std::path::Path::new("miqat.toml"),
+                    (sender, &receiver),
+                    &|| true,
+                    Arc::new(fetch),
+                    |_, _, _, wake, asked| drew.send((wake, asked)).map_err(drop),
+                );
+            });
+            Self {
+                ticks,
+                drawn,
+                release,
+                fetches,
+            }
+        }
+
+        fn next(&self) -> Option<(Option<u64>, Draw)> {
+            self.drawn.recv_timeout(Duration::from_secs(5)).ok()
+        }
+    }
+
+    /// An online doze wake whose fetch outlives it (the radio parked under
+    /// it, its timeouts counting only time awake) held up every wake's
+    /// minute after it: the panel kept an old countdown for as long.
+    #[test]
+    fn a_minute_is_drawn_while_a_fetch_is_under_way() {
+        let worker = DashboardWorker::start();
+        assert_eq!(worker.next(), Some((None, Draw::Full)), "the first paint");
+        // The start's fetch, under way.
+        worker.ticks.send(Tick::Fetch(Some(1))).unwrap();
+        for wake in 2..5 {
+            worker.ticks.send(Tick::Minute(Some(wake))).unwrap();
+            assert_eq!(
+                worker.next(),
+                Some((Some(wake), Draw::Header)),
+                "wake {wake}"
+            );
+        }
+        worker.ticks.send(Tick::Draw(Some(5))).unwrap();
+        assert_eq!(worker.next(), Some((Some(5), Draw::Full)));
+        // The fetches end: the fetched frame, for the wake that asked.
+        (0..2).for_each(|_| worker.release.send(()).unwrap());
+        let fetched = std::iter::from_fn(|| worker.next())
+            .take(3)
+            .any(|drawn| drawn == (Some(1), Draw::Full));
+        assert!(fetched);
+        assert_eq!(worker.fetches.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn a_fetch_asked_for_during_another_is_its_wakes_own() {
+        use Fetching::{Idle, Running};
+        let plan = |start, draw| Plan { start, draw };
+        // Nothing due: the frame now, for the wake.
+        assert_eq!(
+            Idle.asked(Some(3), false),
+            (Idle, Plan::draw(Some(3), Draw::Full))
+        );
+        // Due: a doze wake's frame is the fetched one; awake, the minute
+        // is drawn meanwhile.
+        let for_3 = Running {
+            wake: Some(3),
+            then: Then::Done,
+        };
+        assert_eq!(Idle.asked(Some(3), true), (for_3, plan(true, None)));
+        let awake = Running {
+            wake: None,
+            then: Then::Done,
+        };
+        assert_eq!(
+            Idle.asked(None, true),
+            (awake, plan(true, Some((None, Draw::Full))))
+        );
+        // Wake 4 asks while wake 3's fetch is under way: one after it.
+        let then_4 = Running {
+            wake: Some(3),
+            then: Then::Again(Some(4)),
+        };
+        assert_eq!(for_3.asked(Some(4), true), (then_4, plan(false, None)));
+        assert_eq!(
+            then_4.ended(true),
+            (
+                Running {
+                    wake: Some(4),
+                    then: Then::Done
+                },
+                plan(true, Some((Some(3), Draw::Full)))
+            )
+        );
+        // ...unless the first fetched it all: then that frame is wake 4's.
+        assert_eq!(then_4.ended(false), (Idle, Plan::draw(Some(4), Draw::Full)));
+        let then_awake = Running {
+            wake: Some(3),
+            then: Then::Again(None),
+        };
+        assert_eq!(
+            then_awake.ended(false),
+            (Idle, Plan::draw(Some(3), Draw::Full))
+        );
+        assert_eq!(for_3.ended(true), (Idle, Plan::draw(Some(3), Draw::Full)));
     }
 
     #[test]

@@ -5097,8 +5097,6 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "salah"
 version = "0.7.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04af71d94fdd3fb168cac15a85b2cc89ef8a3518206294cdb4bb923a885c5738"
 dependencies = [
  "chrono",
 ]
