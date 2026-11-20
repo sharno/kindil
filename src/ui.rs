@@ -2475,18 +2475,16 @@ fn miqat_worker(
     display: &Display,
     ticks: &mpsc::Receiver<Tick>,
 ) {
-    let Some(mut config) = load_miqat(path, weak, ticks) else {
+    let Some(config) = load_miqat(path, weak, ticks) else {
         return;
     };
-    let mut renderer = miqat::render::Renderer::new(config.display.contrast);
-    let mut sources = miqat::sources::Sources::new(&config);
     // The board of the full frame on screen.
     let mut shown = None;
-    let mut show = |config: &miqat::config::Config,
-                    renderer: &miqat::render::Renderer,
-                    sources: &miqat::sources::Sources,
-                    wake: Option<u64>,
-                    asked: Draw| {
+    let show = |config: &miqat::config::Config,
+                renderer: &miqat::render::Renderer,
+                sources: &miqat::sources::Sources,
+                wake: Option<u64>,
+                asked: Draw| {
         let (frame, drew, board) =
             render_miqat(config, renderer, sources, Utc::now(), asked, shown);
         shown = board;
@@ -2518,7 +2516,39 @@ fn miqat_worker(
             }
             display.dashboard_shown(wake);
         })
+        .map_err(drop)
     };
+    let dozing = || display.is_dozing();
+    run_dashboard(config, path, ticks, &dozing, &fetch_sources, show);
+}
+
+/// Fetches what is due: [`miqat::sources::Sources::refresh`].
+fn fetch_sources(
+    sources: &mut miqat::sources::Sources,
+    config: &miqat::config::Config,
+    now: DateTime<Utc>,
+) {
+    sources.refresh(config, now);
+}
+
+/// The dashboard worker's loop: renders what each tick asks for through
+/// `show` (which fails once the window is gone), fetching with `fetch`.
+fn run_dashboard(
+    mut config: miqat::config::Config,
+    path: &std::path::Path,
+    ticks: &mpsc::Receiver<Tick>,
+    dozing: &dyn Fn() -> bool,
+    fetch: &dyn Fn(&mut miqat::sources::Sources, &miqat::config::Config, DateTime<Utc>),
+    mut show: impl FnMut(
+        &miqat::config::Config,
+        &miqat::render::Renderer,
+        &miqat::sources::Sources,
+        Option<u64>,
+        Draw,
+    ) -> Result<(), ()>,
+) {
+    let mut renderer = miqat::render::Renderer::new(config.display.contrast);
+    let mut sources = miqat::sources::Sources::new(&config);
     // First paint before any network, so a slow fetch never leaves it blank.
     if show(&config, &renderer, &sources, None, Draw::Full).is_err() {
         return;
@@ -2527,7 +2557,7 @@ fn miqat_worker(
     loop {
         let (wake, asked) = match tick {
             Tick::Fetch(wake) => {
-                sources.refresh(&config, Utc::now());
+                fetch(&mut sources, &config, Utc::now());
                 (wake, Draw::Full)
             }
             Tick::Draw(wake) => (wake, Draw::Full),
@@ -2537,7 +2567,7 @@ fn miqat_worker(
                 Ok(fresh) => {
                     if !same_sources(&config, &fresh) {
                         sources = miqat::sources::Sources::new(&fresh);
-                        sources.refresh(&fresh, Utc::now());
+                        fetch(&mut sources, &fresh, Utc::now());
                     }
                     renderer = miqat::render::Renderer::new(fresh.display.contrast);
                     config = fresh;
@@ -2557,7 +2587,7 @@ fn miqat_worker(
                 Ok(tick) => break tick,
                 // Dozing, wakes ask for draws and fetches: this clock only
                 // runs while the device is up, and Wi-Fi is parked.
-                Err(mpsc::RecvTimeoutError::Timeout) if display.is_dozing() => {}
+                Err(mpsc::RecvTimeoutError::Timeout) if dozing() => {}
                 Err(mpsc::RecvTimeoutError::Timeout) => break Tick::Fetch(None),
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
