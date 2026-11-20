@@ -249,6 +249,52 @@ mod tests {
         );
     }
 
+    fn place(
+        latitude: f64,
+        longitude: f64,
+        timezone: &str,
+        method: &str,
+    ) -> (Location, PrayerConfig) {
+        let config: Config = toml::from_str(&format!(
+            "[location]\nlatitude = {latitude}\nlongitude = {longitude}\n\
+             timezone = \"{timezone}\"\n[prayer]\nmethod = \"{method}\"\n"
+        ))
+        .unwrap();
+        (config.location, config.prayer)
+    }
+
+    /// In Amsterdam the sun stays above -18° from late May to mid July:
+    /// salah 0.7.6 unwrapped the NaN of a twilight never reached (and
+    /// kindil aborts on a panic). Adhan's rule: the high-latitude share of
+    /// the night stands in.
+    #[test]
+    fn a_twilight_never_reached_falls_back_to_the_share_of_the_night() {
+        let (location, config) = amsterdam();
+        let date = NaiveDate::from_ymd_opt(2026, 6, 21).unwrap();
+        let day = DayTimes::compute(&location, &config, date).unwrap();
+        assert!(day.times().windows(2).all(|w| w[0].1 < w[1].1));
+        let local = |s| {
+            let at = day.at(s).with_timezone(&location.timezone);
+            at.format("%d %H:%M").to_string()
+        };
+        // MWL's rule up there: the middle of the night, sunset to sunrise.
+        assert_eq!(local(Salah::Fajr), "21 01:42");
+        assert_eq!(local(Salah::Sunrise), "21 05:18");
+        assert_eq!(local(Salah::Maghrib), "21 22:06");
+        assert_eq!(local(Salah::Isha), "22 01:42");
+    }
+
+    /// Where the sun doesn't set (or rise) there are no times: an error,
+    /// not a panic.
+    #[test]
+    fn no_sunset_is_an_error_not_a_panic() {
+        let (location, config) = place(69.65, 18.96, "Europe/Oslo", "muslim_world_league");
+        for (month, day) in [(6, 21), (12, 21)] {
+            let date = NaiveDate::from_ymd_opt(2026, month, day).unwrap();
+            assert!(DayTimes::compute(&location, &config, date).is_err());
+        }
+    }
+
     #[test]
     fn friday_names_jumuah() {
         assert_eq!(Salah::Dhuhr.names(Weekday::Fri).0, "Jumu'ah");

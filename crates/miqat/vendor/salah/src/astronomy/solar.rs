@@ -94,7 +94,9 @@ pub struct SolarTime {
 }
 
 impl SolarTime {
-    pub fn new(date: DateTime<Utc>, coordinates: Coordinates) -> SolarTime {
+    /// kindil's patch: None where the sun doesn't rise or set that day
+    /// (salah 0.7.6 panicked).
+    pub fn new(date: DateTime<Utc>, coordinates: Coordinates) -> Option<SolarTime> {
         // All calculation need to occur at 0h0m UTC
         let today = Utc
             .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
@@ -146,20 +148,22 @@ impl SolarTime {
             next_solar.declination,
         );
 
-        SolarTime {
+        Some(SolarTime {
             date: date,
             observer: coordinates,
             solar: solar,
-            transit: SolarTime::setting_hour(transit_time, &date).unwrap(),
-            sunrise: SolarTime::setting_hour(sunrise_time, &date).unwrap(),
-            sunset: SolarTime::setting_hour(sunset_time, &date).unwrap(),
+            transit: SolarTime::setting_hour(transit_time, &date)?,
+            sunrise: SolarTime::setting_hour(sunrise_time, &date)?,
+            sunset: SolarTime::setting_hour(sunset_time, &date)?,
             prev_solar: prev_solar,
             next_solar: next_solar,
             approx_transit: approx_transit,
-        }
+        })
     }
 
-    pub fn time_for_solar_angle(&self, angle: Angle, after_transit: bool) -> DateTime<Utc> {
+    /// kindil's patch: None where the sun doesn't reach `angle` that day
+    /// (salah 0.7.6 panicked).
+    pub fn time_for_solar_angle(&self, angle: Angle, after_transit: bool) -> Option<DateTime<Utc>> {
         let hours = ops::corrected_hour_angle(
             self.approx_transit,
             angle,
@@ -174,10 +178,10 @@ impl SolarTime {
             self.next_solar.declination,
         );
 
-        SolarTime::setting_hour(hours, &self.date).unwrap()
+        SolarTime::setting_hour(hours, &self.date)
     }
 
-    pub fn afternoon(&self, shadow_length: f64) -> DateTime<Utc> {
+    pub fn afternoon(&self, shadow_length: f64) -> Option<DateTime<Utc>> {
         let absolute_degrees = (self.observer.latitude - self.solar.declination.degrees).abs();
         let tangent = Angle::new(absolute_degrees);
         let inverse = shadow_length + tangent.radians().tan();
@@ -187,7 +191,7 @@ impl SolarTime {
     }
 
     fn setting_hour(value: f64, date: &DateTime<Utc>) -> Option<DateTime<Utc>> {
-        if value.is_normal() {
+        if value.is_finite() {
             let calculated_hours = value.floor();
             let calculated_minutes = ((value - calculated_hours) * 60.0).floor();
             let calculated_seconds =
@@ -299,7 +303,7 @@ mod tests {
             .with_ymd_and_hms(2015, 7, 12, 0, 0, 0)
             .single()
             .expect("Invalid date and time provided");
-        let solar = SolarTime::new(date, coordinates);
+        let solar = SolarTime::new(date, coordinates).unwrap();
         let transit_date = Utc.with_ymd_and_hms(2015, 07, 12, 17, 20, 0).unwrap();
         let sunrise_date = Utc.with_ymd_and_hms(2015, 07, 12, 10, 08, 0).unwrap();
         let sunset_date = Utc.with_ymd_and_hms(2015, 07, 13, 00, 32, 0).unwrap();
@@ -316,10 +320,10 @@ mod tests {
             .with_ymd_and_hms(2015, 7, 12, 0, 0, 0)
             .single()
             .expect("Invalida date and time provided");
-        let solar = SolarTime::new(date, coordinates);
+        let solar = SolarTime::new(date, coordinates).unwrap();
         let angle = Angle::new(-6.0);
-        let twilight_start = solar.time_for_solar_angle(angle, false);
-        let twilight_end = solar.time_for_solar_angle(angle, true);
+        let twilight_start = solar.time_for_solar_angle(angle, false).unwrap();
+        let twilight_end = solar.time_for_solar_angle(angle, true).unwrap();
 
         assert_eq!(twilight_start.format("%-k:%M").to_string(), "9:38");
         assert_eq!(twilight_end.format("%-k:%M").to_string(), "1:02");

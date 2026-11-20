@@ -39,15 +39,23 @@ pub struct PrayerTimes {
 
 impl PrayerTimes {
     pub fn new(date: NaiveDate, coordinates: Coordinates, parameters: Parameters) -> PrayerTimes {
-        let prayer_date = date
-            .and_hms_opt(0, 0, 0)
-            .expect("Invalid date provided")
-            .and_utc();
-        let tomorrow = prayer_date.tomorrow();
-        let solar_time = SolarTime::new(prayer_date, coordinates);
-        let solar_time_tomorrow = SolarTime::new(tomorrow, coordinates);
+        PrayerTimes::try_new(date, coordinates, parameters)
+            .expect("The sun doesn't rise or set on that date at that latitude")
+    }
 
-        let asr = solar_time.afternoon(parameters.madhab.shadow().into());
+    /// kindil's patch: None where the sun doesn't rise or set that day or
+    /// the next (salah 0.7.6 panicked).
+    pub fn try_new(
+        date: NaiveDate,
+        coordinates: Coordinates,
+        parameters: Parameters,
+    ) -> Option<PrayerTimes> {
+        let prayer_date = date.and_hms_opt(0, 0, 0)?.and_utc();
+        let tomorrow = prayer_date.tomorrow();
+        let solar_time = SolarTime::new(prayer_date, coordinates)?;
+        let solar_time_tomorrow = SolarTime::new(tomorrow, coordinates)?;
+
+        let asr = solar_time.afternoon(parameters.madhab.shadow().into())?;
         let night = solar_time_tomorrow
             .sunrise
             .signed_duration_since(solar_time.sunset);
@@ -83,9 +91,9 @@ impl PrayerTimes {
                 solar_time_tomorrow,
                 coordinates,
                 tomorrow,
-            );
+            )?;
 
-        PrayerTimes {
+        Some(PrayerTimes {
             fajr: final_fajr,
             sunrise: final_sunrise,
             dhuhr: final_dhuhr,
@@ -98,7 +106,7 @@ impl PrayerTimes {
             coordinates: coordinates,
             date: prayer_date,
             parameters: parameters,
-        }
+        })
     }
 
     pub fn time(&self, prayer: Prayer) -> DateTime<Utc> {
@@ -176,6 +184,9 @@ impl PrayerTimes {
         coordinates: Coordinates,
         prayer_date: DateTime<Utc>,
     ) -> DateTime<Utc> {
+        // kindil's patch: a twilight the sun never reaches that day is
+        // None, and the safe time below stands in (Adhan's rule; salah
+        // 0.7.6 panicked).
         let mut fajr = solar_time.time_for_solar_angle(Angle::new(-parameters.fajr_angle), false);
 
         // special case for moonsighting committee above latitude 55
@@ -183,8 +194,7 @@ impl PrayerTimes {
             let night_fraction = night.num_seconds() / 7;
             fajr = solar_time
                 .sunrise
-                .checked_add_signed(Duration::seconds(-night_fraction))
-                .unwrap();
+                .checked_add_signed(Duration::seconds(-night_fraction));
         } else {
             // Nothing to do.
         }
@@ -207,11 +217,10 @@ impl PrayerTimes {
                 .unwrap()
         };
 
-        if fajr < safe_fajr {
-            fajr = safe_fajr;
-        } else {
-            // Nothing to do.
-        }
+        let fajr = match fajr {
+            Some(fajr) if fajr >= safe_fajr => fajr,
+            _ => safe_fajr,
+        };
 
         fajr.adjust_time(parameters.time_adjustments(Prayer::Fajr))
     }
@@ -223,23 +232,21 @@ impl PrayerTimes {
         coordinates: Coordinates,
         prayer_date: DateTime<Utc>,
     ) -> DateTime<Utc> {
-        let mut isha: DateTime<Utc>;
-
-        if parameters.isha_interval > 0 {
-            isha = solar_time
+        let isha = if parameters.isha_interval > 0 {
+            solar_time
                 .sunset
-                .checked_add_signed(Duration::seconds((parameters.isha_interval * 60) as i64))
-                .unwrap();
+                .adjust_time(i64::from(parameters.isha_interval))
         } else {
-            isha = solar_time.time_for_solar_angle(Angle::new(-parameters.isha_angle), true);
+            // kindil's patch: as for Fajr, a twilight never reached is None.
+            let mut isha =
+                solar_time.time_for_solar_angle(Angle::new(-parameters.isha_angle), true);
 
             // special case for moonsighting committee above latitude 55
             if parameters.method == Method::MoonsightingCommittee && coordinates.latitude >= 55.0 {
                 let night_fraction = night.num_seconds() / 7;
                 isha = solar_time
                     .sunset
-                    .checked_add_signed(Duration::seconds(night_fraction))
-                    .unwrap();
+                    .checked_add_signed(Duration::seconds(night_fraction));
             } else {
                 // Nothing to do.
             }
@@ -264,12 +271,11 @@ impl PrayerTimes {
                     .unwrap()
             };
 
-            if isha > safe_isha {
-                isha = safe_isha;
-            } else {
-                // Nothing to do.
+            match isha {
+                Some(isha) if isha <= safe_isha => isha,
+                _ => safe_isha,
             }
-        }
+        };
 
         isha.adjust_time(parameters.time_adjustments(Prayer::Isha))
     }
@@ -280,9 +286,9 @@ impl PrayerTimes {
         solar_time: SolarTime,
         coordinates: Coordinates,
         prayer_date: DateTime<Utc>,
-    ) -> (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) {
+    ) -> Option<(DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)> {
         let tomorrow = prayer_date.tomorrow();
-        let solar_time_tomorrow = SolarTime::new(tomorrow, coordinates);
+        let solar_time_tomorrow = SolarTime::new(tomorrow, coordinates)?;
         let night = solar_time_tomorrow
             .sunrise
             .signed_duration_since(solar_time.sunset);
@@ -303,7 +309,7 @@ impl PrayerTimes {
             .unwrap()
             .rounded_minute(Rounding::Nearest);
 
-        (middle_of_night, last_third_of_night, tomorrow_fajr)
+        Some((middle_of_night, last_third_of_night, tomorrow_fajr))
     }
 }
 
@@ -340,11 +346,14 @@ impl PrayerSchedule {
 
     pub fn calculate(&self) -> Result<PrayerTimes, String> {
         if self.date.is_some() && self.coordinates.is_some() && self.params.is_some() {
-            Ok(PrayerTimes::new(
+            PrayerTimes::try_new(
                 self.date.unwrap(),
                 self.coordinates.unwrap(),
                 self.params.unwrap(),
-            ))
+            )
+            .ok_or_else(|| {
+                String::from("The sun doesn't rise or set on that date at that latitude.")
+            })
         } else {
             Err(String::from(
                 "Required information is needed in order to calculate the prayer times.",
@@ -356,8 +365,8 @@ impl PrayerSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::madhab::Madhab;
     use crate::Configuration;
+    use crate::models::madhab::Madhab;
     use chrono::{NaiveDate, TimeZone, Utc};
 
     #[test]

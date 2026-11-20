@@ -29,7 +29,7 @@ impl Qiblah {
 
         Qiblah(Angle::from_radians(term4).unwound().degrees)
     }
-    
+
     pub fn value(&self) -> f64 {
         self.0
     }
