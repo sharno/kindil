@@ -4,7 +4,7 @@
 // Copyright (c) 2019-2022 Farhan Ahmed. All rights reserved.
 //
 
-use chrono::{DateTime, Datelike, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 
 use crate::astronomy::ops;
 use crate::astronomy::unit::Stride;
@@ -190,54 +190,20 @@ impl SolarTime {
         self.time_for_solar_angle(angle, true)
     }
 
+    /// `value` hours after the start of `date`'s day (UTC), to the nearest
+    /// minute. kindil's patch: counted from midnight, so a time that rounds
+    /// to 24:00 is the next day's 00:00 and any number of hours either way
+    /// is a time (salah 0.7.6 built it from hour and minute fields, and
+    /// panicked on 24:00, from 23:59:30 UTC on: sunset in Toronto in April).
+    /// None for no time at all, NaN: an angle the sun never reaches.
     fn setting_hour(value: f64, date: &DateTime<Utc>) -> Option<DateTime<Utc>> {
-        if value.is_finite() {
-            let calculated_hours = value.floor();
-            let calculated_minutes = ((value - calculated_hours) * 60.0).floor();
-            let calculated_seconds =
-                ((value - (calculated_hours + calculated_minutes / 60.0)) * 60.0 * 60.0).floor();
-
-            let (adjusted_hour, adjusted_date) =
-                SolarTime::hour_adjustment(calculated_hours, &date);
-
-            // Round to the nearest minute
-            let adjusted_mins = (calculated_minutes + calculated_seconds / 60.0).round() as u32;
-            let adjusted_secs: u32 = 0;
-
-            let (hour, mins, secs) = if adjusted_mins > 59 {
-                (adjusted_hour + 1, 0, adjusted_secs)
-            } else {
-                (adjusted_hour, adjusted_mins, adjusted_secs)
-            };
-
-            let adjusted = Utc
-                .with_ymd_and_hms(
-                    adjusted_date.year(),
-                    adjusted_date.month(),
-                    adjusted_date.day(),
-                    hour,
-                    mins,
-                    secs,
-                )
-                .single();
-
-            adjusted
-        } else {
-            None
+        if !value.is_finite() {
+            return None;
         }
-    }
-
-    fn hour_adjustment(calculated_hours: f64, date: &DateTime<Utc>) -> (u32, DateTime<Utc>) {
-        // Adjust the hour to be within 0..=23,
-        // wrapping around as needed; otherwise
-        // chrono method will panic.
-        if calculated_hours < 0.0 {
-            ((calculated_hours + 24.0) as u32, date.yesterday())
-        } else if calculated_hours >= 24.0 {
-            ((calculated_hours - 24.0) as u32, date.tomorrow())
-        } else {
-            (calculated_hours as u32, date.clone())
-        }
+        // Whole seconds, then to the nearest minute, as 0.7.6 rounded.
+        let seconds = (value * 3600.0).floor() as i64;
+        let midnight = date.date_naive().and_hms_opt(0, 0, 0)?.and_utc();
+        midnight.checked_add_signed(Duration::minutes((seconds + 30).div_euclid(60)))
     }
 }
 

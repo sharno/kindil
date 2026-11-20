@@ -284,6 +284,23 @@ mod tests {
         assert_eq!(local(Salah::Isha), "22 01:42");
     }
 
+    /// salah 0.7.6 built each time from hour and minute fields: one that
+    /// rounded up to 24:00 UTC (from 23:59:30) was no time, and a panic.
+    /// In Toronto that was sunset on 2026-04-14 (19:59:3x EDT), which salah
+    /// works out for the three days before too (their next days' nights):
+    /// kindil aborted on 2026-04-11 to 14, and again on 08-25 to 28.
+    #[test]
+    fn a_time_rounding_up_to_midnight_utc_is_the_next_days_first_minute() {
+        let (location, config) = place(43.65, -79.38, "America/Toronto", "north_america");
+        let day = |d| {
+            let date = NaiveDate::from_ymd_opt(2026, 4, d).unwrap();
+            DayTimes::compute(&location, &config, date)
+        };
+        let midnight = Utc.with_ymd_and_hms(2026, 4, 15, 0, 0, 0).unwrap();
+        assert_eq!(day(14).unwrap().at(Salah::Maghrib), midnight);
+        assert!((11..14).all(|d| day(d).is_ok()));
+    }
+
     /// Where the sun doesn't set (or rise) there are no times: an error,
     /// not a panic.
     #[test]
