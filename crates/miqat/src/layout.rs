@@ -728,9 +728,12 @@ pub fn format_time(t: DateTime<Utc>, tz: Tz, clock: ClockFormat) -> String {
     }
 }
 
-/// Whole minutes remaining, rounded up so "in 1m" shows until the moment arrives.
+/// Whole minutes remaining, rounded up so "in 1m" shows until the moment
+/// arrives: any part of a minute counts, a fraction of a second included.
 fn countdown(now: DateTime<Utc>, at: DateTime<Utc>) -> String {
-    let minutes = (at - now).num_seconds().max(0).unsigned_abs().div_ceil(60);
+    let left = (at - now).max(Duration::zero());
+    let whole = left.num_minutes();
+    let minutes = whole + i64::from(left > Duration::minutes(whole));
     match (minutes / 60, minutes % 60) {
         (0, m) => format!("in {m}m"),
         (h, 0) => format!("in {h}h"),
@@ -960,6 +963,11 @@ mod tests {
         );
         assert_eq!(countdown(t(12, 0), t(13, 0)), "in 1h");
         assert_eq!(countdown(t(12, 0), t(14, 5)), "in 2h 5m");
+        // A minute and a fraction of a second: two.
+        let at = t(12, 2);
+        assert_eq!(countdown(at - Duration::milliseconds(60_213), at), "in 2m");
+        assert_eq!(countdown(at - Duration::seconds(60), at), "in 1m");
+        assert_eq!(countdown(at + Duration::seconds(1), at), "in 0m");
     }
 
     #[test]
