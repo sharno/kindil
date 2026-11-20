@@ -1508,6 +1508,42 @@ fn ignored_ssh_keys_are_not_offered_again() {
     assert!(host.own_ssh().new_on_usb.is_empty());
 }
 
+/// An hour held awake by SSH sessions (2026-11-20 on the device, 19:11 to
+/// 20:12, showed no wake): each minute still wakes and turns the clock,
+/// without a nap, until the last session closes.
+#[test]
+fn an_hour_held_awake_by_ssh_turns_the_clock_each_minute() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static CLOCK: AtomicI64 = AtomicI64::new(1_795_396_261); // 19:11:01 UTC
+    let host = Arc::new(Simulated::default());
+    let f = Fixture::with_clock(host.clone(), || {
+        chrono::DateTime::from_timestamp(CLOCK.load(Ordering::Relaxed), 0).unwrap()
+    });
+    // A connection at a time, each for 10 minutes (one holds at most 30).
+    let session = |minute: u16| Session {
+        local_port: 2222,
+        remote: format!("192.168.1.5:{}", 50_000 + minute / 10)
+            .parse()
+            .unwrap(),
+    };
+    host.set_ssh_sessions(vec![session(0)]);
+    f.app.device_event(Event::Doze);
+    let mut shown = Vec::new();
+    for minute in 0..61 {
+        host.set_ssh_sessions(vec![session(minute)]);
+        // The minute's wake, then its redraw's end: a hold, no nap.
+        (0..2).for_each(|_| f.app.fire_timers());
+        assert_eq!(host.naps(), 0, "minute {minute}: held awake");
+        shown.push(f.k().get_clock().to_string());
+        CLOCK.fetch_add(60, Ordering::Relaxed);
+    }
+    shown.dedup();
+    assert_eq!(shown.len(), 61, "the clock turned each minute: {shown:?}");
+    host.set_ssh_sessions(Vec::new());
+    f.app.fire_timers();
+    assert_eq!(host.naps(), 1, "closed: napping again");
+}
+
 #[test]
 fn a_dozing_app_keeps_napping_and_turning_its_clock_after_the_clock_steps_back() {
     use std::sync::atomic::{AtomicI64, Ordering};
