@@ -63,7 +63,7 @@ someone nearby to press the power button, or must end on their own first.
 | `view.rs` | Pure domain → display text (units, wording) |
 | `host.rs` | The `Host` trait the UI uses, and the `Simulated` device |
 | `kindle.rs` | `Host` on the device: battery, charger and front light drivers, power button, volumd's events or kindil's USB drive mode, USBNetwork |
-| `power.rs` | powerd's rules kept by kindil: charging temperatures, critical battery |
+| `power.rs` | powerd's rules kept by kindil: charging temperatures, critical battery; and the charger driver's stop at full and restart at 95% (`govern_charging`, see docs/CHARGING-TEST.md) |
 | `gauge.rs` | The fuel gauge read from the chip through the driver's register window, not its cached files |
 | `wifi.rs` | wpa_supplicant control socket, typed SSID/passphrase |
 | `net.rs` | Wi-Fi run by kindil: driver, supervised wpa_supplicant and udhcpc (or kindil's own DHCP client) |

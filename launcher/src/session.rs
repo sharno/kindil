@@ -820,8 +820,10 @@ mod lifecycle {
             // Amazon's UI is an empty screen. `launcher boot` sets the flag
             // again after a boot kindil stays up.
             let _ = std::fs::remove_file(&paths.skip);
-            // kindil may have paused charging for the temperature
-            // (src/power.rs); powerd, back now, keeps its own range.
+            // kindil may have held charging off, for the temperature or at
+            // full (src/power.rs), and a crash leaves it so: powerd, back
+            // now, keeps its own range, and the charger driver its own end
+            // of charge, which a `0` left in the switch would keep off.
             let _ = std::fs::write(&paths.charger, "1");
             if !os.running("powerd") {
                 os.start("powerd");

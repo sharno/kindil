@@ -184,6 +184,9 @@ fn kindle(cli: &Cli) -> anyhow::Result<Exit> {
     app.shutdown();
     // Its SSH server goes with it, and its port is shut.
     kindil::ssh::stop();
+    // Never left holding the charger off (a crash is caught by the next
+    // start, or the launcher, src/power.rs).
+    kindil::kindle::release_charging();
     Ok(app.exit())
 }
 
