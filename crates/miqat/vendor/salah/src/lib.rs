@@ -23,6 +23,10 @@
 //!                       .calculate();
 //! ```
 
+// Vendored (PATCHED.md): linted as salah's, not as kindil's code; a path
+// dependency's lints would otherwise fail kindil's `clippy -D warnings`.
+#![allow(clippy::all)]
+
 mod astronomy;
 mod models;
 mod schedule;
