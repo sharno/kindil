@@ -229,6 +229,22 @@ against them: see [Formal models](DEVELOP.md#formal-models).
     the driver's own). It only reads; should that fail, it says so in the
     log once and uses the driver's files until it works again.
     `kindil gauge [--every SECS]` prints the two side by side.
+    While dozing, the chip's charge runs low by about 11 mAh an hour
+    that the cell never gave: 2 s after each resume, the driver
+    subtracts from the chip's charge (NAC) what it supposes the suspend
+    drew, 765 µA for the suspend's length rounded *up* to whole hours,
+    and writes it back (`battery_handle_update_nac`, "Battery: Resume -
+    PostUpdate" in the kernel log). A wake back asleep within those 2 s
+    (a minute tick) cancels it; each full redraw and online wake (about
+    16 an hour) lets it take 4 counts, 0.71 mAh, as if it followed an
+    hour's sleep. Measured on 2026-11-19/20: 56-64 of the 87-92 counts
+    the chip lost each hour were these, so doze really draws about 5 mAh
+    an hour, not 16; a 60-minute suspend alone moved the chip's charge by
+    nothing at all (its current stayed under the chip's dead band: NOACT
+    in FLAGS). So the percentage falls about three times too fast while
+    dozing (12% at 3.94 V), until a full charge sets it right again. The
+    doze ledger and "doze drew" lines count the chip's charge as it is,
+    these subtractions included.
   - **Crash restart**: the launcher restarts kindil after a crash. After 3
     crashes within 5 minutes it runs the previous version (kept by the last
     update), and after 3 more it returns to Amazon's UI.
