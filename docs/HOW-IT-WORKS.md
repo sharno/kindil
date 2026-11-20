@@ -156,8 +156,36 @@ against them: see [Formal models](DEVELOP.md#formal-models).
     says it is connected, so a wake waits up to 10 s for either and
     otherwise sleeps on with the screen untouched; with a charger already
     in, it doesn't sleep at all.
-  - **Charging**: the charger charges by itself; kindil pauses it outside
-    32-113 °F, powerd's range, and resumes 3 °F back inside.
+  - **Charging**: the charger charges by itself; kindil decides when it
+    stops, through the charger driver's `charging` switch (`0` stops it, `1`
+    sets the charge current again). Its driver (Amazon's
+    `aplite_charger.c`) stops at full (100% and under 55 mA of charging
+    current) and is meant to start again at 95%, but runs that rule only
+    while its work is scheduled, on the battery driver's cached readings:
+    each suspend cancels the work and only a charger plug event schedules
+    it again, so a dozing Kindle left on a charger stopped at 100% and ran
+    down on it (90% and discharging, plugged in all night, on 0.17.0).
+    kindil now keeps the rule itself, at every reading of the gauge chip
+    (each minute awake, each full redraw of a doze, every 5 minutes, and
+    the 6-hourly check of a sleep; no wake of its own), in one policy
+    (src/power.rs): outside 32-113 °F, powerd's range, it pauses charging,
+    and resumes 3 °F back inside; this wins over the rest. On a charger it
+    stops at 100% under 55 mA and restarts at 95% or below. A charger the
+    driver stopped by itself (full, or its charge timer) that the chip
+    shows not charging at 95% or below gets `0` then `1`, at most once each
+    30 minutes until the chip shows it charging. Each change is logged with
+    the chip's percentage, current and temperature ("kindil: charging
+    stopped at full (100%, +41 mA, 75 °F)", "charging restarted at 95%");
+    the current's sign is the chip's charging flag (FLAGS bit 7), not yet
+    confirmed on the device while charging. kindil never leaves the switch
+    off: an unplug while it holds it puts it back to `1` (the driver forgets
+    "full" on an unplug, but not a `0` written to the switch, which keeps
+    its own rule off), and so does leaving kindil; the launcher writes `1`
+    too as Amazon's UI comes back. A kindil that crashed holding it is
+    followed by one that finds the switch off on a charger, and holds it as
+    full until 95%. A charger replugged between two readings switches
+    charging on again, which kindil sees, and its rule goes on from there.
+    To test on the device: [CHARGING-TEST.md](CHARGING-TEST.md).
   - **Battery gauge**: the PW1's fuel gauge is a TI bq27000-family chip
     (bq27200's registers) on I2C, run by Lab126's `yoshi_battery` driver.
     The driver's files (`battery_capacity`, `battery_mAH`,

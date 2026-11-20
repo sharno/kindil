@@ -24,13 +24,18 @@ use std::time::Duration;
 const WIFI_START: Duration = Duration::from_secs(180);
 /// How long the start's clock sync waits for Wi-Fi to have an address.
 const CLOCK_SYNC_WAIT: Duration = Duration::from_secs(120);
-/// `1` while the charger may charge; writing `0` pauses it (src/power.rs).
+/// The charger driver's switch: writing `0` stops charging (and the driver's
+/// own end of charge with it), `1` sets the charge current again
+/// (src/power.rs). Reads `1` while plugged in and charging or stopped full
+/// by the driver.
 const CHARGER: &str = "/sys/devices/platform/aplite_charger.0/charging";
 /// `1` while a charger is plugged in.
 const CHARGER_CONNECTED: &str = "/sys/devices/platform/aplite_charger.0/connected";
-/// Whether kindil paused charging for the temperature (src/power.rs); only
-/// a pause of kindil's own is ever lifted.
-static CHARGING_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// What kindil holds the charger off for, if anything (src/power.rs).
+static CHARGING: Mutex<crate::power::Charging> = Mutex::new(crate::power::Charging {
+    held: None,
+    restarted: None,
+});
 /// USBNetwork toggles dropbear when configured with USE_WIFI_SSHD_ONLY.
 const USBNET_TOGGLE: &str = "/mnt/us/usbnet/bin/usbnetwork";
 const USBNET_AT_BOOT: &str = "/mnt/us/usbnet/auto";
@@ -108,24 +113,69 @@ fn plugged_from(read: std::io::Result<String>) -> anyhow::Result<bool> {
     }
 }
 
-/// powerd's charging temperature range, kept by kindil: pauses the charger
-/// outside it, and lifts a pause of its own once well inside again.
-fn guard_charging(gauge: &crate::gauge::Cached) -> anyhow::Result<()> {
-    use std::sync::atomic::Ordering;
-    let paused = CHARGING_PAUSED.load(Ordering::Relaxed);
-    let temperature = gauge
-        .temperature
-        .ok_or_else(|| anyhow::anyhow!("no temperature from the gauge"))?;
-    let pause = plugged()? && crate::power::pause_charging(temperature, paused);
-    if pause != paused {
-        std::fs::write(CHARGER, if pause { "0" } else { "1" })?;
-        CHARGING_PAUSED.store(pause, Ordering::Relaxed);
-        crate::log!(
-            "kindil: charging {} at {temperature} °F",
-            if pause { "paused" } else { "resumed" }
-        );
+/// kindil's charging policy (src/power.rs) on one reading of the gauge:
+/// powerd's temperature range, and the charger driver's stop at full and
+/// restart at 95%, which the driver itself doesn't keep while dozing. Runs
+/// wherever the gauge is read anyway: no wake of its own.
+fn govern_charging(gauge: &crate::gauge::Cached) -> anyhow::Result<()> {
+    use crate::power::{Change, Hold};
+    let missing = |what: &str| anyhow::anyhow!("no {what} from the gauge");
+    let percent = gauge.percent.ok_or_else(|| missing("state of charge"))?;
+    let current = gauge.current.ok_or_else(|| missing("current"))?;
+    let temperature_f = gauge.temperature.ok_or_else(|| missing("temperature"))?;
+    // Held while the switch is read, decided on and written: readings come
+    // from more than one thread.
+    let mut state = lock(&CHARGING);
+    let plugged = plugged()?;
+    let seen = crate::power::Seen {
+        plugged,
+        // Unplugged, the switch always reads 0.
+        enabled: plugged && std::fs::read_to_string(CHARGER)?.trim() == "1",
+        percent,
+        current,
+        temperature_f,
+    };
+    let (next, change) = crate::power::govern_charging(*state, seen, epoch_seconds());
+    let Some(change) = change else {
+        *state = next;
+        return Ok(());
+    };
+    // The current's sign is the chip's charging flag (FLAGS bit 7), not yet
+    // seen to be right while charging: in the log as evidence.
+    let at = format!("{percent}%, {current:+} mA, {temperature_f} °F");
+    let (writes, line): (&[&str], String) = match change {
+        Change::Stop(Hold::Full) => (&["0"], format!("charging stopped at full ({at})")),
+        Change::Stop(Hold::Temperature) => (&["0"], format!("charging paused ({at})")),
+        Change::Resume(Hold::Temperature) => (&["1"], format!("charging resumed ({at})")),
+        Change::Resume(Hold::Full) => (&["1"], format!("charging restarted at {percent}% ({at})")),
+        Change::Restart => (
+            &["0", "1"],
+            format!("charging restarted at {percent}%: stopped on a charger ({at})"),
+        ),
+        Change::Release => (&["1"], "charger unplugged; charging switch back on".into()),
+        Change::Adopted => (&[], format!("charging found off; held until 95% ({at})")),
+    };
+    for value in writes {
+        std::fs::write(CHARGER, value)?;
     }
+    *state = next;
+    crate::log!("kindil: {line}");
     Ok(())
+}
+
+/// On the way out: a charger switch kindil holds off goes back on, so
+/// neither Amazon's powerd nor the driver's own end of charge finds it off
+/// (the driver leaves charging alone while a `0` written to it stands). The
+/// launcher writes `1` too, as it hands back to Amazon's UI.
+pub fn release_charging() {
+    let mut state = lock(&CHARGING);
+    if state.held.is_some() {
+        match std::fs::write(CHARGER, "1") {
+            Ok(()) => crate::log!("kindil: charging switch back on for the driver"),
+            Err(error) => crate::log!("kindil: charging switch: {error}"),
+        }
+    }
+    *state = crate::power::Charging::default();
 }
 
 impl Host for KindleHost {
@@ -335,11 +385,12 @@ impl Host for KindleHost {
     }
 
     fn info(&self) -> DeviceInfo {
-        // Read each minute and each doze wake: the charging guard rides
-        // along. One reading of the chip for all of it.
+        // Read each minute awake and at each doze wake that draws in full
+        // (every 5 minutes): the charging policy rides along. One reading
+        // of the chip for all of it.
         let gauge = crate::gauge::now();
-        if let Err(error) = guard_charging(&gauge) {
-            crate::log!("kindil: charging guard: {error}");
+        if let Err(error) = govern_charging(&gauge) {
+            crate::log!("kindil: charging: {error:#}");
         }
         DeviceInfo {
             battery: gauge_battery(&gauge)
@@ -505,9 +556,14 @@ impl crate::power::Sleeper for Sleeping<'_> {
         epoch_seconds()
     }
     /// The chip now: the driver's cache wasn't refreshed in the hours
-    /// asleep.
+    /// asleep. The charging policy rides along: a sleep on a charger
+    /// restarts charging at 95% at its 6-hourly check.
     fn battery(&self) -> anyhow::Result<Battery> {
-        gauge_battery(&crate::gauge::now())
+        let gauge = crate::gauge::now();
+        if let Err(error) = govern_charging(&gauge) {
+            self.recorder.note(&format!("sleep: charging: {error:#}"));
+        }
+        gauge_battery(&gauge)
     }
     fn wait(&self, time: Duration) {
         std::thread::sleep(time);

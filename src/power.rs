@@ -1,6 +1,8 @@
 //! What Amazon's powerd did besides reading the battery, which kindil now
 //! does itself while it runs: charging only at temperatures safe for the
-//! cell, and powering off before the battery is spent.
+//! cell, and powering off before the battery is spent; and the charger
+//! driver's stop at full and restart at 95%, which the driver doesn't keep
+//! up while the Kindle dozes ([`govern_charging`]).
 //!
 //! The charger charges on its own (verified: it keeps charging with powerd
 //! stopped); powerd only paused it outside its temperature range, through
@@ -31,6 +33,141 @@ pub fn pause_charging(temperature_f: i32, paused: bool) -> bool {
     let near_limit =
         !(CHARGE_MIN_F + CHARGE_MARGIN_F..=CHARGE_MAX_F - CHARGE_MARGIN_F).contains(&temperature_f);
     outside || (paused && near_limit)
+}
+
+/// The charger driver's end of charge (Amazon's GPL
+/// arch/arm/mach-mx5/aplite_charger.c, `charger_loop`): full at 100% with
+/// the charging current under [`EOC_MILLIAMPS`], charging again at
+/// [`RESTART_PERCENT`] or below. The driver runs that rule on its own cached
+/// gauge values, and only while its work is scheduled: each suspend cancels
+/// the work, and only a charger event schedules it again, so a dozing
+/// Kindle stops at full and may never restart. kindil runs the same rule on
+/// the chip's values (src/gauge.rs) at each of its readings instead.
+pub const FULL_PERCENT: u8 = 100;
+/// `EOC_BATTERY_CURRENT`.
+pub const EOC_MILLIAMPS: i32 = 55;
+/// `RESTART_BATTERY_CAPACITY`.
+pub const RESTART_PERCENT: u8 = 95;
+/// After a restart of a charger kindil didn't stop, how long before it
+/// tries again while the chip still says it isn't charging.
+pub const RESTART_RETRY: Duration = Duration::from_secs(30 * 60);
+
+/// Why kindil holds the charger off (its `charging` switch at `0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hold {
+    /// Full: until [`RESTART_PERCENT`].
+    Full,
+    /// Outside powerd's temperature range: until well inside it again.
+    Temperature,
+}
+
+/// What kindil remembers of the charger between readings. Its memory is
+/// checked against the switch at each one: a crashed kindil's successor,
+/// or the driver re-enabling charging on a replug, is seen there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Charging {
+    pub held: Option<Hold>,
+    /// When kindil last restarted a charger that had stopped on its own,
+    /// in seconds since the epoch.
+    pub restarted: Option<i64>,
+}
+
+/// One reading: the charger driver's and the gauge chip's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seen {
+    /// `connected` reads 1.
+    pub plugged: bool,
+    /// The `charging` switch reads 1: plugged in and either charging or
+    /// stopped full by the driver itself. Plugged in, it reads 0 only after
+    /// a `0` was written to it (kindil's, or powerd's before it).
+    pub enabled: bool,
+    pub percent: u8,
+    /// mA, positive while the chip's FLAGS say charging.
+    pub current: i32,
+    pub temperature_f: i32,
+}
+
+/// What to do with the charger's `charging` switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// Write `0`.
+    Stop(Hold),
+    /// Write `1`: the hold is over.
+    Resume(Hold),
+    /// Write `0`, then `1`: plugged in, the chip says not charging at
+    /// [`RESTART_PERCENT`] or below, and kindil holds nothing. The driver
+    /// stopped by itself (full, or its charge timer); `0` clears its
+    /// full flag and timer count, `1` sets the charge current anew.
+    Restart,
+    /// Write `1`: unplugged while kindil held the charger off. The driver
+    /// forgets "full" on an unplug but not a `0` written to the switch,
+    /// which would keep its own end of charge off after the next plug-in.
+    Release,
+    /// Nothing to write: the switch was found off with no hold of kindil's
+    /// (a previous kindil's, or powerd's): held as if full.
+    Adopted,
+}
+
+/// kindil's charging policy, one reading at a time: powerd's temperature
+/// range ([`pause_charging`]) first, then the driver's end of charge and
+/// restart ([`FULL_PERCENT`], [`RESTART_PERCENT`]). Pure, so every reading
+/// can be played back in a test; src/kindle.rs writes the switch.
+pub fn govern_charging(state: Charging, seen: Seen, now: i64) -> (Charging, Option<Change>) {
+    if !seen.plugged {
+        // The driver resets itself on the plug events; kindil starts over.
+        return (Charging::default(), state.held.map(|_| Change::Release));
+    }
+    let mut next = state;
+    if seen.current > 0 {
+        // Charging, by the chip: a restart worked, or wasn't needed.
+        next.restarted = None;
+    }
+    let off = !seen.enabled;
+    let mut adopted = false;
+    match (next.held, off) {
+        // On again under kindil's hold: replugged meanwhile, which sets the
+        // charge current; the driver's own rule is off while a `0` written
+        // to the switch stands, so kindil's applies.
+        (Some(_), false) => next.held = None,
+        (None, true) => {
+            next.held = Some(Hold::Full);
+            adopted = true;
+        }
+        _ => {}
+    }
+    let pause = pause_charging(seen.temperature_f, next.held == Some(Hold::Temperature));
+    let change = match next.held {
+        Some(Hold::Temperature) if pause => None,
+        Some(Hold::Temperature) => {
+            next.held = None;
+            Some(Change::Resume(Hold::Temperature))
+        }
+        _ if pause => {
+            next.held = Some(Hold::Temperature);
+            Some(Change::Stop(Hold::Temperature))
+        }
+        Some(Hold::Full) if seen.percent <= RESTART_PERCENT => {
+            next.held = None;
+            Some(Change::Resume(Hold::Full))
+        }
+        Some(Hold::Full) => None,
+        None if seen.percent >= FULL_PERCENT && (1..EOC_MILLIAMPS).contains(&seen.current) => {
+            next.held = Some(Hold::Full);
+            Some(Change::Stop(Hold::Full))
+        }
+        None if seen.percent <= RESTART_PERCENT
+            && seen.current <= 0
+            && next.restarted.is_none_or(|at| {
+                // A clock stepped back counts as time enough.
+                now < at || now - at >= RESTART_RETRY.as_secs() as i64
+            }) =>
+        {
+            next.restarted = Some(now);
+            Some(Change::Restart)
+        }
+        None => None,
+    };
+    (next, change.or(adopted.then_some(Change::Adopted)))
 }
 
 pub fn critical(battery: Battery) -> bool {
@@ -261,6 +398,225 @@ mod tests {
         assert!(!pause_charging(CHARGE_MAX_F - CHARGE_MARGIN_F, true));
         assert!(pause_charging(CHARGE_MIN_F + 2, true));
         assert!(!pause_charging(CHARGE_MIN_F + CHARGE_MARGIN_F, true));
+    }
+
+    /// A charger in, the switch on, 77 °F.
+    fn seen(percent: u8, current: i32) -> Seen {
+        Seen {
+            plugged: true,
+            enabled: true,
+            percent,
+            current,
+            temperature_f: 77,
+        }
+    }
+
+    /// Plays `readings` through the policy from `state`, with the switch as
+    /// the driver would show it after each write (and `seen`'s otherwise);
+    /// returns the changes and the state.
+    fn play(state: Charging, readings: &[(i64, Seen)]) -> (Vec<Option<Change>>, Charging) {
+        let mut state = state;
+        let mut switch: Option<bool> = None;
+        let mut changes = Vec::new();
+        for &(now, reading) in readings {
+            let reading = Seen {
+                enabled: switch.unwrap_or(reading.enabled) && reading.plugged,
+                ..reading
+            };
+            let (next, change) = govern_charging(state, reading, now);
+            switch = match change {
+                Some(Change::Stop(_)) => Some(false),
+                Some(Change::Resume(_) | Change::Restart | Change::Release) => Some(true),
+                Some(Change::Adopted) | None => switch,
+            };
+            if !reading.plugged {
+                switch = None;
+            }
+            state = next;
+            changes.push(change);
+        }
+        (changes, state)
+    }
+
+    #[test]
+    fn charging_stops_at_full_and_restarts_at_95_percent() {
+        let (changes, state) = play(
+            Charging::default(),
+            &[
+                (0, seen(99, 120)),
+                (300, seen(100, 60)),
+                (600, seen(100, 40)),
+                // Stopped: the device runs on the cell.
+                (900, seen(100, -30)),
+                (1200, seen(96, -30)),
+                (1500, seen(95, -30)),
+                (1800, seen(96, 300)),
+            ],
+        );
+        assert_eq!(
+            changes,
+            [
+                None,
+                None,
+                Some(Change::Stop(Hold::Full)),
+                None,
+                None,
+                Some(Change::Resume(Hold::Full)),
+                None,
+            ]
+        );
+        assert_eq!(state, Charging::default());
+    }
+
+    #[test]
+    fn full_is_the_drivers_rule_a_current_under_55_ma_and_charging() {
+        let state = Charging::default();
+        let at = |percent, current| govern_charging(state, seen(percent, current), 0).1;
+        assert_eq!(at(100, 54), Some(Change::Stop(Hold::Full)));
+        assert_eq!(at(100, 1), Some(Change::Stop(Hold::Full)));
+        assert_eq!(at(100, 55), None, "still charging hard");
+        assert_eq!(at(100, 0), None, "not charging: the driver's `> 0`");
+        assert_eq!(at(100, -20), None);
+        assert_eq!(at(99, 20), None);
+    }
+
+    /// 2026-11-19, 05:04 UTC: on the charger all night, the chip at 90% and
+    /// discharging, `connected` 1: the driver had stopped at full and its
+    /// work, cancelled by every nap, never restarted it.
+    #[test]
+    fn a_charger_the_driver_stopped_is_restarted_at_95_percent() {
+        let (changes, state) = play(
+            Charging::default(),
+            &[
+                (0, seen(97, -25)),
+                (300, seen(90, -25)),
+                // Not charging yet: tried again only after RESTART_RETRY.
+                (600, seen(90, -25)),
+                (2100, seen(89, -25)),
+                (2400, seen(89, 400)),
+            ],
+        );
+        assert_eq!(
+            changes,
+            [
+                None,
+                Some(Change::Restart),
+                None,
+                Some(Change::Restart),
+                None
+            ]
+        );
+        assert_eq!(state, Charging::default(), "charging: nothing to retry");
+        // A clock stepped back doesn't hold the next try off.
+        let (_, change) = govern_charging(
+            Charging {
+                held: None,
+                restarted: Some(5_000),
+            },
+            seen(90, -25),
+            4_000,
+        );
+        assert_eq!(change, Some(Change::Restart));
+    }
+
+    #[test]
+    fn the_temperature_pause_wins_over_full_and_restart() {
+        let hot = |percent, current| Seen {
+            temperature_f: CHARGE_MAX_F + 1,
+            ..seen(percent, current)
+        };
+        let warm = |percent, current| Seen {
+            temperature_f: CHARGE_MAX_F - 1,
+            ..seen(percent, current)
+        };
+        let (changes, _) = play(
+            Charging::default(),
+            &[
+                (0, seen(100, 30)),
+                // Held for full, then too hot: held for the temperature.
+                (300, hot(100, -30)),
+                // Below 95%, but not cool enough yet.
+                (600, warm(90, -30)),
+                (900, seen(90, -30)),
+            ],
+        );
+        assert_eq!(
+            changes,
+            [
+                Some(Change::Stop(Hold::Full)),
+                Some(Change::Stop(Hold::Temperature)),
+                None,
+                Some(Change::Resume(Hold::Temperature)),
+            ]
+        );
+        // Too hot at 90% on a stopped charger: no restart, a pause.
+        let (_, change) = govern_charging(Charging::default(), hot(90, -30), 0);
+        assert_eq!(change, Some(Change::Stop(Hold::Temperature)));
+    }
+
+    #[test]
+    fn an_unplug_gives_the_switch_back_and_forgets() {
+        let unplugged = Seen {
+            plugged: false,
+            enabled: false,
+            ..seen(100, -30)
+        };
+        let (changes, state) = play(
+            Charging::default(),
+            &[(0, seen(100, 30)), (300, unplugged), (600, unplugged)],
+        );
+        assert_eq!(
+            changes,
+            [Some(Change::Stop(Hold::Full)), Some(Change::Release), None]
+        );
+        assert_eq!(state, Charging::default());
+        // Holding nothing, an unplug writes nothing.
+        assert_eq!(govern_charging(Charging::default(), unplugged, 0).1, None);
+    }
+
+    /// Unplugged and plugged in again between two readings (5 minutes
+    /// apart in a doze): the driver's plug-in sets the charge current, so
+    /// the switch reads 1 under kindil's hold, and kindil's rule goes on.
+    #[test]
+    fn a_replug_between_readings_ends_the_hold() {
+        let held = Charging {
+            held: Some(Hold::Full),
+            restarted: None,
+        };
+        assert_eq!(
+            govern_charging(held, seen(98, 300), 0),
+            (Charging::default(), None)
+        );
+        // At full again: stopped again.
+        assert_eq!(
+            govern_charging(held, seen(100, 40), 0).1,
+            Some(Change::Stop(Hold::Full))
+        );
+    }
+
+    /// The switch found off with no hold of kindil's: a kindil that crashed
+    /// while holding it, or powerd before the launcher stopped it.
+    #[test]
+    fn a_switch_found_off_is_held_as_full_until_95_percent() {
+        let off = |percent| Seen {
+            enabled: false,
+            ..seen(percent, -30)
+        };
+        let (state, change) = govern_charging(Charging::default(), off(99), 0);
+        assert_eq!(change, Some(Change::Adopted));
+        assert_eq!(state.held, Some(Hold::Full));
+        assert_eq!(
+            govern_charging(Charging::default(), off(80), 0).1,
+            Some(Change::Resume(Hold::Full))
+        );
+        let cold = Seen {
+            temperature_f: CHARGE_MIN_F - 1,
+            ..off(80)
+        };
+        assert_eq!(
+            govern_charging(Charging::default(), cold, 0).1,
+            Some(Change::Stop(Hold::Temperature))
+        );
     }
 
     #[test]
