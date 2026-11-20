@@ -191,6 +191,7 @@ pub mod tests {
             flag: t.join("BOOT"),
             skip: t.join("SKIP"),
             charger: t.join("charging"),
+            firmware_timeout: t.join("firmware-timeout"),
             wifi_pids: vec![],
             sshd_pid: t.join("sshd.pid"),
             pid_file: t.join("pid"),

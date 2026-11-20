@@ -66,6 +66,9 @@ pub struct Paths {
     pub skip: PathBuf,
     /// The charger's switch, which kindil may have left off.
     pub charger: PathBuf,
+    /// The kernel's firmware loading timeout, which kindil sets to 0
+    /// (src/firmware.rs).
+    pub firmware_timeout: PathBuf,
     /// The pid files of kindil's own Wi-Fi children (src/net.rs).
     pub wifi_pids: Vec<PathBuf>,
     /// The pid file of kindil's own SSH server (src/ssh.rs).
@@ -93,6 +96,7 @@ impl Default for Paths {
             flag: "/mnt/us/kindil/BOOT".into(),
             skip: "/mnt/us/DONT_START_FRAMEWORK".into(),
             charger: "/sys/devices/platform/aplite_charger.0/charging".into(),
+            firmware_timeout: "/sys/class/firmware/timeout".into(),
             wifi_pids: vec![
                 "/var/run/kindil-udhcpc.pid".into(),
                 "/var/run/kindil-wpa.pid".into(),

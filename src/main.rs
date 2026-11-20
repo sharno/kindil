@@ -54,6 +54,10 @@ enum Mode {
         #[arg(long, value_name = "SECS")]
         every: Option<u64>,
     },
+    /// Suspend once for SECONDS through doze's checked step (the wake alarm
+    /// armed and read back first), for device tests
+    #[cfg(feature = "kindle")]
+    Nap { seconds: u64 },
     /// Install the uploaded release bundle, rolling back unless it comes up
     /// (run on the Kindle by `cargo xtask release`)
     Install { id: String },
@@ -187,6 +191,8 @@ fn kindle(cli: &Cli) -> anyhow::Result<Exit> {
     // Never left holding the charger off (a crash is caught by the next
     // start, or the launcher, src/power.rs).
     kindil::kindle::release_charging();
+    // The kernel's firmware timeout back, for Amazon's Wi-Fi (src/firmware.rs).
+    let _ = kindil::firmware::restore(std::path::Path::new(kindil::firmware::TIMEOUT));
     Ok(app.exit())
 }
 
@@ -282,6 +288,8 @@ fn main() -> std::process::ExitCode {
         Mode::Kindle => kindle(&cli),
         Mode::Uevents { usb } => uevents(*usb).map(|()| Exit::Quit),
         Mode::Gauge { every } => gauge(*every).map(|()| Exit::Quit),
+        #[cfg(feature = "kindle")]
+        Mode::Nap { seconds } => kindil::kindle::test_nap(*seconds).map(|()| Exit::Quit),
         Mode::Install { id } => kindil::install::install(
             id,
             &kindil::install::Paths::default(),
