@@ -53,8 +53,10 @@ pub struct Board {
 
 impl Board {
     pub fn at(config: &miqat::config::Config, now: DateTime<Utc>) -> Option<Self> {
+        // The calendar date, which the weather's days follow; the prayer
+        // day changes only with the next prayer.
         let date = miqat::prayer::local_date(&config.location, now);
-        miqat::prayer::DayTimes::compute(&config.location, &config.prayer, date)
+        miqat::prayer::DayTimes::current(&config.location, &config.prayer, now)
             .ok()
             .map(|prayers| Self {
                 date,
@@ -89,8 +91,7 @@ pub fn render(
     now: DateTime<Utc>,
     sources: &miqat::sources::Sources,
 ) -> anyhow::Result<Gray> {
-    let date = miqat::prayer::local_date(&config.location, now);
-    let prayers = miqat::prayer::DayTimes::compute(&config.location, &config.prayer, date)?;
+    let prayers = miqat::prayer::DayTimes::current(&config.location, &config.prayer, now)?;
     renderer.gray(&miqat::layout::Frame {
         now,
         config,
@@ -108,8 +109,7 @@ pub fn render_header(
     config: &miqat::config::Config,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Gray> {
-    let date = miqat::prayer::local_date(&config.location, now);
-    let prayers = miqat::prayer::DayTimes::compute(&config.location, &config.prayer, date)?;
+    let prayers = miqat::prayer::DayTimes::current(&config.location, &config.prayer, now)?;
     let header = renderer.header_gray(&miqat::layout::Frame {
         now,
         config,
@@ -198,8 +198,7 @@ fn frame_with(
     weather: miqat::weather::Weather,
     radar: Option<&miqat::sources::Snapshot<miqat::radar::RadarImage>>,
 ) -> anyhow::Result<miqat::image::Gray> {
-    let date = miqat::prayer::local_date(&config.location, now);
-    let prayers = miqat::prayer::DayTimes::compute(&config.location, &config.prayer, date)?;
+    let prayers = miqat::prayer::DayTimes::current(&config.location, &config.prayer, now)?;
     let snapshot = miqat::sources::Snapshot {
         data: weather,
         fetched_at: now,

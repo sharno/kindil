@@ -1037,6 +1037,50 @@ mod tests {
         );
     }
 
+    /// Any moment, anywhere: the header names the next prayer (as every
+    /// solar day around it says, Jumu'ah on Fridays) and counts the whole
+    /// minutes to it, rounded up.
+    #[test]
+    fn the_header_counts_down_to_the_next_prayer() {
+        use crate::prayer::oracle;
+        for index in 0..oracle::PLACES.len() {
+            let config = oracle::place(index);
+            let mut random = oracle::Random(index as u64 + 100);
+            for second in oracle::moments(index as u64 + 50, 400) {
+                // Anywhere in the second, its end included.
+                let now = second + Duration::milliseconds(random.below(1_000) as i64);
+                let (salah, at, weekday) = oracle::next(&config.location, &config.prayer, now);
+                let prayers = DayTimes::current(&config.location, &config.prayer, now).unwrap();
+                let header = header_svg(&Frame {
+                    now,
+                    config: &config,
+                    prayers: &prayers,
+                    weather: None,
+                    radar: None,
+                    page: Page::below(56),
+                });
+                let left = (at - now).num_milliseconds();
+                let minutes = (left + 59_999) / 60_000;
+                let remaining = match (minutes / 60, minutes % 60) {
+                    (0, m) => format!("{m}m"),
+                    (h, 0) => format!("{h}h"),
+                    (h, m) => format!("{h}h {m}m"),
+                };
+                let (english, arabic) = salah.names(weekday);
+                for shown in [
+                    format!(">{remaining}</tspan>"),
+                    format!(">{english}</text>"),
+                    format!(">{arabic}</text>"),
+                ] {
+                    assert!(
+                        header.contains(&shown),
+                        "{now}, {left} ms to {at}: {shown}\n{header}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn countdown_hero_shrinks_the_prefix_and_grows_the_numbers() {
         let hero = countdown_hero(379.0, 268.0, "in 9h 52m");
