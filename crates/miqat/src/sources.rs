@@ -25,6 +25,10 @@ fn is_due<T>(snapshot: &Option<Snapshot<T>>, now: DateTime<Utc>, every: Duration
         .is_none_or(|s| now - s.fetched_at >= every || now < s.fetched_at)
 }
 
+/// Cheap enough to clone (an agent, a basemap and a radar frame of
+/// [`layout::RADAR_SIZE`]): a host can fetch on a copy while it draws with
+/// the original.
+#[derive(Clone)]
 pub struct Sources {
     agent: ureq::Agent,
     radar: RadarClient,
@@ -34,6 +38,7 @@ pub struct Sources {
 }
 
 /// Radar needs the static basemap first; it is fetched once per process.
+#[derive(Clone)]
 enum RadarState {
     NoBasemap,
     Ready {
@@ -71,6 +76,21 @@ impl Sources {
         }
     }
 
+    /// Whether [`Self::refresh`] at `now` would fetch anything.
+    pub fn due(&self, now: DateTime<Utc>) -> bool {
+        let radar = match &self.radar_state {
+            RadarState::NoBasemap => true,
+            RadarState::Ready { latest, .. } => is_due(latest, now, RADAR_EVERY),
+        };
+        is_due(&self.weather, now, WEATHER_EVERY) || (self.rain_expected(now) && radar)
+    }
+
+    fn rain_expected(&self, now: DateTime<Utc>) -> bool {
+        self.weather
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.data.rain_expected(now))
+    }
+
     /// Refetches whatever is due. A failed fetch keeps the previous snapshot, so the
     /// dashboard shows aging data rather than nothing; it is retried on the next frame.
     pub fn refresh(&mut self, config: &Config, now: DateTime<Utc>) {
@@ -93,10 +113,7 @@ impl Sources {
                 Err(e) => eprintln!("weather: {e:#}"),
             }
         }
-        let rain = self
-            .weather
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.data.rain_expected(now));
+        let rain = self.rain_expected(now);
         let state = std::mem::replace(&mut self.radar_state, RadarState::NoBasemap);
         self.radar_state = if rain {
             self.refresh_radar(self.load_basemap(state), now)
@@ -157,5 +174,38 @@ mod tests {
         assert!(is_due(&fresh, now + Duration::minutes(10), WEATHER_EVERY));
         // The clock set back past the fetch: refetched, not kept for a day.
         assert!(is_due(&fresh, now - Duration::minutes(10), WEATHER_EVERY));
+    }
+
+    #[test]
+    fn due_when_refresh_would_fetch() {
+        let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        let mut sources = Sources::new(&config);
+        let mut weather = crate::weather::decode(
+            include_str!("../tests/fixtures/open-meteo.json"),
+            config.location.timezone,
+        )
+        .unwrap();
+        let now = weather.hours[0].at;
+        assert!(sources.due(now), "no weather yet");
+        weather
+            .quarters
+            .iter_mut()
+            .for_each(|q| q.precipitation_mm = 0.0);
+        sources.weather = Some(Snapshot {
+            data: weather.clone(),
+            fetched_at: now,
+        });
+        assert!(!sources.due(now), "fresh, and no rain: no radar");
+        assert!(sources.due(now + WEATHER_EVERY));
+        // Rain on the way: the radar, and first its basemap.
+        weather
+            .quarters
+            .iter_mut()
+            .for_each(|q| q.precipitation_mm = crate::weather::WET_MM);
+        sources.weather = Some(Snapshot {
+            data: weather,
+            fetched_at: now,
+        });
+        assert!(sources.due(now));
     }
 }
