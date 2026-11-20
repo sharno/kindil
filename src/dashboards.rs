@@ -228,7 +228,7 @@ pub fn preview_header(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeDelta;
+    use chrono::{Datelike, TimeDelta};
 
     fn config() -> miqat::config::Config {
         toml::from_str(include_str!("../examples/miqat.toml")).unwrap()
@@ -304,6 +304,123 @@ mod tests {
             body: shown.body,
         };
         assert_eq!(patched, Split::of(preview(&config, minute).unwrap()));
+    }
+
+    /// The countdown and the prayer a header shows at `now`, as minutes.
+    fn header_says(config: &miqat::config::Config, now: DateTime<Utc>) -> (String, i64) {
+        let prayers =
+            miqat::prayer::DayTimes::current(&config.location, &config.prayer, now).unwrap();
+        let svg = miqat::layout::header_svg(&miqat::layout::Frame {
+            now,
+            config,
+            prayers: &prayers,
+            weather: None,
+            radar: None,
+            page: PAGE,
+        });
+        let (english, _) = prayers.upcoming(now).prayer.names(prayers.date.weekday());
+        assert!(svg.contains(&format!(">{english}</text>")));
+        let hero = r##"font-size="150" font-weight="700" fill="#000">"##;
+        let rest = svg
+            .split(hero)
+            .nth(1)
+            .unwrap()
+            .split("</tspan>")
+            .next()
+            .unwrap();
+        let minutes = rest
+            .split(' ')
+            .map(|part| match part.split_at(part.len() - 1) {
+                (h, "h") => h.parse::<i64>().unwrap() * 60,
+                (m, "m") => m.parse::<i64>().unwrap(),
+                other => panic!("{other:?} in {rest}"),
+            })
+            .sum();
+        (english.to_owned(), minutes)
+    }
+
+    /// Dozing through an evening in Toronto, on a clock that resumes up to
+    /// a second off each nap (put back within the RTC's second) and starts
+    /// 724 s slow until the first online wake's sync: from that sync on,
+    /// whatever is on the panel at any second names the next prayer and
+    /// counts no more than a minute more than is left (the frame stays up
+    /// to a minute), never less; but from the moment a prayer comes to the
+    /// next wake, that prayer "in 1m" or less.
+    #[test]
+    fn a_dozing_panel_counts_down_within_its_minute() {
+        use crate::system::{next_redraw, Redraw, Schedule, Window};
+        use miqat::prayer::DayTimes;
+        let config: miqat::config::Config = toml::from_str(
+            "[location]\nlatitude = 43.65\nlongitude = -79.38\n\
+             timezone = \"America/Toronto\"\n[prayer]\nmethod = \"north_america\"\n",
+        )
+        .unwrap();
+        let mut real = DateTime::parse_from_rfc3339("2026-11-20T18:58:00.300Z")
+            .unwrap()
+            .to_utc();
+        let mut error = TimeDelta::seconds(-724);
+        let mut jitter = 0x2026_1120_u64;
+        let mut next_jitter = |range_ms: i64| {
+            jitter = jitter
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            TimeDelta::milliseconds((jitter >> 33) as i64 % (2 * range_ms + 1) - range_ms)
+        };
+        let mut schedule = Schedule::default();
+        schedule.doze_began();
+        let mut synced = false;
+        // On the glass since, and the time it was drawn for.
+        let mut shown: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
+        let mut fulls = 0;
+        while real < DateTime::parse_from_rfc3339("2026-11-21T02:00:00Z").unwrap() {
+            // A wake: the clock as the device reads it.
+            let now = real + error;
+            let wake = schedule.wake(now, true);
+            fulls += u32::from(wake.redraw == Redraw::Full);
+            if wake.window == Window::Online {
+                // The sync steps the clock right (the fetch's frame follows).
+                error = next_jitter(100);
+                synced = true;
+            }
+            // Rendered a moment later; on the glass a second after that.
+            let rendered = real + TimeDelta::milliseconds(600) + error;
+            let on_glass = real + TimeDelta::milliseconds(1_600);
+            // Until then, the frame before.
+            if let (true, Some((since, frame))) = (synced, shown) {
+                let mut t = since;
+                while t < on_glass {
+                    let (name, minutes) = header_says(&config, frame);
+                    let day = DayTimes::current(&config.location, &config.prayer, t).unwrap();
+                    let next = day.upcoming(t);
+                    let left = (next.at - t).num_milliseconds();
+                    let truth = (left + 59_999) / 60_000;
+                    let (english, _) = next.prayer.names(day.date.weekday());
+                    let passed = name != english;
+                    assert!(
+                        (passed && minutes <= 1)
+                            || (!passed && (truth..=truth + 1).contains(&minutes)),
+                        "at {t} the panel says {name} in {minutes}m (drawn for {frame}); \
+                         {english} is in {truth}m"
+                    );
+                    t += TimeDelta::seconds(1);
+                }
+            }
+            shown = Some((on_glass, rendered));
+            // Awake about 1.5 s, then the nap to the next minute plus a
+            // second, on the monotonic clock: as long as the device clock
+            // said; the resume leaves it up to a second off, put back
+            // within the RTC's (half a second either way).
+            let awake = TimeDelta::milliseconds(1_500);
+            let until = next_redraw(now + awake) + TimeDelta::seconds(1);
+            real += awake + (until - (now + awake));
+            let half = TimeDelta::milliseconds(500);
+            error = match synced {
+                true => (error + next_jitter(1_000)).clamp(-half, half),
+                false => error + next_jitter(500),
+            };
+        }
+        assert!(synced);
+        assert!(fulls > 7 * 60 / 5, "{fulls}");
     }
 
     /// Host timings, for the cost of a doze wake: `cargo test --release
