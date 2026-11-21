@@ -27,15 +27,16 @@ git subtree pull --prefix=crates/miqat https://github.com/sharno/miqat.git main 
 git subtree push --prefix=crates/miqat https://github.com/sharno/miqat.git BRANCH # send kindil's back
 ```
 
-Miqat's prayer times come from salah, as the
-[salah-rs](https://github.com/sharno/salah-rs) fork (no panics, Kani-verified;
-see its VERIFICATION.md), carried in `crates/salah` the same way: Miqat names
-the fork's repository, and the workspace's `[patch]` points that at the
-subtree, so the Nix build stays offline.
+Miqat's prayer times come from [tawqit](https://github.com/sharno/tawqit)
+(verified: a Verus-proven integer core, Kani-proven boundaries; see its
+VERIFICATION.md), carried in `crates/tawqit` the same way: Miqat names
+tawqit's repository, and the workspace's `[patch]` points that at the
+subtree, so the Nix build stays offline. tawqit speaks jiff; Miqat keeps
+chrono and crosses over in one place (`bridge` in crates/miqat/src/prayer.rs).
 
 ```sh
-git subtree pull --prefix=crates/salah https://github.com/sharno/salah-rs.git main   # take salah-rs's changes
-git subtree push --prefix=crates/salah https://github.com/sharno/salah-rs.git BRANCH # send kindil's back
+git subtree pull --prefix=crates/tawqit https://github.com/sharno/tawqit.git main   # take tawqit's changes
+git subtree push --prefix=crates/tawqit https://github.com/sharno/tawqit.git BRANCH # send kindil's back
 ```
 
 `preview` and `desktop` use a simulated device: no file under `/mnt/us`, no

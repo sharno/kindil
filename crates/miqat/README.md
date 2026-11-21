@@ -118,7 +118,6 @@ See [`config.example.toml`](config.example.toml):
 - Weather: [Open-Meteo](https://open-meteo.com/) (CC BY 4.0)
 - Radar: [RainViewer](https://www.rainviewer.com/api.html), free for personal use with attribution
 - Map: © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors. Tiles are fetched once per server start, per the [tile usage policy](https://operations.osmfoundation.org/policies/tiles/)
-- Prayer times: [`salah`](https://github.com/sharno/salah-rs), a Rust port of Adhan
-  (the salah-rs fork of [insha/salah](https://github.com/insha/salah): no
-  panics, verified)
+- Prayer times: [`tawqit`](https://github.com/sharno/tawqit): Adhan's
+  algorithms, verified (it began from [salah](https://github.com/insha/salah))
 - Font: IBM Plex Sans Arabic (SIL OFL 1.1, [`assets/fonts/OFL.txt`](assets/fonts/OFL.txt))

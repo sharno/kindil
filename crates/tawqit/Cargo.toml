@@ -1,0 +1,45 @@
+[package]
+name = "tawqit"
+version = "2.0.0"
+authors = ["Farhan Ahmed <farhan@themacronaut.com>", "tawqit contributors"]
+edition = "2024"
+rust-version = "1.87"
+description = "Islamic prayer times, verified: a total API, a Verus-proven integer core, Kani-proven boundaries"
+homepage = "https://github.com/sharno/tawqit"
+repository = "https://github.com/sharno/tawqit"
+readme = "README.md"
+exclude = ["tests/fixtures"]
+keywords = ["prayer-times", "salah", "islam", "adhan", "verified"]
+categories = ["date-and-time", "no-std"]
+license = "MIT"
+# Not on crates.io (yet): depend on it by git or as a subtree.
+publish = false
+
+[dependencies]
+jiff = { version = "1.0.1", default-features = false }
+# The trigonometry without std (no_std, the default `std` feature off).
+libm = { version = "0.2.11", optional = true }
+serde = { version = "1.0.229", default-features = false, features = ["derive"], optional = true }
+# The `verus!` macro of the integer core (src/verified.rs): it erases the
+# specs and proofs from a normal build, leaving plain Rust; Verus reads them.
+# Pinned to the build of the Verus release the proofs are checked with
+# (VERIFICATION.md).
+verus_builtin_macros = "=0.0.0-2026-11-01-0251"
+
+[dev-dependencies]
+jiff = { version = "1.0.1", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always"] }
+proptest = "1"
+serde_json = "1"
+
+[features]
+default = ["std"]
+std = ["jiff/std"]
+# Without std, the math comes from libm: `default-features = false,
+# features = ["libm"]`.
+libm = ["dep:libm"]
+serde = ["dep:serde", "jiff/serde"]
+
+[lints.rust]
+# Kani's proofs are built under cfg(kani), Verus's under
+# cfg(verus_keep_ghost): see VERIFICATION.md.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(verus_keep_ghost)"] }

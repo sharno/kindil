@@ -10,9 +10,11 @@ chrono-tz = "0.10.4"
 clap = { version = "4.6.7", features = ["derive"] }
 png = "0.18.1"
 resvg = "0.50"
-# The salah-rs fork; kindil carries it as a subtree (crates/salah) and
-# patches this to it.
-salah = { git = "https://github.com/sharno/salah-rs" }
+# Prayer times; kindil carries tawqit as a subtree (crates/tawqit) and
+# patches this to it. jiff is its types', without a time zone database
+# (chrono-tz's stays the one: see prayer.rs's bridge).
+tawqit = { git = "https://github.com/sharno/tawqit" }
+jiff = { version = "1.0.1", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tiny_http = "0.12.0"
