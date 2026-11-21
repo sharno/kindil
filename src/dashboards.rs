@@ -434,7 +434,7 @@ mod tests {
         (english.to_owned(), minutes)
     }
 
-    /// Dozing through an evening in Toronto, on a clock that resumes up to
+    /// Dozing through an evening in Chicago, on a clock that resumes up to
     /// a second off each nap (put back within the RTC's second) and starts
     /// 724 s slow until the first online wake's sync: from that sync on,
     /// whatever is on the panel at any second names the next prayer and
@@ -446,8 +446,8 @@ mod tests {
         use crate::system::{next_redraw, Redraw, Schedule, Window};
         use miqat::prayer::DayTimes;
         let config: miqat::config::Config = toml::from_str(
-            "[location]\nlatitude = 43.65\nlongitude = -79.38\n\
-             timezone = \"America/Toronto\"\n[prayer]\nmethod = \"north_america\"\n",
+            "[location]\nlatitude = 41.88\nlongitude = -87.63\n\
+             timezone = \"America/Chicago\"\n[prayer]\nmethod = \"north_america\"\n",
         )
         .unwrap();
         let mut real = DateTime::parse_from_rfc3339("2026-11-20T18:58:00.300Z")

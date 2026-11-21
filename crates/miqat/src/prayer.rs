@@ -249,8 +249,8 @@ pub(crate) mod oracle {
     /// method (angles, Isha 90 minutes after Maghrib, Moonsighting's
     /// seasons, Hanafi's Asr).
     pub const PLACES: [(&str, f64, f64, &str, &str); 12] = [
-        ("America/Toronto", 43.65, -79.38, "north_america", "shafi"),
-        ("America/Toronto", 45.42, -75.70, "north_america", "hanafi"),
+        ("America/Chicago", 41.88, -87.63, "north_america", "shafi"),
+        ("America/Chicago", 44.98, -93.27, "north_america", "hanafi"),
         (
             "America/New_York",
             40.71,
@@ -347,7 +347,7 @@ pub(crate) mod oracle {
     }
 
     /// `count` moments through 2026, to the second, and the minutes
-    /// around Toronto's and Amsterdam's DST changes and their midnights.
+    /// around Chicago's and Amsterdam's DST changes and their midnights.
     pub fn moments(seed: u64, count: usize) -> Vec<DateTime<Utc>> {
         let start = DateTime::from_timestamp(1_767_225_600, 0).unwrap(); // 2026-01-01
         let mut random = Random(seed);
@@ -526,18 +526,16 @@ mod tests {
 
     /// salah 0.7.6 built each time from hour and minute fields: one that
     /// rounded up to 24:00 UTC (from 23:59:30) was no time, and a panic.
-    /// In Toronto that was sunset on 2026-04-14 (19:59:3x EDT), which salah
-    /// works out for the three days before too (their next days' nights):
-    /// kindil aborted on 2026-04-11 to 14, and again on 08-25 to 28.
+    /// In Mexico City that was sunset on 2026-11-08 (23:59:3x UTC).
     #[test]
     fn a_time_rounding_up_to_midnight_utc_is_the_next_days_first_minute() {
-        let (location, config) = place(43.65, -79.38, "America/Toronto", "north_america");
+        let (location, config) = place(19.43, -99.13, "America/Mexico_City", "muslim_world_league");
         let day = |d| {
-            let date = NaiveDate::from_ymd_opt(2026, 4, d).unwrap();
+            let date = NaiveDate::from_ymd_opt(2026, 11, d).unwrap();
             DayTimes::compute(&location, &config, date)
         };
-        let midnight = Utc.with_ymd_and_hms(2026, 4, 15, 0, 0, 0).unwrap();
-        assert_eq!(day(14).unwrap().at(Salah::Maghrib), midnight);
+        let midnight = Utc.with_ymd_and_hms(2026, 11, 9, 0, 0, 0).unwrap();
+        assert_eq!(day(8).unwrap().at(Salah::Maghrib), midnight);
         assert!((11..14).all(|d| day(d).is_ok()));
     }
 
