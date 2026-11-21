@@ -29,13 +29,16 @@ use std::path::PathBuf;
 
 /// Amazon's services kindil has no use for: connections (cmd, with tmd and
 /// phd), apps, archive, power management helpers, dynamic config, updates,
-/// crash dumps and sync. Stopped while kindil runs; Amazon's UI needs them
-/// all back.
+/// crash dumps and sync; and cron, whose crontab only rotates and gathers
+/// Amazon's logs (tinyrot and loginfo every 15 minutes, onto /var/local)
+/// and runs tmpfs_scan, its loginfo crashing devcap-get-feat and asking
+/// powerd, which isn't there, every hour. Stopped while kindil runs;
+/// Amazon's UI needs them all back.
 /// kindil's SSH server's port (src/ssh.rs's PORT): its firewall rule goes
 /// on the way back to Amazon's UI.
 pub const SSH_PORT: u16 = 2222;
 
-pub const SERVICES: [&str; 11] = [
+pub const SERVICES: [&str; 12] = [
     "cmd",
     "appmgrd",
     "archive",
@@ -47,6 +50,7 @@ pub const SERVICES: [&str; 11] = [
     "stackdumpd",
     "todo",
     "deviced",
+    "cron",
 ];
 
 /// Where everything is; the tests point it at a temporary directory.

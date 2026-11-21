@@ -12,7 +12,7 @@ export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 L=/var/local/kindil/launcher
 SKIP=/mnt/us/DONT_START_FRAMEWORK
 # The launcher's SERVICES (launcher/src/main.rs; a test keeps them alike).
-SERVICES="cmd appmgrd archive dpmd dynconfig otaupd otav3 rcm stackdumpd todo deviced"
+SERVICES="cmd appmgrd archive dpmd dynconfig otaupd otav3 rcm stackdumpd todo deviced cron"
 "$L" --version >/dev/null 2>&1 || "$(dirname "$0")/kindil" launcher >/dev/null 2>&1
 "$L" boot
 code=$?
