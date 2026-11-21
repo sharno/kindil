@@ -40,10 +40,10 @@ pub struct Location {
 }
 
 impl Location {
-    /// The place, as salah takes it (latitude and longitude are already in
+    /// The place, as tawqit takes it (latitude and longitude are already in
     /// its ranges).
-    pub fn coordinates(&self) -> Result<salah::Coordinates, salah::CoordinatesError> {
-        salah::Coordinates::new(self.latitude.degrees(), self.longitude.degrees())
+    pub fn coordinates(&self) -> Result<tawqit::Coordinates, tawqit::CoordinatesError> {
+        tawqit::Coordinates::from_degrees(self.latitude.degrees(), self.longitude.degrees())
     }
 }
 

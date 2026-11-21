@@ -2,9 +2,9 @@
 members = [".", "launcher", "sshd", "xtask", "installer", "installer/gui"]
 # `cargo build` and the Nix build at the root build the app alone.
 default-members = ["."]
-# salah (the salah-rs fork, a subtree) is Miqat's dependency, with its own
-# tests and lints: not a member of kindil's workspace.
-exclude = ["crates/salah"]
+# tawqit (prayer times, a subtree) is Miqat's dependency, with its own tests,
+# lints and proofs: not a member of kindil's workspace.
+exclude = ["crates/tawqit"]
 
 [package]
 name = "kindil"
@@ -82,10 +82,10 @@ slint-build = "=1.18.1"
 [patch.crates-io]
 slint-backend-kindle = { path = "vendor/slint-backend-kindle" }
 
-# Miqat takes salah from the salah-rs repository; kindil builds the copy
-# it carries (a git subtree, offline in the Nix build).
-[patch."https://github.com/sharno/salah-rs"]
-salah = { path = "crates/salah" }
+# Miqat takes tawqit from its repository; kindil builds the copy it carries
+# (a git subtree, offline in the Nix build).
+[patch."https://github.com/sharno/tawqit"]
+tawqit = { path = "crates/tawqit" }
 
 [profile.release]
 # Speed over size: the binary is a few MB either way, and page turns matter more.

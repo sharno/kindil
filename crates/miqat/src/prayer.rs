@@ -1,8 +1,9 @@
-//! Prayer times, computed locally with the `salah` crate (a port of Adhan).
+//! Prayer times, computed locally with the `tawqit` crate (verified; its
+//! algorithms are Adhan's).
 
 use anyhow::Context;
 use chrono::{DateTime, NaiveDate, Utc, Weekday};
-use salah::{Configuration, Parameters, Prayer, PrayerTimes};
+use tawqit::{Day, MinuteOffset, Night, Offsets, Parameters, Prayer};
 
 use crate::config::{CalculationMethod, Location, Madhab, PrayerConfig};
 
@@ -67,7 +68,7 @@ pub struct Upcoming {
 }
 
 impl DayTimes {
-    /// The times of the local calendar day `date`: those of salah's solar
+    /// The times of the local calendar day `date`: those of tawqit's solar
     /// day whose Dhuhr falls on `date` in the location's zone (Kiritimati,
     /// at UTC+14 and 157°W, has its noon on the UTC date before).
     pub fn compute(
@@ -75,16 +76,22 @@ impl DayTimes {
         config: &PrayerConfig,
         date: NaiveDate,
     ) -> anyhow::Result<Self> {
-        let times = PrayerTimes::on_local_date(
-            date,
-            &location.timezone,
+        let day = Day::on_local_date(
+            bridge::date(date)?,
+            &bridge::noon_zone(location.timezone, date)?,
             location.coordinates()?,
-            parameters(config),
-        )?;
+            &parameters(config)?,
+        );
+        let Day::Complete(schedule) = day else {
+            anyhow::bail!("no prayer times on {date} at this latitude: {day:?}");
+        };
+        let Night::Known { next_fajr, .. } = schedule.night() else {
+            anyhow::bail!("no Fajr after {date} at this latitude");
+        };
         Ok(Self {
             date,
-            times: Salah::DAY.map(|s| times.time(s.library())),
-            fajr_tomorrow: times.time(Prayer::FajrTomorrow),
+            times: Salah::DAY.map(|s| bridge::instant(schedule.at(s.library()))),
+            fajr_tomorrow: bridge::instant(next_fajr.at()),
         })
     }
 
@@ -151,36 +158,73 @@ impl DayTimes {
     }
 }
 
-fn parameters(config: &PrayerConfig) -> Parameters {
+fn parameters(config: &PrayerConfig) -> anyhow::Result<Parameters> {
     let a = config.adjust_minutes;
     let method = match config.method {
-        CalculationMethod::MuslimWorldLeague => salah::Method::MuslimWorldLeague,
-        CalculationMethod::Egyptian => salah::Method::Egyptian,
-        CalculationMethod::Karachi => salah::Method::Karachi,
-        CalculationMethod::UmmAlQura => salah::Method::UmmAlQura,
-        CalculationMethod::Dubai => salah::Method::Dubai,
-        CalculationMethod::MoonsightingCommittee => salah::Method::MoonsightingCommittee,
-        CalculationMethod::NorthAmerica => salah::Method::NorthAmerica,
-        CalculationMethod::Kuwait => salah::Method::Kuwait,
-        CalculationMethod::Qatar => salah::Method::Qatar,
-        CalculationMethod::Singapore => salah::Method::Singapore,
-        CalculationMethod::Tehran => salah::Method::Tehran,
-        CalculationMethod::Turkey => salah::Method::Turkey,
+        CalculationMethod::MuslimWorldLeague => tawqit::Method::MuslimWorldLeague,
+        CalculationMethod::Egyptian => tawqit::Method::Egyptian,
+        CalculationMethod::Karachi => tawqit::Method::Karachi,
+        CalculationMethod::UmmAlQura => tawqit::Method::UmmAlQura,
+        CalculationMethod::Dubai => tawqit::Method::Dubai,
+        CalculationMethod::MoonsightingCommittee => tawqit::Method::MoonsightingCommittee,
+        CalculationMethod::NorthAmerica => tawqit::Method::NorthAmerica,
+        CalculationMethod::Kuwait => tawqit::Method::Kuwait,
+        CalculationMethod::Qatar => tawqit::Method::Qatar,
+        CalculationMethod::Singapore => tawqit::Method::Singapore,
+        CalculationMethod::Tehran => tawqit::Method::Tehran,
+        CalculationMethod::Turkey => tawqit::Method::Turkey,
     };
     let madhab = match config.madhab {
-        Madhab::Shafi => salah::Madhab::Shafi,
-        Madhab::Hanafi => salah::Madhab::Hanafi,
+        Madhab::Shafi => tawqit::Madhab::Shafi,
+        Madhab::Hanafi => tawqit::Madhab::Hanafi,
     };
-    let mut params = Configuration::with(method, madhab);
-    params.adjustments = salah::TimeAdjustment::new(
-        a.fajr.into(),
-        a.sunrise.into(),
-        a.dhuhr.into(),
-        a.asr.into(),
-        a.maghrib.into(),
-        a.isha.into(),
-    );
-    params
+    let minutes = |m: i8| MinuteOffset::new(i16::from(m));
+    Ok(method
+        .parameters()
+        .with_madhab(madhab)
+        .with_offsets(Offsets {
+            fajr: minutes(a.fajr)?,
+            sunrise: minutes(a.sunrise)?,
+            dhuhr: minutes(a.dhuhr)?,
+            asr: minutes(a.asr)?,
+            maghrib: minutes(a.maghrib)?,
+            isha: minutes(a.isha)?,
+        }))
+}
+
+/// Miqat keeps chrono; tawqit takes jiff. Each crossing is here.
+mod bridge {
+    use anyhow::Context;
+    use chrono::{DateTime, Datelike, NaiveDate, Offset, TimeZone as _, Utc};
+
+    /// A chrono date as tawqit's, if in its years (1000 to 3000).
+    pub fn date(date: NaiveDate) -> anyhow::Result<tawqit::PrayerDate> {
+        let year = i16::try_from(date.year())?;
+        let civil = jiff::civil::Date::new(year, date.month() as i8, date.day() as i8)?;
+        Ok(tawqit::PrayerDate::new(civil)?)
+    }
+
+    /// The zone as tawqit needs it for the local date: its offset at noon
+    /// that day. tawqit only asks which local date the solar noon (within
+    /// hours of 12:00) falls on, and no zone changes its offset then; so
+    /// no second time zone database, chrono-tz's being the one.
+    pub fn noon_zone(zone: chrono_tz::Tz, date: NaiveDate) -> anyhow::Result<jiff::tz::TimeZone> {
+        let noon = date.and_hms_opt(12, 0, 0).context("noon")?;
+        let offset = zone
+            .offset_from_local_datetime(&noon)
+            .earliest()
+            .context("no noon in the zone that day")?;
+        let seconds = offset.fix().local_minus_utc();
+        Ok(jiff::tz::TimeZone::fixed(jiff::tz::Offset::from_seconds(
+            seconds,
+        )?))
+    }
+
+    /// A tawqit instant as chrono's (always one: tawqit's are within years
+    /// 999 to 3001).
+    pub fn instant(at: jiff::Timestamp) -> DateTime<Utc> {
+        DateTime::from_timestamp(at.as_second(), 0).unwrap_or_default()
+    }
 }
 
 /// The local calendar day `now` falls on.
@@ -273,15 +317,17 @@ pub(crate) mod oracle {
         now: DateTime<Utc>,
     ) -> (Salah, DateTime<Utc>, Weekday) {
         let coordinates = location.coordinates().unwrap();
+        let parameters = parameters(config).unwrap();
         (-3..=3)
             .flat_map(|days| {
-                let date = now.date_naive() + TimeDelta::days(days);
-                let schedule = PrayerTimes::new(date, coordinates, parameters(config)).unwrap();
-                let weekday = schedule
-                    .time(Prayer::Dhuhr)
-                    .with_timezone(&location.timezone)
-                    .weekday();
-                Salah::DAY.map(|s| (s, schedule.time(s.library()), weekday))
+                let date = bridge::date(now.date_naive() + TimeDelta::days(days)).unwrap();
+                let schedule = match Day::calculate(date, coordinates, &parameters) {
+                    Day::Complete(schedule) => schedule,
+                    Day::Partial(partial) => panic!("{partial:?}"),
+                };
+                let at = |s: Salah| bridge::instant(schedule.at(s.library()));
+                let weekday = at(Salah::Dhuhr).with_timezone(&location.timezone).weekday();
+                Salah::DAY.map(|s| (s, at(s), weekday))
             })
             .find(|&(_, at, _)| at > now)
             .unwrap()

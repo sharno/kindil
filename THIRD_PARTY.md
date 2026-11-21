@@ -9,7 +9,8 @@ a replacement for the full transitive license inventory when distributing builds
 | Slint virtual-keyboard example | Slint `v1.18.1`, `examples/virtual_keyboard/ui` — MIT | Adapted touch keyboard; source, attribution and license in `ui/vendor/slint-keyboard` |
 | slint-backend-kindle 0.7.1 | https://github.com/sverrejb/slint-kindle-backend — MIT OR Apache-2.0 | Kindle display/input backend, vendored in `vendor/` with a full-refresh patch |
 | Miqat | `crates/miqat`, a git subtree of sharno/miqat — MIT | Unmodified dashboard layout, data and fonts |
-| salah (salah-rs) | `crates/salah`, a git subtree of sharno/salah-rs, a fork of https://github.com/insha/salah — MIT | Prayer times |
+| tawqit | `crates/tawqit`, a git subtree of sharno/tawqit, which began from https://github.com/insha/salah — MIT | Prayer times (verified) |
+| jiff | https://github.com/BurntSushi/jiff — MIT OR Unlicense | tawqit's date and time types (no time zone database) |
 | chrono-tz | https://github.com/chronotope/chrono-tz — MIT OR Apache-2.0 | IANA timezones for the clock |
 | clap | https://github.com/clap-rs/clap — MIT OR Apache-2.0 | Command line |
 | rbook | https://github.com/DevinSterling/rbook — Apache-2.0 | EPUB parsing/reading order |
