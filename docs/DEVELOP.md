@@ -27,6 +27,17 @@ git subtree pull --prefix=crates/miqat https://github.com/sharno/miqat.git main 
 git subtree push --prefix=crates/miqat https://github.com/sharno/miqat.git BRANCH # send kindil's back
 ```
 
+Miqat's prayer times come from salah, as the
+[salah-rs](https://github.com/sharno/salah-rs) fork (no panics, Kani-verified;
+see its VERIFICATION.md), carried in `crates/salah` the same way: Miqat names
+the fork's repository, and the workspace's `[patch]` points that at the
+subtree, so the Nix build stays offline.
+
+```sh
+git subtree pull --prefix=crates/salah https://github.com/sharno/salah-rs.git main   # take salah-rs's changes
+git subtree push --prefix=crates/salah https://github.com/sharno/salah-rs.git BRANCH # send kindil's back
+```
+
 `preview` and `desktop` use a simulated device: no file under `/mnt/us`, no
 framebuffer, no front light and no network is touched. Previews use fixture
 weather and make no requests.
