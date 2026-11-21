@@ -1,193 +1,149 @@
-# Salah (salah-rs fork)
+# tawqit
 
-[![CI](https://github.com/sharno/salah-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/sharno/salah-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/sharno/tawqit/actions/workflows/ci.yml/badge.svg)](https://github.com/sharno/tawqit/actions/workflows/ci.yml)
 
-Islamic prayer times for Rust: a maintained fork of
-[insha/salah](https://github.com/insha/salah) (MIT, by Farhan Ahmed), itself a
-port of [Adhan](https://github.com/batoulapps/Adhan).
+Islamic prayer times for Rust, verified. *Tawqīt* is the science of
+timekeeping for the prayers.
 
-## Why this fork
-
-salah 0.7 panics on ordinary inputs: where the sun never reaches a twilight
-angle (most of Europe around the June solstice), where it never rises or sets
-(past the polar circles), on any time that rounds up to 24:00 UTC, on
-`current()` for any day but today. This fork keeps salah's calculations and
-attribution, and changes:
-
-- **A total API.** No input panics: the calculation returns `Result` with a
-  typed `Error`, coordinates and parameters are checked types, and nothing
-  reads the clock.
-- **Every known bug fixed**, each in its own commit with a regression test
-  (listed below).
-- **Verified.** Kani proofs that the API can't panic and that its results
-  keep their order, property tests over wide input ranges, and differential
-  tests against Adhan and NOAA's solar calculator; see
+- **A total API.** Every input is checked once, by its type's constructor;
+  after that the calculation can't fail or panic. Nothing reads the clock.
+- **Times say what they are.** Each is the sun's (`Time::Computed`), a
+  rule's in its place (`Time::Fallback`, naming the rule), or missing with
+  the reason (`Unavailable`); a day is complete (all six, in order) or
+  partial.
+- **Verified.** Everything after the astronomy is an integer core proven
+  with [Verus](https://github.com/verus-lang/verus) for every input; the
+  astronomy's conversions into it are proven with
+  [Kani](https://github.com/model-checking/kani); the astronomy agrees with
+  Adhan to the minute and with NOAA's solar calculator to seconds. See
   [VERIFICATION.md](VERIFICATION.md).
-- **Adhan's current algorithms**: the converged sunrise and twilight
-  iteration, the Asr checks, the order guard and the polar circle
-  resolutions of adhan-js, whose times it matches to the minute.
-- **`no_std`** (without std or an allocator), with the `libm` feature.
-
-It is not published to crates.io (`salah` there is the original). Use it from
-git:
+- **[jiff](https://github.com/BurntSushi/jiff)** types (`civil::Date`,
+  `Timestamp`, `tz::TimeZone`, `SignedDuration`), and `no_std` (without an
+  allocator) with the `libm` feature.
 
 ```toml
 [dependencies]
-salah = { git = "https://github.com/sharno/salah-rs" }
+tawqit = { git = "https://github.com/sharno/tawqit" }
 ```
-
-This fork is maintained with the help of an AI coding assistant; every change
-carries a test, and the proofs and checks in CI gate each commit.
-
-### What changed from salah 0.7
-
-Fixed (upstream issue or PR where there is one):
-
-- No times where the sun doesn't rise or set: `Error::SunNeverRises` /
-  `SunNeverSets` instead of a panic (#20), or times from the nearest latitude
-  or day with `PolarCircleResolution::AqrabBalad` / `AqrabYaum` (PR #21).
-- A twilight the sun never reaches gives way to the high-latitude rule (#18,
-  fixed upstream too).
-- A time that rounds up to 24:00 UTC is the next day's 00:00 (PR #26).
-- `current`, `next` and `time_remaining` take the time and return `Option`:
-  no panic before Fajr (PR #23) or on another day (#17); `Prayer::name` no
-  longer reads the clock to call Dhuhr Jumua.
-- Rounding happens once, at the end: `Rounding::Up` is a ceiling (Singapore's
-  times were often a minute late) and `Rounding::None` keeps the seconds.
-- Noon near the date line is on the date (Suva's times were a day late in
-  October and November); `PrayerTimes::on_local_date` gives a local day's
-  times where the zone is far from its meridian (Kiritimati).
-- Sunrise, sunset and twilights converge (one Newton step was up to 34
-  minutes off near the polar circles).
-- Asr uses the noon declination, and is an error where the sun can't reach it
-  (it was Dhuhr's time); times crowding near the polar circles are an error.
-- Tehran's 4.5° Maghrib angle is used (it was ignored).
-- The Moonsighting Committee's seasons in the southern hemisphere (an overflow,
-  and up to half an hour off).
-- The recommended high-latitude rule applies south of 48°S.
-- The next Fajr is the next day's own (it was unrounded); the middle of the
-  night is public.
-- Qiblah bearings stay in [0, 360).
-- Dates outside 1000–3000 are an error, not a panic; `Rounding`, `Shafaq` and
-  `Qiblah` are exported; `no_std` (#16).
-
-Changed API: `PrayerTimes::new(date, coordinates, parameters) -> Result`
-replaces the `PrayerSchedule` builder; `Coordinates::new` and
-`DepressionAngle::new` return `Result`; `Parameters` has `isha: Isha` (an
-angle or an interval), `maghrib_angle: Option<_>`, `polar_circle_resolution`,
-and `i16` adjustments.
 
 ## Usage
 
 ```rust
-use salah::prelude::*;
+use jiff::civil::date;
+use tawqit::{Coordinates, Day, Method, Outcome, Prayer, PrayerDate, Time};
 
-let makkah = Coordinates::new(21.4225, 39.8262).expect("valid coordinates");
-let date = NaiveDate::from_ymd_opt(2026, 3, 20).expect("a date");
-let params = Configuration::with(Method::UmmAlQura, Madhab::Shafi);
+let makkah = Coordinates::from_degrees(21.4225, 39.8262).expect("a place");
+let today = PrayerDate::new(date(2026, 3, 20)).expect("a date in 1000-3000");
+let parameters = Method::UmmAlQura.parameters();
 
-match PrayerTimes::new(date, makkah, params) {
-    Ok(times) => {
-        for prayer in [Prayer::Fajr, Prayer::Sunrise, Prayer::Dhuhr, Prayer::Asr, Prayer::Maghrib, Prayer::Isha] {
-            println!("{}: {}", prayer.name(), times.time(prayer).format("%H:%M UTC"));
+match Day::calculate(today, makkah, &parameters) {
+    Day::Complete(schedule) => {
+        for prayer in Prayer::ALL {
+            println!("{}: {}", prayer.name(), schedule.at(prayer));
         }
-        // The prayer at a moment, and the next one.
-        let now = times.time(Prayer::Asr);
-        assert_eq!(times.current(now), Some(Prayer::Asr));
-        assert_eq!(times.next(now), Some(Prayer::Maghrib));
-        println!("Maghrib in {} minutes", times.time_remaining(now).unwrap().num_minutes());
+        // The mark at a moment, and the next one.
+        let now = schedule.at(Prayer::Asr);
+        assert_eq!(schedule.current(now), Some(tawqit::Mark::Prayer(Prayer::Asr)));
+        assert_eq!(schedule.next(now), Some(tawqit::Mark::Prayer(Prayer::Maghrib)));
+        println!("Maghrib in {}", schedule.until_next(now).unwrap());
     }
-    Err(error) => println!("No prayer times: {error}"),
+    Day::Partial(partial) => {
+        // Near the poles: each prayer is there, or says why not.
+        for prayer in Prayer::ALL {
+            match partial.outcome(prayer) {
+                Outcome::Time(Time::Computed(at)) => println!("{prayer:?} {at}"),
+                Outcome::Time(Time::Fallback { at, rule }) => println!("{prayer:?} {at} ({rule:?})"),
+                Outcome::Unavailable(why) => println!("{prayer:?}: {why:?}"),
+            }
+        }
+    }
 }
 ```
 
-Times are `DateTime<Utc>`; show them in the place's time zone (with
-`chrono-tz`, say). `PrayerTimes::new` takes the solar day of a UTC date, whose
-noon is near 12:00 local mean time; where a zone keeps far from its meridian,
-`PrayerTimes::on_local_date(date, &zone, ..)` takes the day whose Dhuhr falls
-on the local date.
+Times are UTC instants; show them in the place's zone. `Day::calculate`
+takes the solar day of a UTC date (its noon near 12:00 local mean time);
+where a zone keeps far from its meridian, `Day::on_local_date(date, &zone,
+…)` takes the day whose noon falls on the local date.
 
-### Coordinates
+### Settings
 
-Latitude in [-90°, 90°] and a finite longitude (wrapped into [-180°, 180°]),
-north and east positive. Anything else is a `CoordinatesError`.
-
-### Configuration
-
-`Configuration::with(method, madhab)` gives a method's `Parameters`, whose
-fields can then be changed; `Configuration::new(fajr_angle, isha)` builds custom
-ones.
-
-| Field                     | Meaning                                                                                         |
-| ------------------------- | ----------------------------------------------------------------------------------------------- |
-| `method`                  | The preset these came from (`Other` for custom ones).                                           |
-| `fajr_angle`              | The sun's depression for Fajr: a `DepressionAngle`, 0° to 30°.                                  |
-| `maghrib_angle`           | `Some(angle)` for Maghrib at that depression rather than at sunset (Tehran).                    |
-| `isha`                    | `Isha::Angle(angle)`, or `Isha::Interval(minutes)` after sunset.                                |
-| `madhab`                  | `Shafi` (shadow 1×) or `Hanafi` (2×), for Asr.                                                  |
-| `high_latitude_rule`      | The bounds on Fajr and Isha where twilight lasts long (below).                                  |
-| `polar_circle_resolution` | What to do on a day without times near the poles (below).                                       |
-| `adjustments`             | `TimeAdjustment`: minutes added to each time.                                                   |
-| `rounding`                | `Nearest` minute (default), `Up` to the next minute, or `None` (to the second).                 |
-| `shafaq`                  | The Moonsighting Committee's twilight for Isha: `General`, `Ahmer` (red) or `Abyad` (white).    |
-
-**Methods**
-
-| Value                   | Fajr  | Isha            | Notes                                                                    |
-| ----------------------- | ----- | --------------- | ------------------------------------------------------------------------ |
-| `MuslimWorldLeague`     | 18°   | 17°             |                                                                          |
-| `Egyptian`              | 19.5° | 17.5°           |                                                                          |
-| `Karachi`               | 18°   | 18°             |                                                                          |
-| `UmmAlQura`             | 18.5° | 90 min          | Add 30 minutes to Isha in Ramadan.                                       |
-| `Dubai`                 | 18.2° | 18.2°           | Sunrise −3, Dhuhr, Asr, Maghrib +3 minutes.                              |
-| `MoonsightingCommittee` | 18°   | 18°             | Seasonal twilights; a seventh of the night above 55°N.                   |
-| `NorthAmerica`          | 15°   | 15°             | ISNA.                                                                    |
-| `Kuwait`                | 18°   | 17.5°           |                                                                          |
-| `Qatar`                 | 18°   | 90 min          |                                                                          |
-| `Singapore`             | 20°   | 18°             | Rounds up.                                                               |
-| `Tehran`                | 17.7° | 14°             | Maghrib at 4.5°.                                                         |
-| `Turkey`                | 18°   | 17°             | An approximation of Diyanet's.                                           |
-| `Other`                 | 0°    | 0°              | Placeholders, for custom parameters.                                     |
-
-**High-latitude rules**: `MiddleOfTheNight` (default): Fajr no earlier and Isha
-no later than the middle of the night; `SeventhOfTheNight`: no earlier than
-the last seventh, no later than the first; `TwilightAngle`: angle / 60 of the
-night. `HighLatitudeRule::recommended(coordinates)` is the seventh beyond 48°
-north or south.
-
-**Polar circle resolutions**: `Unresolved` (default): the `Error` that says why
-there are no times; `AqrabBalad`: the times of the nearest latitude toward
-the equator that has them; `AqrabYaum`: those of the nearest day that has
-them.
-
-### Qibla direction
+`Method::X.parameters()` is a preset (each is a `const` in `presets`);
+change it with the `with_` methods, or build your own with
+`Parameters::new(fajr_angle, isha)`. Every value is a checked type, so
+every `Parameters` is valid.
 
 ```rust
-use salah::prelude::*;
+use tawqit::*;
 
-let paris = Coordinates::new(48.8566, 2.3522).expect("valid coordinates");
-let qiblah = Qiblah::new(paris);
-assert!((qiblah.value() - 119.163).abs() < 0.001); // degrees from true north
+let minutes = |m| MinuteOffset::new(m).expect("within 12 hours");
+let parameters = Method::MuslimWorldLeague
+    .parameters()
+    .with_madhab(Madhab::Hanafi)
+    .with_high_latitude_rule(HighLatitudeRule::SeventhOfTheNight)
+    .with_polar_circle_resolution(PolarCircleResolution::AqrabBalad)
+    .with_offsets(Offsets { isha: minutes(2), ..Offsets::ZERO })
+    .with_rounding(Rounding::Up);
+
+let custom = Parameters::new(
+    DepressionAngle::new(16.5).expect("0 to 30 degrees"),
+    Isha::Interval(IshaInterval::new(75).expect("5 to 240 minutes")),
+);
+assert_ne!(parameters, custom);
+```
+
+| Setting | Values |
+| --- | --- |
+| Fajr | `DepressionAngle`: (0°, 30°], to a hundredth |
+| `Isha` | `Angle(DepressionAngle)` or `Interval(IshaInterval)` (5–240 minutes after sunset) |
+| `Maghrib` | `Sunset`, or `Angle(DepressionAngle)` (Tehran), which gives way to sunset if it would crowd Isha |
+| `Madhab` | `Shafi` (Asr shadow 1×), `Hanafi` (2×) |
+| `NightBound` | `HighLatitude(rule)`: Fajr no earlier and Isha no later than `MiddleOfTheNight`, `SeventhOfTheNight` or `TwilightAngle` (angle / 60) of the night; or `MoonsightingSeasons(Shafaq)` |
+| `PolarCircleResolution` | `Unresolved` (a `PartialDay`), `AqrabBalad` (the nearest latitude with times), `AqrabYaum` (the nearest day) |
+| `Offsets` | `MinuteOffset`s (±12 hours) per prayer: the method's and yours |
+| `Rounding` | `Nearest`, `Up`, `Off` (to the second) |
+
+| Method | Fajr | Isha | Notes |
+| --- | --- | --- | --- |
+| `MuslimWorldLeague` | 18° | 17° | |
+| `Egyptian` | 19.5° | 17.5° | |
+| `Karachi` | 18° | 18° | |
+| `UmmAlQura` | 18.5° | 90 min | Add 30 minutes to Isha in Ramadan. |
+| `Dubai` | 18.2° | 18.2° | Sunrise −3, Dhuhr, Asr, Maghrib +3 minutes. |
+| `MoonsightingCommittee` | 18° | 18° | Seasonal twilights; a seventh of the night above 55°N. |
+| `NorthAmerica` | 15° | 15° | ISNA. |
+| `Kuwait` | 18° | 17.5° | |
+| `Qatar` | 18° | 90 min | |
+| `Singapore` | 20° | 18° | Rounds up. |
+| `Tehran` | 17.7° | 14° | Maghrib at 4.5°. |
+| `Turkey` | 18° | 17° | An approximation of Diyanet's. |
+
+### Qibla
+
+```rust
+use tawqit::{Coordinates, Qiblah};
+
+let paris = Coordinates::from_degrees(48.8566, 2.3522).expect("a place");
+assert!((Qiblah::new(paris).degrees() - 119.163).abs() < 0.001);
 ```
 
 ### Features
 
 - `std` (default). Without it the crate is `no_std` and needs `libm`:
   `default-features = false, features = ["libm"]`.
-- `serde`: serialization; deserializing checks coordinates and angles.
+- `serde`: serialization; deserializing checks every value.
 
-## Contributing
+## Origins
 
-Please see the `CONTRIBUTING.md` file for more information.
+tawqit began from [salah](https://github.com/insha/salah) by Farhan Ahmed
+(MIT), itself a port of [Adhan](https://github.com/batoulapps/Adhan) by
+Batoul Apps. It keeps their astronomy, from Jean Meeus's *Astronomical
+Algorithms*, follows Adhan's current algorithms, and is otherwise its own:
+a new API, every known bug of salah fixed (the git history has each fix
+with its test), and the verification above.
 
-## Code of Conduct
-
-Our contributor code of conduct can be found in the `code-of-conduct.md` file.
-
-## Acknowledgement
-
-This library is based on the [Adhan](https://github.com/batoulapps/Adhan) library by Batoul Apps. All astronomical calculations are high precision equations directly from the book [Astronomical Algorithms](http://www.willbell.com/math/mc1.htm) by Jean Meeus.
+It is maintained with the help of an AI coding assistant; every change
+carries a test, and the proofs and checks in CI gate each commit.
 
 ## License
 
-Salah is available under the MIT License. The full license text can be found in the `LICENSE` file.
+MIT; see [LICENSE](LICENSE).

@@ -1,41 +1,45 @@
 [package]
-name = "salah"
-version = "0.7.6"
-authors = ["Farhan Ahmed <farhan@themacronaut.com>", "salah-rs contributors"]
+name = "tawqit"
+version = "2.0.0"
+authors = ["Farhan Ahmed <farhan@themacronaut.com>", "tawqit contributors"]
 edition = "2024"
 rust-version = "1.87"
-description = "Islamic prayer time library for Rust"
-homepage = "https://github.com/sharno/salah-rs"
-repository = "https://github.com/sharno/salah-rs"
+description = "Islamic prayer times, verified: a total API, a Verus-proven integer core, Kani-proven boundaries"
+homepage = "https://github.com/sharno/tawqit"
+repository = "https://github.com/sharno/tawqit"
 readme = "README.md"
 exclude = ["tests/fixtures"]
-keywords = ["salah", "pray", "islam", "reminder", "adhan"]
-categories = ["date-and-time"]
+keywords = ["prayer-times", "salah", "islam", "adhan", "verified"]
+categories = ["date-and-time", "no-std"]
 license = "MIT"
-# A fork of insha/salah: not on crates.io, so it can't be mistaken for the
-# original there. Depend on it by git or as a vendored subtree.
+# Not on crates.io (yet): depend on it by git or as a subtree.
 publish = false
 
-[dev-dependencies]
-# Formatting times in tests, with or without std.
-chrono = { version = "0.4.42", default-features = false, features = ["alloc"] }
-proptest = "1"
-serde_json = "1"
-
 [dependencies]
-chrono = { version = "0.4.42", default-features = false }
+jiff = { version = "1.0.1", default-features = false }
 # The trigonometry without std (no_std, the default `std` feature off).
 libm = { version = "0.2.11", optional = true }
 serde = { version = "1.0.229", default-features = false, features = ["derive"], optional = true }
+# The `verus!` macro of the integer core (src/verified.rs): it erases the
+# specs and proofs from a normal build, leaving plain Rust; Verus reads them.
+# Pinned to the build of the Verus release the proofs are checked with
+# (VERIFICATION.md).
+verus_builtin_macros = "=0.0.0-2026-11-01-0251"
+
+[dev-dependencies]
+jiff = { version = "1.0.1", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always"] }
+proptest = "1"
+serde_json = "1"
 
 [features]
 default = ["std"]
-std = ["chrono/std"]
+std = ["jiff/std"]
 # Without std, the math comes from libm: `default-features = false,
 # features = ["libm"]`.
 libm = ["dep:libm"]
-serde = ["dep:serde", "chrono/serde"]
+serde = ["dep:serde", "jiff/serde"]
 
 [lints.rust]
-# Kani's proofs are built under cfg(kani): see VERIFICATION.md.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+# Kani's proofs are built under cfg(kani), Verus's under
+# cfg(verus_keep_ghost): see VERIFICATION.md.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(verus_keep_ghost)"] }

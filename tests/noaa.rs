@@ -1,4 +1,4 @@
-//! salah's astronomy against an independent one: NOAA's solar calculator
+//! tawqit's astronomy against an independent one: NOAA's solar calculator
 //! (the equations of its spreadsheet, after Meeus, by way of the equation
 //! of time rather than salah's right ascension and sidereal time),
 //! written here from those equations.
@@ -8,7 +8,9 @@
 //! over two centuries of dates, away from the edge of the sun's reaching an
 //! angle at all.
 
-use salah::prelude::*;
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
+use tawqit::*;
 
 const TOLERANCE_SECONDS: i64 = 10;
 
@@ -73,30 +75,36 @@ fn event(jd0: f64, latitude: f64, longitude: f64, altitude: f64, side: f64) -> O
     Some(minutes)
 }
 
-fn seconds_off(time: DateTime<Utc>, midnight: DateTime<Utc>, minutes: f64) -> i64 {
-    ((time - midnight).num_milliseconds() as f64 / 1000.0 - minutes * 60.0).round() as i64
+fn seconds_off(time: Timestamp, midnight: Timestamp, minutes: f64) -> i64 {
+    (time.duration_since(midnight).as_secs_f64() - minutes * 60.0).round() as i64
 }
 
 #[test]
 fn sun_and_twilights_agree_with_noaa() {
     // No adjustments, no rounding, 18° twilights.
     let eighteen = DepressionAngle::new(18.0).unwrap();
-    let mut parameters = Parameters::new(eighteen, Isha::Angle(eighteen));
-    parameters.rounding = Rounding::None;
+    let parameters = Parameters::new(eighteen, Isha::Angle(eighteen)).with_rounding(Rounding::Off);
 
     let mut worst = [0i64; 5];
     let mut compared = 0;
-    for year in (1950..=2150).step_by(25) {
+    for year in (1950i16..=2150).step_by(25) {
         for day in (1..=365).step_by(11) {
-            let date = NaiveDate::from_yo_opt(year, day).unwrap();
-            let midnight = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-            let jd0 = 2440587.5 + midnight.timestamp() as f64 / 86400.0;
+            let date = jiff::civil::Date::new(year, 1, 1)
+                .unwrap()
+                .with()
+                .day_of_year(day)
+                .build()
+                .unwrap();
+            let midnight = date
+                .at(0, 0, 0, 0)
+                .to_zoned_datetime(TimeZone::UTC)
+                .unwrap()
+                .timestamp();
+            let jd0 = 2440587.5 + midnight.as_second() as f64 / 86400.0;
             for latitude in (-65..=65).step_by(5).map(f64::from) {
                 for longitude in (-180..180).step_by(30).map(f64::from) {
-                    let place = Coordinates::new(latitude, longitude).unwrap();
-                    let Ok(times) = PrayerTimes::new(date, place, parameters) else {
-                        continue;
-                    };
+                    let place = Coordinates::from_degrees(latitude, longitude).unwrap();
+                    let times = Day::calculate(PrayerDate::new(date).unwrap(), place, &parameters);
                     let horizon = -50.0 / 60.0;
                     // Events near the edge of not happening are ill-conditioned
                     // (the hour angle's slope is unbounded there): skip within
@@ -115,7 +123,11 @@ fn sun_and_twilights_agree_with_noaa() {
                         let Some(minutes) = event(jd0, latitude, longitude, altitude, side) else {
                             return;
                         };
-                        let off = seconds_off(times.time(prayer), midnight, minutes);
+                        // The sun's own time, where the day has it.
+                        let Outcome::Time(Time::Computed(at)) = times.outcome(prayer) else {
+                            return;
+                        };
+                        let off = seconds_off(at, midnight, minutes);
                         assert!(
                             off.abs() <= TOLERANCE_SECONDS,
                             "{prayer:?} at {latitude}, {longitude} on {date}: {off} s from NOAA's"

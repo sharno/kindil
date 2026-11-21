@@ -1,37 +1,14 @@
-//! Properties of the public API over wide ranges of inputs (proptest).
-//!
-//! The Kani proofs (VERIFICATION.md) cover every input, but with the
-//! astronomy taken as any value; these run the real astronomy.
+//! Properties of the public API over wide ranges of inputs (proptest), with
+//! the real astronomy (the Kani proofs take it as any value; VERIFICATION.md).
 
-use chrono::FixedOffset;
+use jiff::civil::Date;
+use jiff::tz::{Offset, TimeZone};
+use jiff::{SignedDuration, Timestamp};
 use proptest::prelude::*;
-use salah::prelude::*;
+use tawqit::*;
 
-const SIX: [Prayer; 6] = [
-    Prayer::Fajr,
-    Prayer::Sunrise,
-    Prayer::Dhuhr,
-    Prayer::Asr,
-    Prayer::Maghrib,
-    Prayer::Isha,
-];
-
-/// Every method but Other, whose 0° angles are placeholders.
 fn method() -> impl Strategy<Value = Method> {
-    prop_oneof![
-        Just(Method::MuslimWorldLeague),
-        Just(Method::Egyptian),
-        Just(Method::Karachi),
-        Just(Method::UmmAlQura),
-        Just(Method::Dubai),
-        Just(Method::MoonsightingCommittee),
-        Just(Method::NorthAmerica),
-        Just(Method::Kuwait),
-        Just(Method::Qatar),
-        Just(Method::Singapore),
-        Just(Method::Tehran),
-        Just(Method::Turkey),
-    ]
+    (0..Method::ALL.len()).prop_map(|i| Method::ALL[i])
 }
 
 fn high_latitude_rule() -> impl Strategy<Value = HighLatitudeRule> {
@@ -54,12 +31,13 @@ fn rounding() -> impl Strategy<Value = Rounding> {
     prop_oneof![
         Just(Rounding::Nearest),
         Just(Rounding::Up),
-        Just(Rounding::None)
+        Just(Rounding::Off)
     ]
 }
 
-/// A method with any madhab, high-latitude rule, polar circle resolution
-/// and rounding, and no adjustments.
+/// A method with any madhab, high-latitude rule (but for the Moonsighting
+/// Committee's seasons), polar circle resolution and rounding, and no
+/// offsets.
 fn parameters() -> impl Strategy<Value = Parameters> {
     (
         method(),
@@ -69,154 +47,195 @@ fn parameters() -> impl Strategy<Value = Parameters> {
         rounding(),
     )
         .prop_map(|(method, hanafi, rule, resolution, rounding)| {
-            let madhab = if hanafi {
-                Madhab::Hanafi
-            } else {
-                Madhab::Shafi
+            let parameters = method.parameters();
+            let parameters = match parameters.night_bound() {
+                NightBound::HighLatitude(_) => parameters.with_high_latitude_rule(rule),
+                NightBound::MoonsightingSeasons(_) => parameters,
             };
-            let mut parameters = Configuration::with(method, madhab);
-            parameters.high_latitude_rule = rule;
-            parameters.polar_circle_resolution = resolution;
-            parameters.rounding = rounding;
-            parameters.method_adjustments = TimeAdjustment::default();
             parameters
+                .with_madhab(if hanafi {
+                    Madhab::Hanafi
+                } else {
+                    Madhab::Shafi
+                })
+                .with_polar_circle_resolution(resolution)
+                .with_rounding(rounding)
+                .with_method_offsets(Offsets::ZERO)
         })
 }
 
-/// Any parameters at all: angles, Isha by interval, adjustments.
+fn angle() -> impl Strategy<Value = DepressionAngle> {
+    (1u16..=3000).prop_map(|h| DepressionAngle::new(f64::from(h) / 100.0).unwrap())
+}
+
+fn offsets() -> impl Strategy<Value = Offsets> {
+    prop::array::uniform6(-720i16..=720).prop_map(|m| {
+        let o = |i: usize| MinuteOffset::new(m[i]).unwrap();
+        Offsets {
+            fajr: o(0),
+            sunrise: o(1),
+            dhuhr: o(2),
+            asr: o(3),
+            maghrib: o(4),
+            isha: o(5),
+        }
+    })
+}
+
+/// Any parameters at all: angles, intervals, Maghrib angles, offsets.
 fn any_parameters() -> impl Strategy<Value = Parameters> {
     (
-        (parameters(), any::<bool>()).prop_map(|(mut parameters, other)| {
-            if other {
-                parameters.method = Method::Other;
-            }
-            parameters
-        }),
-        0.0..=30.0f64,
-        prop::option::of(0.0..=30.0f64),
+        parameters(),
+        angle(),
         prop_oneof![
-            (0.0..=30.0f64).prop_map(|a| Isha::Angle(DepressionAngle::new(a).unwrap())),
-            any::<u8>().prop_map(Isha::Interval),
+            angle().prop_map(Isha::Angle),
+            (5u8..=240).prop_map(|m| Isha::Interval(IshaInterval::new(m).unwrap())),
         ],
-        prop::array::uniform6(any::<i16>()),
+        prop_oneof![Just(Maghrib::Sunset), angle().prop_map(Maghrib::Angle)],
+        offsets(),
+        offsets(),
     )
-        .prop_map(|(mut parameters, fajr, maghrib, isha, a)| {
-            parameters.fajr_angle = DepressionAngle::new(fajr).unwrap();
-            parameters.maghrib_angle = maghrib.map(|m| DepressionAngle::new(m).unwrap());
-            parameters.isha = isha;
-            parameters.adjustments = TimeAdjustment::new(a[0], a[1], a[2], a[3], a[4], a[5]);
-            parameters
+        .prop_map(|(parameters, fajr, isha, maghrib, method, user)| {
+            Parameters::new(fajr, isha)
+                .with_maghrib(maghrib)
+                .with_night_bound(parameters.night_bound())
+                .with_madhab(parameters.madhab())
+                .with_polar_circle_resolution(parameters.polar_circle_resolution())
+                .with_rounding(parameters.rounding())
+                .with_method_offsets(method)
+                .with_offsets(user)
         })
 }
 
-fn date(from: i32, to: i32) -> impl Strategy<Value = NaiveDate> {
-    (from..=to, 1u32..=366).prop_map(|(year, day)| {
-        NaiveDate::from_yo_opt(year, day)
-            .unwrap_or_else(|| NaiveDate::from_yo_opt(year, 365).unwrap())
+fn date(from: i16, to: i16) -> impl Strategy<Value = PrayerDate> {
+    (from..=to, 1i16..=365).prop_map(|(year, day)| {
+        let date = Date::new(year, 1, 1)
+            .unwrap()
+            .with()
+            .day_of_year(day)
+            .build()
+            .unwrap();
+        PrayerDate::new(date).unwrap()
     })
 }
 
 fn coordinates() -> impl Strategy<Value = Coordinates> {
-    (-90.0..=90.0f64, -180.0..=180.0f64).prop_map(|(lat, lon)| Coordinates::new(lat, lon).unwrap())
+    (-90.0..=90.0f64, -180.0..=180.0f64)
+        .prop_map(|(lat, lon)| Coordinates::from_degrees(lat, lon).unwrap())
+}
+
+fn midnight(date: PrayerDate) -> Timestamp {
+    date.date()
+        .at(0, 0, 0, 0)
+        .to_zoned_datetime(TimeZone::UTC)
+        .unwrap()
+        .timestamp()
 }
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(40_000))]
 
-    /// Any f64s, any date chrono has, any parameters: never a panic.
+    /// Any f64s, any date jiff has, any parameters, moment and zone: never
+    /// a panic.
     #[test]
     fn never_panics(
         latitude in any::<f64>(),
         longitude in any::<f64>(),
-        days in any::<i32>(),
+        days in -4_000_000i32..4_000_000,
         parameters in any_parameters(),
-        now in any::<i64>(),
+        now in -300_000_000_000i64..300_000_000_000,
+        offset in -25i8..=25,
     ) {
-        let Ok(coordinates) = Coordinates::new(latitude, longitude) else { return Ok(()) };
-        let Some(date) = NaiveDate::from_num_days_from_ce_opt(days) else { return Ok(()) };
-        if let Ok(times) = PrayerTimes::new(date, coordinates, parameters) {
-            if let Some(now) = DateTime::from_timestamp(now % 100_000_000_000, 0) {
-                let _ = (times.current(now), times.next(now), times.time_remaining(now));
-            }
+        let Ok(coordinates) = Coordinates::from_degrees(latitude, longitude) else { return Ok(()) };
+        let Ok(date) = Date::new(1970, 1, 1).unwrap().checked_add(jiff::Span::new().days(days)) else {
+            return Ok(())
+        };
+        let Ok(date) = PrayerDate::new(date) else { return Ok(()) };
+        let day = Day::calculate(date, coordinates, &parameters);
+        if let (Day::Complete(schedule), Ok(now)) = (day, Timestamp::from_second(now)) {
+            let _ = (schedule.current(now), schedule.next(now), schedule.until_next(now));
         }
-        let zone = FixedOffset::east_opt((now % 50_400) as i32).unwrap();
-        let _ = PrayerTimes::on_local_date(date, &zone, coordinates, parameters);
+        let zone = TimeZone::fixed(Offset::constant(offset));
+        let _ = Day::on_local_date(date, &zone, coordinates, &parameters);
     }
 
-    /// Without adjustments, a day's six times are in order, on whole minutes
-    /// when rounded, Dhuhr is within an hour of local mean noon, and the
-    /// whole day within a day of it.
+    /// A complete day without offsets: its six times in order, on whole
+    /// minutes when rounded, Dhuhr within an hour of local mean noon (but
+    /// for AqrabYaum), every time within a day of it. A partial day has
+    /// some time missing.
     #[test]
-    fn times_are_ordered_and_near_the_date(
+    fn days_are_what_they_say(
         coordinates in coordinates(),
         date in date(1900, 2100),
         parameters in parameters(),
     ) {
-        let Ok(times) = PrayerTimes::new(date, coordinates, parameters) else { return Ok(()) };
-        let six = SIX.map(|p| times.time(p));
-        for pair in six.windows(2) {
-            prop_assert!(pair[0] < pair[1], "{:?}", six);
-        }
-        if parameters.rounding != Rounding::None {
-            prop_assert!(six.iter().all(|t| t.second() == 0));
-        }
-        let mean_noon = date.and_hms_opt(12, 0, 0).unwrap().and_utc()
-            - TimeDelta::seconds((coordinates.longitude() * 240.0) as i64);
-        if parameters.polar_circle_resolution != PolarCircleResolution::AqrabYaum {
-            prop_assert!((times.time(Prayer::Dhuhr) - mean_noon).num_minutes().abs() <= 60);
-        }
-        for time in six {
-            prop_assert!((time - mean_noon).num_hours().abs() <= 24);
+        match Day::calculate(date, coordinates, &parameters) {
+            Day::Complete(schedule) => {
+                let six = Prayer::ALL.map(|p| schedule.at(p));
+                for pair in six.windows(2) {
+                    prop_assert!(pair[0] < pair[1], "{:?}", six);
+                }
+                if parameters.rounding() != Rounding::Off {
+                    prop_assert!(six.iter().all(|t| t.as_second() % 60 == 0));
+                }
+                let mean_noon = midnight(date) + SignedDuration::from_hours(12)
+                    - SignedDuration::from_secs((coordinates.longitude.degrees() * 240.0) as i64);
+                if parameters.polar_circle_resolution() != PolarCircleResolution::AqrabYaum {
+                    let off = schedule.at(Prayer::Dhuhr).duration_since(mean_noon);
+                    prop_assert!(off.as_mins().abs() <= 60);
+                }
+                for time in six {
+                    prop_assert!(time.duration_since(mean_noon).as_hours().abs() <= 24);
+                }
+            }
+            Day::Partial(partial) => {
+                prop_assert!(Prayer::ALL.iter().any(|&p| matches!(partial.outcome(p), Outcome::Unavailable(_))));
+            }
         }
     }
 
-    /// The night: Maghrib, its middle, its last third and the next Fajr in
-    /// order, and the next Fajr the next day's own. (A resolved polar day
-    /// and the next can borrow from different places or days, so the next
-    /// Fajr can come before Maghrib; unresolved within 60° it never does.)
+    /// The night: the next Fajr is the next day's own; Maghrib, the
+    /// middle, the last third and the next Fajr in order (strictly
+    /// unresolved within 60°; resolved polar days can borrow from different
+    /// places or days, so the next Fajr can come first, and a night of
+    /// minutes rounds its marks together).
     #[test]
     fn the_night_is_in_order(
         coordinates in coordinates(),
         date in date(1900, 2099),
         parameters in parameters(),
     ) {
-        let Ok(times) = PrayerTimes::new(date, coordinates, parameters) else { return Ok(()) };
-        // The next day's times need the day after's too, which may have none.
-        let Ok(next) = PrayerTimes::new(date.succ_opt().unwrap(), coordinates, parameters) else {
-            return Ok(());
-        };
-        prop_assert_eq!(times.time(Prayer::FajrTomorrow), next.time(Prayer::Fajr));
-        let unresolved = parameters.polar_circle_resolution == PolarCircleResolution::Unresolved;
-        if unresolved && coordinates.latitude().abs() <= 60.0 {
-            prop_assert!(times.time(Prayer::Maghrib) < times.time(Prayer::FajrTomorrow));
+        let Day::Complete(schedule) = Day::calculate(date, coordinates, &parameters) else { return Ok(()) };
+        let Night::Known { middle, last_third, next_fajr } = schedule.night() else { return Ok(()) };
+        let next = PrayerDate::new(date.date().tomorrow().unwrap()).unwrap();
+        prop_assert_eq!(Day::calculate(next, coordinates, &parameters).outcome(Prayer::Fajr), Outcome::Time(next_fajr));
+        let maghrib = schedule.at(Prayer::Maghrib);
+        let unresolved = parameters.polar_circle_resolution() == PolarCircleResolution::Unresolved;
+        if unresolved && coordinates.latitude.degrees().abs() <= 60.0 {
+            prop_assert!(maghrib < middle && middle < last_third && last_third < next_fajr.at());
         }
-        if times.time(Prayer::FajrTomorrow) <= times.time(Prayer::Maghrib) {
-            return Ok(());
+        if maghrib <= next_fajr.at() {
+            prop_assert!(maghrib <= middle && middle <= last_third && last_third <= next_fajr.at());
         }
-        // A night of minutes rounds its middle and last third together.
-        prop_assert!(times.time(Prayer::Maghrib) <= times.middle_of_the_night());
-        prop_assert!(times.middle_of_the_night() <= times.time(Prayer::Qiyam));
-        prop_assert!(times.time(Prayer::Qiyam) <= times.time(Prayer::FajrTomorrow));
     }
 
-    /// Away from the polar circles every day has times, and AqrabBalad
-    /// finds times everywhere.
+    /// Every day within 60° is complete, and every day with AqrabBalad.
     #[test]
     fn times_exist(
         coordinates in coordinates(),
         date in date(1900, 2100),
         parameters in parameters(),
     ) {
-        let result = PrayerTimes::new(date, coordinates, parameters);
-        if coordinates.latitude().abs() <= 60.0 {
-            prop_assert!(result.is_ok(), "{result:?}");
+        if coordinates.latitude.degrees().abs() <= 60.0 {
+            let day = Day::calculate(date, coordinates, &parameters);
+            prop_assert!(matches!(day, Day::Complete(_)), "{day:?}");
         }
-        let mut balad = parameters;
-        balad.polar_circle_resolution = PolarCircleResolution::AqrabBalad;
-        prop_assert!(PrayerTimes::new(date, coordinates, balad).is_ok());
+        let balad = parameters.with_polar_circle_resolution(PolarCircleResolution::AqrabBalad);
+        prop_assert!(matches!(Day::calculate(date, coordinates, &balad), Day::Complete(_)));
     }
 
-    /// current() and next() bracket any moment of the day.
+    /// current is the latest mark at or before any moment, next the
+    /// earliest after it, until_next the time to it.
     #[test]
     fn current_and_next_bracket_the_moment(
         coordinates in coordinates(),
@@ -224,44 +243,45 @@ proptest! {
         parameters in parameters(),
         offset in -86_400i64..(3 * 86_400),
     ) {
-        let Ok(times) = PrayerTimes::new(date, coordinates, parameters) else { return Ok(()) };
-        let now = date.and_hms_opt(0, 0, 0).unwrap().and_utc() + TimeDelta::seconds(offset);
-        if let Some(current) = times.current(now) {
-            prop_assert!(times.time(current) <= now);
+        let Day::Complete(schedule) = Day::calculate(date, coordinates, &parameters) else { return Ok(()) };
+        let now = midnight(date) + SignedDuration::from_secs(offset);
+        if let Some(current) = schedule.current(now) {
+            prop_assert!(schedule.mark(current).unwrap() <= now);
         }
-        if let Some(next) = times.next(now) {
-            prop_assert!(times.time(next) > now);
-            prop_assert_eq!(times.time_remaining(now), Some(times.time(next) - now));
+        if let Some(next) = schedule.next(now) {
+            let at = schedule.mark(next).unwrap();
+            prop_assert!(at > now);
+            prop_assert_eq!(schedule.until_next(now), Some(at.duration_since(now)));
         }
     }
 
-    /// The times of a local date have their Dhuhr on that date in the zone,
-    /// for a zone within 10 hours of local mean time, give or take a day
-    /// (Kiritimati's is 24.5 hours off). Twelve hours off, noon is at
-    /// midnight, and there may be no solar day with its noon on the date.
+    /// A local date's Dhuhr falls on it in the zone, for a zone within 10
+    /// hours of local mean time (Kiritimati's is 24.5 hours off: within
+    /// 0.5 of it, a day apart).
     #[test]
     fn local_dates_have_their_noon(
         latitude in -60.0..=60.0f64,
         longitude in -180.0..=180.0f64,
         date in date(1900, 2100),
-        off_meridian in -9i32..=9,
+        off_meridian in -9i8..=9,
     ) {
-        let offset_hours = match (longitude / 15.0).round() as i32 + off_meridian {
+        let hours = match (longitude / 15.0).round() as i8 + off_meridian {
             o if o > 14 => o - 24,
             o if o < -12 => o + 24,
             o => o,
         };
-        let coordinates = Coordinates::new(latitude, longitude).unwrap();
-        let zone = FixedOffset::east_opt(offset_hours * 3600).unwrap();
-        let parameters = Configuration::with(Method::MuslimWorldLeague, Madhab::Shafi);
-        let times = PrayerTimes::on_local_date(date, &zone, coordinates, parameters).unwrap();
-        prop_assert_eq!(times.time(Prayer::Dhuhr).with_timezone(&zone).date_naive(), date);
+        let coordinates = Coordinates::from_degrees(latitude, longitude).unwrap();
+        let zone = TimeZone::fixed(Offset::constant(hours));
+        let parameters = Method::MuslimWorldLeague.parameters();
+        let day = Day::on_local_date(date, &zone, coordinates, &parameters);
+        let Outcome::Time(dhuhr) = day.outcome(Prayer::Dhuhr) else { panic!("a Dhuhr") };
+        prop_assert_eq!(zone.to_datetime(dhuhr.at()).date(), date.date());
     }
 
     /// Qiblah bearings are in [0, 360) everywhere.
     #[test]
     fn qiblah_is_a_bearing(coordinates in coordinates()) {
-        let bearing = Qiblah::new(coordinates).value();
+        let bearing = Qiblah::new(coordinates).degrees();
         prop_assert!((0.0..360.0).contains(&bearing), "{bearing}");
     }
 }
