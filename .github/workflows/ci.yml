@@ -48,6 +48,20 @@ jobs:
       - run: cargo build --no-default-features --features libm --target thumbv7em-none-eabihf
       - run: cargo test --lib
 
+  # The Verus proofs of the integer core (VERIFICATION.md).
+  verus:
+    runs-on: ubuntu-latest
+    env:
+      VERUS_RELEASE: 0.2026.11.02.8bf68ee
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Verus and its Rust toolchain
+        run: |
+          curl -sfLO "https://github.com/verus-lang/verus/releases/download/release/$VERUS_RELEASE/verus-$VERUS_RELEASE-x86-linux.zip"
+          unzip -q "verus-$VERUS_RELEASE-x86-linux.zip"
+          rustup install "$(jq -r '.verus.toolchain' verus-x86-linux/version.json | cut -d' ' -f1)"
+      - run: verus-x86-linux/verus src/verified.rs --crate-type=lib
+
   # The Kani proofs (VERIFICATION.md).
   kani:
     runs-on: ubuntu-latest

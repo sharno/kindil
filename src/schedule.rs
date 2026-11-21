@@ -613,8 +613,9 @@ fn solar_noon(civil: Civil, coordinates: Coordinates, parameters: &Parameters) -
 }
 
 /// Seconds since 1970 as a jiff instant. The core's seconds are within
-/// ±4·10¹⁰ (Verus: `absolute`), inside jiff's range, so the conversion
-/// never fails (Kani: `timestamps_convert`); its stand-in is never reached.
+/// ±4·10¹⁰ (Verus: `absolute`), inside jiff's range, where `from_second`
+/// never fails (jiff's semver guarantee; tests::the_cores_seconds_are_jiff_instants):
+/// its stand-in is never reached.
 pub(crate) fn timestamp(seconds: i64) -> Timestamp {
     Timestamp::from_second(seconds).unwrap_or(Timestamp::UNIX_EPOCH)
 }
@@ -638,8 +639,8 @@ mod proofs {
 
     fn any_share() -> Share {
         let (numerator, denominator): (i64, i64) = (kani::any(), kani::any());
-        kani::assume(0 <= numerator && 1 <= denominator && denominator <= 6000);
-        kani::assume(2 * numerator <= denominator);
+        kani::assume((1..=6000).contains(&denominator));
+        kani::assume((0..=3000).contains(&numerator) && 2 * numerator <= denominator);
         Share {
             numerator,
             denominator,
@@ -702,8 +703,8 @@ mod proofs {
         }
     }
 
-    /// `timestamp`, for the proofs below: total (timestamps_convert), and
-    /// slow to verify.
+    /// `timestamp`, for the proofs below: total (see its doc), and slow to
+    /// model check.
     #[allow(dead_code)] // Used by kani::stub.
     fn any_timestamp(_: i64) -> Timestamp {
         Timestamp::UNIX_EPOCH
@@ -719,6 +720,27 @@ mod proofs {
         seconds + moved
     }
 
+    fn any_slot(timed: bool) -> Slot {
+        let t: i64 = kani::any();
+        kani::assume((-verified::DAY_BOUND..=verified::DAY_BOUND).contains(&t));
+        match (timed, kani::any::<u8>()) {
+            (_, 0) => Slot::At(t),
+            (_, 1) => Slot::Fallback(t, kani::any()),
+            (true, _) => Slot::At(t),
+            (false, _) => Slot::Missing(kani::any()),
+        }
+    }
+
+    /// `verified::resolve`, for the proof below: any day its Verus contract
+    /// allows (every time within DAY_BOUND; Ordered only with all six).
+    #[allow(dead_code)] // Used by kani::stub.
+    fn any_resolved(_: &Events, _: &Bound, _: IshaBy) -> Core {
+        match kani::any() {
+            true => Core::Ordered([0; 6].map(|_| any_slot(true))),
+            false => Core::Partial([0; 6].map(|_| any_slot(false))),
+        }
+    }
+
     /// `verified::night_times`, for the proof below: any two times (Verus
     /// proves what they are).
     #[allow(dead_code)] // Used by kani::stub.
@@ -729,27 +751,66 @@ mod proofs {
         (middle, last_third)
     }
 
-    /// The whole calculation after the astronomy, for any date, place and
-    /// parameters without a polar circle resolution, and any observation
-    /// (stubbed; and the core's rounding and night by their Verus
-    /// contracts): no panic.
+    /// A day's times after the astronomy, for any place and parameters
+    /// (every polar circle resolution) and any observation: the rules, the
+    /// polar search's result, offsets and rounding, absolute seconds, the
+    /// public outcomes. No panic. The float layer, the core's `resolve` and
+    /// `round` and the polar searches are stubbed by their proven
+    /// contracts; the date is fixed (it enters only through `Civil::number`
+    /// and `absolute`, which Verus proves for every date). With
+    /// `night_is_total`, all of `Day::calculate`'s glue: `day_of` only
+    /// matches on what these return.
     #[kani::proof]
     #[kani::stub(Observed::new, any_observed)]
+    #[kani::stub(verified::resolve, any_resolved)]
+    #[kani::stub(timestamp, any_timestamp)]
+    #[kani::stub(verified::round, any_rounding)]
+    #[kani::stub(nearest_latitude, any_search)]
+    #[kani::stub(nearest_day, any_search)]
+    fn todays_times_are_total() {
+        let parameters: Parameters = kani::any();
+        let civil = Civil::new(2026, 3, 20).unwrap();
+        let today = rounded(civil, kani::any(), &parameters);
+        let _ = today.six.map(|slot| outcome(slot, &today, &parameters));
+    }
+
+    /// A complete day's night, as `todays_times_are_total` (the next day's
+    /// times, its Fajr, the core's `night_times` by its contract): no
+    /// panic.
+    #[kani::proof]
+    #[kani::stub(Observed::new, any_observed)]
+    #[kani::stub(verified::resolve, any_resolved)]
     #[kani::stub(timestamp, any_timestamp)]
     #[kani::stub(verified::round, any_rounding)]
     #[kani::stub(verified::night_times, any_night)]
-    fn calculate_is_total() {
+    #[kani::stub(nearest_latitude, any_search)]
+    #[kani::stub(nearest_day, any_search)]
+    fn night_is_total() {
         let parameters: Parameters = kani::any();
-        kani::assume(parameters.polar_circle_resolution() == PolarCircleResolution::Unresolved);
-        let day = day_of(
-            jiff::civil::date(2000, 1, 1),
-            any_civil(),
+        let civil = Civil::new(2026, 3, 20).unwrap();
+        let _ = night(
+            Time::Computed(Timestamp::UNIX_EPOCH),
+            civil,
             kani::any(),
             &parameters,
         );
-        if let Day::Complete(schedule) = day {
-            let _ = schedule.current(Timestamp::UNIX_EPOCH);
-        }
+    }
+
+    /// The polar circle resolutions' searches, for the proof below: none,
+    /// or any day borrowed from elsewhere (their every step is proven by
+    /// polar_circle_resolution_steps_are_total; the model checker would
+    /// unroll their 180 and 183 steps).
+    #[allow(dead_code)] // Used by kani::stub.
+    fn any_search(civil: Civil, _: Coordinates, _: &Parameters) -> Option<Unrounded> {
+        kani::any::<bool>().then(|| Unrounded {
+            civil,
+            six: [0; 6].map(|_| any_slot(true)),
+            source: match kani::any() {
+                true => Source::NearestLatitude(kani::any()),
+                false => Source::NearestDay(kani::any()),
+            },
+            polar_night: kani::any(),
+        })
     }
 
     /// Every step of the polar circle resolutions' searches (any of the
@@ -769,13 +830,21 @@ mod proofs {
         kani::assume(days != 0 && (-SEARCH_DAYS..=SEARCH_DAYS).contains(&days));
         let _ = moved(civil, other, days, coordinates, &parameters);
     }
+}
 
-    /// Every number of seconds the core makes is a jiff instant: the
-    /// stand-in in `timestamp` is never reached.
-    #[kani::proof]
-    fn timestamps_convert() {
-        let seconds: i64 = kani::any();
-        kani::assume((-MAX_SECONDS..=MAX_SECONDS).contains(&seconds));
-        assert!(Timestamp::from_second(seconds).is_ok());
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::verified::MAX_SECONDS;
+
+    /// The core's seconds are inside jiff's range, where `from_second`
+    /// never fails ("a semver guarantee", jiff's docs): `timestamp`'s
+    /// stand-in is never reached.
+    #[test]
+    fn the_cores_seconds_are_jiff_instants() {
+        assert!(Timestamp::MIN.as_second() < -MAX_SECONDS);
+        assert!(MAX_SECONDS < Timestamp::MAX.as_second());
+        assert!(Timestamp::from_second(-MAX_SECONDS).is_ok());
+        assert!(Timestamp::from_second(MAX_SECONDS).is_ok());
     }
 }

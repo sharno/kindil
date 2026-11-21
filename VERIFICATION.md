@@ -1,124 +1,181 @@
 # Verification
 
-What is proven about this crate, what is tested, and what is assumed.
-CI (`.github/workflows/ci.yml`) runs all of it on every push.
+What is proven about tawqit, what is only tested, and how the parts
+connect. CI (`.github/workflows/ci.yml`) runs all of it on every push.
 
-## Proven: Kani
+## The layers
 
-[Kani](https://github.com/model-checking/kani) is a bounded model checker
-for Rust: a harness's inputs are symbolic, so a proof covers every value at
-once (every f64 bit pattern, every enum variant), and Kani checks the
-harness's assertions, and every panic, overflow and out-of-bounds access, on
-all of them. Run them with:
-
-```sh
-cargo install --locked kani-verifier --version 0.68.0 && cargo kani setup
-cargo kani -Z stubbing                       # all of them
-cargo kani -Z stubbing --harness day_rules   # one
+```text
+ inputs ──▶ checked types ──▶ float astronomy ──▶ conversions ──▶ integer core ──▶ jiff types
+ (f64, jiff  Latitude, …,      Meeus, Adhan's      hours → s,       Verus: every     Timestamp,
+  Date)      PrayerDate        root finder         seasons → s,     function proven  Day, Schedule
+             (Kani; dates:     (tested: Adhan,     shares exact     for all inputs   (jiff's range
+              exhaustive)       NOAA)              (Kani)                            guarantee)
 ```
 
-The harnesses are in `#[cfg(kani)] mod proofs` next to the code they prove.
-Times are on a laptop (Apple M-series), Kani 0.68.0, CBMC 6.11; all 13 take
-about 26 minutes one after another.
+1. **Checked types** (`geo`, `parameters`, `date`): one fallible
+   constructor each; Kani proves each accepts exactly its range.
+2. **Float astronomy** (`astronomy`): sunrise, transit, sunset, the sun at
+   an angle, Asr's shadow, the Moonsighting seasons, the Qiblah. Not
+   proven correct; tested against Adhan and NOAA (below).
+3. **Conversions** (`observe`, `astronomy::ops`): every number the core
+   gets from floating point passes through one of them, and Kani proves
+   each lands within the core's preconditions.
+4. **Integer core** (`src/verified.rs`): everything from the events in
+   whole seconds to the times shown, proven with Verus for every input that
+   meets its preconditions.
+5. **jiff at the edges** (`schedule`): seconds to `Timestamp` (inside
+   jiff's guaranteed range), the public types; Kani proves the glue between
+   the proven parts can't panic.
+
+### The trusted boundary, exactly
+
+- **Verus's erasure.** `src/verified.rs` is written inside `verus!`; Verus
+  reads its specs and proofs, and a normal build erases them through the
+  same macro (`verus_builtin_macros`, pinned to the build of the Verus
+  release used) and compiles the remaining Rust. The proven functions
+  *are* the functions that run; there is no second copy.
+- **Preconditions at the boundary.** Verus proves each core function for
+  inputs meeting its `requires`; a normal build doesn't check them at run
+  time. The callers outside the core meet them by construction, and Kani
+  proves the parts that aren't plain construction:
+  | Core precondition | Established by |
+  | --- | --- |
+  | events within ±`EVENT_BOUND` (4 days) of their date's 00:00 UTC | `observe::seconds` (Kani: `seconds_are_within_the_event_bound`) |
+  | the transit within the bound | `observe::transit`: `seconds` of the transit, or else local mean noon, in range for any longitude by construction (that the stand-in is never used is tested, not proven: every Dhuhr in the differential tests is Adhan's) |
+  | seasons within [0, `SEASON_BOUND`] | Kani: `seasons_are_within_the_bound` |
+  | shares of the night ≤ ½, denominators ≤ 6000 | `HighLatitudeRule::share` (1/2, 1/7, angle/6000 for angles ≤ 3000 hundredths: Kani `angle_new_is_total`) |
+  | Isha intervals 5–240 minutes | `IshaInterval`'s constructor |
+  | offsets within ±1440 minutes | `MinuteOffset` (±720) × 2 (Kani: `offsets_are_within_the_core_bound`) |
+  | a valid date in years 999–3001 | `Civil` (its Verus type invariant; built only by `Civil::new`, `next`, `previous`); `PrayerDate::new` accepts exactly the supported jiff dates (tested on every one of the 730,485: the domain is finite) |
+  | seconds within ±`MAX_SECONDS` are a `Timestamp` | jiff's semver guarantee for `from_second` inside `Timestamp::MIN..=MAX`; a unit test pins the bounds (below) |
+- **The tools**: Verus (and Z3), Kani (and CBMC), rustc.
+
+## Proven: Verus (the integer core)
+
+`verus src/verified.rs --crate-type=lib` (Verus 0.2026.11.02.8bf68ee):
+77 items, 1.5 seconds. Unbounded: every input meeting the preconditions,
+no bounded model.
+
+| Function or lemma | Proves |
+| --- | --- |
+| `is_leap`, `month_length` | equal the Gregorian rules (`leap`, `days_in_month`) |
+| `day_of_year_of` | the day of the year, in 1..=365/366 |
+| `day_number_of` | days since 1970-01-01, by the spec (`day_number`), in range |
+| `lemma_day_number_successor` | the day after a date is a date, and its day number is one more: day numbers count days |
+| `lemma_epoch` | 1970-01-01 is day 0 |
+| `Civil` (type invariant), `new`, `next`, `previous`, `number`, `day_of_year` | a `Civil` is always a valid date; `new` accepts exactly the valid ones; `next`/`previous` are the next/previous date (`next_date`, `previous_date`), a day number apart, None only at the ends |
+| `days_since_solstice` | exactly `(day − solstice offset) mod year length`, a day of the year |
+| `round` | exactly `round_spec`: nearest minute (half up), ceiling, or none |
+| `lemma_round_bounds` | Nearest moves by −29..=30 s, Up by 0..=59 s, onto a minute; Exact not at all |
+| `lemma_round_idempotent` | rounding twice is rounding once |
+| `lemma_round_monotone`, `lemma_round_minute` | rounding keeps order; a minute stays |
+| `absolute` | `day × 86400 + offset`, within ±`MAX_SECONDS` |
+| `day_and_second` | a time's day and second of day (0..86400): the day rolls over at 24:00 |
+| `add_minutes` | exactly `offset + 60 × minutes`, no overflow |
+| `share_seconds`, `share_seconds_up` | ⌊n·share⌋ and ⌈n·share⌉, within [0, n] |
+| `fajr_of`, `isha_of`, `maghrib_of` | exactly the rules (`fajr_spec`, …): the sun's time unless outside the night's bound or within 5 minutes of sunrise/sunset (then `Fallback` with the rule that gave it), Isha by interval, Maghrib's angle only after sunset and 5 minutes before Isha (else `Fallback(Sunset)`), `Missing` with the reason when an event isn't |
+| `in_order` | true exactly when consecutive times are ≥ 5 minutes apart |
+| `resolve` | the day's times by the rules; `Ordered` exactly when all six are there in order 5 minutes apart; otherwise `Partial`, as the rules leave them, or all `Missing(Order)` when all are there but out of order; every time within its bound |
+| `finish` | each time with its offsets added and rounded, exactly |
+| `lemma_finish_keeps_order` | without offsets, rounding keeps an ordered day in order (≥ 4 minutes apart) |
+| `night_times` | the night's middle and last third, exactly (floored to the second, then rounded); for a night that doesn't run backwards, with Maghrib and Fajr on a minute (as rounded times are): Maghrib ≤ middle ≤ last third ≤ next Fajr |
+| `latest_at_or_before`, `earliest_after` | exactly the latest time at or before the moment (the last of equals) and the earliest after it (the first of equals), None exactly when there is none |
+
+## Proven: Kani (the boundaries)
+
+`cargo kani -Z stubbing` (Kani 0.68.0, CBMC 6.11). Kani is a bounded model
+checker: each harness's inputs are symbolic (every f64 bit pattern, every
+enum variant), and it checks the assertions and every panic, overflow and
+out-of-bounds access. It over-approximates `sin`, `cos`, `acos` and the like
+(any value in their range, or NaN).
 
 | Harness | Proves, for every input | Time |
 | --- | --- | --- |
-| `time::at_hours_is_total_and_near_the_date` | Any f64 hours (NaN, ±∞, any size) on any supported date: no time, or one within 72 h of that date's 00:00 UTC. No panic. | 9 s |
-| `time::rounding_stays_within_a_minute` | Any moment within 5 days of the supported dates, any `Rounding`: `Nearest` moves it by −29..=30 s, `Up` by 0..=59 s, `None` not at all; the result is on a whole minute (but for `None`), rounding it again changes nothing, and it converts to a chrono `DateTime` (`Moment::utc` is total). | 390 s |
-| `astronomy::unit::normalized_to_scale_is_in_range` | Any finite f64 normalizes into [0, max) for max 1, 24 and 360 (angles, fractions of a day). | 2 s |
-| `astronomy::ops::days_since_solstice_is_a_day_of_the_year` | Any day 1..=366 of any year 1000..=3000, any latitude: a day of that year. | < 1 s |
-| `astronomy::ops::julian_day_is_total` | Any year 1000..=3000, month, day: a finite Julian day, no overflow. | < 1 s |
-| `models::coordinates::new_is_total` | Any two f64: `Ok` exactly when the latitude is in [−90, 90] and the longitude finite, then with the longitude in [−180, 180]; the matching error otherwise. | < 1 s |
-| `models::parameters::angles_and_night_portions` | Any f64: a `DepressionAngle` exactly when in [0, 30]; any angle's night portion under any rule is in [0, 1/2]. | < 1 s |
-| `schedule::day_rules_are_total_and_ordered` | `Day::from_events`, the rules that make a day's times from the sun's events, for any events (any moments within 5 days of the supported dates, each present or not), any supported date, any latitude and any `Parameters` (every method, madhab, high-latitude rule, shafaq, rounding, angle, Isha interval and adjustment): no panic; a day it makes has Fajr, Sunrise, Dhuhr, Asr, Maghrib, Isha in order at least 5 minutes apart, still strictly in order after rounding when there are no adjustments (rounding stubbed by any moment within its proven −29..=59 s); otherwise it is `NoAsr` or `TimesOutOfOrder` of that date. | 125 s |
-| `schedule::night_times_are_in_order` | For any night (Maghrib before the next Fajr, any moments near the supported dates) and rounding: Maghrib ≤ the middle of the night ≤ the start of its last third ≤ the next Fajr, within the minute rounding moves them. | 498 s |
-| `schedule::current_and_next_bracket_the_moment` | For any 8 times and any moment: `current`'s index is the last time at or before it, `next`'s the first after it, and each is `None` exactly when there is none. (`PrayerTimes::current`, `next` and `time_remaining` are this, on their times.) | 3 s |
-| `schedule::latitudes_toward_the_equator_are_latitudes` | AqrabBalad's latitudes, from any latitude in any number of steps up to 180: valid latitudes, no farther from the equator, on the same side. | 1 s |
-| `schedule::prayer_times_new_is_total` | `PrayerTimes::new`, the public calculation, for any date chrono has (supported or not), any coordinates, any parameters without a polar circle resolution, with the astronomy (`Events::new`) any events or either of its errors, and `Moment::utc` stubbed (proven total above): no panic, and `DateOutOfRange` outside the supported dates. | 545 s |
-| `schedule::polar_circle_resolution_steps_are_total` | The polar circle resolutions' searches, for any supported date, coordinates and parameters, with each day they try any times or none (`Day::unresolved` stubbed): AqrabBalad tries at most 180 latitudes, and every try of either search (any of the 180 latitudes, any of the ±183 days) is panic-free; the searches around them are std's iterators over those ranges. | 5 s |
+| `observe::seconds_are_within_the_event_bound` | Any f64 hours (NaN, ±∞, any size): no time, or whole seconds within the core's ±`EVENT_BOUND` | 1 s |
+| `astronomy::ops::seasons_are_within_the_bound` | The Moonsighting Committee's seasonal twilights, any latitude, any day since the solstice, any shafaq: whole seconds in [0, `SEASON_BOUND`] | 117 s |
+| `astronomy::ops::julian_day_is_exact` | The Julian day of every day number the core makes is exact (the float layer's one conversion from the calendar) | 1 s |
+| `astronomy::unit::normalized_to_scale_is_in_range` | Any finite f64 normalizes into [0, max) for max 1, 24, 360 | 2 s |
+| `geo::latitude_new_is_total`, `geo::longitude_new_is_total` | Any f64: a latitude exactly when in [−90, 90]; a longitude exactly when finite, then in [−180, 180] | 1 s each |
+| `geo::latitudes_toward_the_equator_are_latitudes` | AqrabBalad's latitudes, any number of steps from any latitude: latitudes, no farther from the equator, on its side; at most 180 steps | 1 s |
+| `parameters::angle_new_is_total` | Any f64 is an angle exactly when it rounds into (0, 30] hundredths; its share of the night is at most a half (the core's precondition) | 1 s |
+| `parameters::offsets_are_within_the_core_bound` | Any parameters' offsets (method's + user's) are within ±1440 minutes (the core's precondition) | 1 s |
+| `schedule::polar_circle_resolution_steps_are_total` | Every step of AqrabBalad's and AqrabYaum's searches, any date, place, parameters, and any observation (stubbed): no panic | 12 s |
+| `schedule::todays_times_are_total` | A day's times after the astronomy, any place, any parameters (every polar circle resolution), any observation: the rules' result, the polar search's, offsets and rounding, absolute seconds, the public outcomes: no panic | 17 s |
+| `schedule::night_is_total` | A complete day's night (the next day's times, its Fajr, the night's marks), as above: no panic | 15 s |
 
-### What the proofs assume
+All 12 take 2 minutes 47 seconds one after another.
 
-- **The astronomy is taken as any value.** The floating-point astronomy
-  (`SolarTime`, Meeus's series, the iteration to the sun's altitude) is
-  replaced in the schedule harnesses by any events at all, and CBMC
-  over-approximates `sin`, `cos`, `acos` and the like (any value in their
-  range, or NaN). So the proofs show the code around the astronomy can't
-  panic and keeps its invariants *whatever the astronomy returns*; that the
-  astronomy is *right* is what the differential tests below are for. The
-  astronomy itself has no panicking operation: it is f64 arithmetic, whose
-  operations can't panic, and saturating casts.
-- **Stubs.** `Events::new`, `Day::unresolved`, `Moment::utc` and
-  `Moment::rounded` are stubbed (`#[kani::stub]`) where noted: the first two
-  by any value of their result type; `Moment::utc` by a fixed time (its
-  totality is `rounding_stays_within_a_minute`'s); `Moment::rounded` by any
-  moment within the bounds that harness proves. Each stub is an
-  over-approximation of what it replaces, so a proof with it holds without
-  it; the stubbed functions are proven on their own. (They are stubbed
-  because chrono's date arithmetic and 64-bit division are slow to verify.)
-  Stubbing needs Kani's `-Z stubbing`.
-- **Bounds.** Dates are 1000-01-01 to 3000-12-31 (`FIRST_DATE`,
-  `LAST_DATE`; `PrayerTimes::new` returns `DateOutOfRange` outside them, and
-  `prayer_times_new_is_total` covers every other date chrono has). Moments
-  are within 5 days of those dates, which every moment the calculation makes
-  is (solar events within 72 h of their date, shares of a night, i16 minutes
-  of adjustment, AqrabYaum's 183 days moved by the same amount back).
-- **Kani's models.** Kani's model of float `%` is imprecise (it reported a
-  longitude wrap out of range that concrete execution doesn't produce), so
-  the code wraps with `normalized_to_scale`, whose range is proven, instead.
+The last two harnesses together cover `Day::calculate`'s glue: `day_of`
+only matches on what they return. Their date is fixed: it enters the glue
+only through `Civil::number`, `next` and `absolute`, which Verus proves for
+every date. Stubs (Kani's `-Z stubbing`) replace, in the harnesses that say
+so: the float layer (`Observed::new`) by any observation meeting the core's
+preconditions (which the conversion harnesses prove it does); the core's
+`resolve`, `round` and `night_times` by any result their Verus
+postconditions allow; the polar searches by any result (their every step is
+`polar_circle_resolution_steps_are_total`'s); `timestamp` by a fixed
+instant. Each stub
+over-approximates what it replaces, so a proof with it holds without it.
+Where Kani would have to re-prove what Verus proves (64-bit division, the
+date arithmetic, and loops it unrolls even on paths ruled out make that
+slow), the harness takes the proven contract instead.
+
+What Kani doesn't cover, and how it's covered instead:
+- `timestamp` (seconds to `jiff::Timestamp`) never fails: the core's
+  seconds are within ±4·10¹⁰, inside `Timestamp::MIN..=MAX`, where jiff
+  guarantees `from_second` succeeds (its docs: "a semver guarantee"); a unit
+  test pins the bounds. A harness over jiff's internals didn't finish in 15
+  minutes.
+- `Schedule::current`, `next` and `until_next`: their searches are Verus's
+  (`latest_at_or_before`, `earliest_after`); around them, a `match` over
+  the marks and `.get` (a harness over symbolic jiff instants didn't
+  finish in five minutes). The property tests run them over every moment
+  of 40,000 days.
+- `PrayerDate::new` accepts exactly the supported dates: the domain is
+  finite, and a unit test goes through all 730,485 dates (with the
+  calendar's agreement with jiff).
 
 ## Tested
 
 `cargo test --release --all-features`:
 
-- **Unit and regression tests** (`src/`): one per fixed bug, which fails
-  before its fix (see the git log), and Adhan's and salah's own examples.
-- **Property tests** (`tests/properties.rs`, proptest, 40,000 cases each),
-  with the real astronomy:
-  - any f64 coordinates, any date chrono has, any parameters (angles, Isha
-    intervals, adjustments, every method, rule, resolution, rounding), any
-    moment and zone: no panic, in `new`, `current`, `next`,
-    `time_remaining` and `on_local_date`;
-  - without adjustments, the six times are in order, on whole minutes when
-    rounded, Dhuhr within an hour of local mean noon (but for AqrabYaum),
-    every time within a day of it (1900–2100, every latitude);
-  - the next Fajr is the next day's own, and Maghrib, the middle of the
-    night, its last third and the next Fajr are in order (strictly within
-    60° unresolved; resolved polar days can borrow from different places);
-  - every day within 60° has times for every method, and AqrabBalad finds
-    times everywhere;
-  - `current` and `next` bracket any moment, and `time_remaining` is the
-    time to `next`;
-  - `on_local_date`'s Dhuhr falls on the local date, for zones within 10 h
-    of local mean time;
-  - Qiblah bearings are in [0, 360).
+- **Regression tests** (`tests/regressions.rs`): one per fixed bug, each of
+  which failed before its fix (the git history has them), and the reference
+  times salah and Adhan were checked against.
+- **Property tests** (`tests/properties.rs`, proptest, 40,000 cases each,
+  the real astronomy): no panic for any f64 coordinates, any date jiff has,
+  any parameters, moment and zone; a complete day's six times in order (no
+  offsets), on minutes when rounded, Dhuhr near local mean noon; a partial
+  day missing something; the night in order and its next Fajr the next
+  day's own; every day within 60° complete, every day with AqrabBalad
+  complete; current and next bracketing any moment; a local date's Dhuhr
+  on it; Qiblah bearings in [0, 360).
+- **The calendar against jiff**, every date 1000–3000 (`date.rs`).
 - **Differential test against Adhan** (`tests/differential.rs`): adhan-js
-  (the library salah ports; commit d2993d5, generated by
-  `tests/fixtures/adhan/generate.ts`) for 29 places from 78°S to 78°N and
-  both sides of the date line, every method, both madhabs, every
-  high-latitude rule, shafaq and polar circle resolution, on 29 dates
-  (2026, and 1990 to 2100): all six times and the middle and last third of
-  the night **agree to the minute** (tolerance 0) on all 14,961 days both
-  have times. The only other differences are by design and listed in the
-  test: 15 days where salah has no times because the next day has none.
-- **Differential test against NOAA** (`tests/noaa.rs`): an independent
-  solar calculation, NOAA's (the equation of time rather than salah's right
-  ascension and sidereal time), written in the test. Sunrise, transit and
-  sunset from 65°S to 65°N, and 18° twilights from 45°S to 45°N, every 11th
-  day of every 25th year from 1950 to 2150 on a 5° × 30° grid: 436,968
-  times, **within 10 seconds (3 at worst)**, away from the edge of the sun's
-  reaching an angle at all (where the time's dependence on the angle is
-  unbounded).
-- **no_std**: `cargo test --no-default-features --features libm`, a test
-  that libm's functions agree with std's, and a build for
-  `thumbv7em-none-eabihf`.
+  at commit d2993d5 (`tests/fixtures/adhan/generate.ts`), 29 places from
+  78°S to 78°N and both sides of the date line, every method, madhab,
+  high-latitude rule, shafaq and polar circle resolution, on 29 dates:
+  **14,976 days with all six times and the night equal to the minute**
+  (tolerance 0); the 1,003 days Adhan has no times for are partial days
+  here.
+- **Differential test against NOAA** (`tests/noaa.rs`): NOAA's solar
+  calculator, written in the test (the equation of time rather than right
+  ascension and sidereal time): sunrise, transit, sunset (65°S–65°N) and
+  18° twilights (45°S–45°N), 1950–2150: **436,968 times within 10 s, 3 s at
+  worst**.
+- **no_std**: a build for `thumbv7em-none-eabihf` without std or an
+  allocator, the tests on the libm path, and a test that libm agrees with
+  std.
 
 ## Not covered
 
-- The astronomy's accuracy far from 1950–2150: ΔT and the low-precision
-  series' error grow with distance from 2000; the supported dates' first and
-  last centuries aren't checked against a reference here.
-- Whether a method's angles match an authority's published tables: methods
-  are Adhan's, and agree with Adhan.
-- Time zones and daylight saving: times are UTC; converting them is the
-  caller's (`on_local_date` takes any chrono `TimeZone`).
+- The astronomy's correctness, beyond the differential tests: Kani proves
+  only that it can't panic (f64 arithmetic can't) and that what leaves it
+  is in range.
+- Accuracy far from 1950–2150 (ΔT and the series' error grow with distance
+  from 2000).
+- Whether a method's angles match an authority's tables: methods are
+  Adhan's, and agree with Adhan.
+- Time zones: times are UTC; `Day::on_local_date` takes any jiff
+  `TimeZone`, tested with fixed offsets.

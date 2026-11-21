@@ -561,6 +561,7 @@ pub fn add_minutes(offset: i64, minutes: i32) -> (r: i64)
 
 /// Why a time is missing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub enum Missing {
     /// No sunrise (Sunrise, and Fajr, which is bound to it).
     Sunrise,
@@ -577,6 +578,7 @@ pub enum Missing {
 
 /// The rule that gave a time in place of the sun's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub enum Rule {
     /// Fajr no earlier, Isha no later, than a share of the night.
     NightShare,
