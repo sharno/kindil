@@ -305,7 +305,8 @@ faster.
   UI and its Java framework, since kindil draws to the screen itself, and
   stop Amazon's boot spinner. While kindil runs (from a boot or from KUAL),
   its launcher stops powerd, whose work kindil does, and the services kindil
-  has no use for (connections, apps, archive, updates, sync and the like);
+  has no use for (connections, apps, archive, updates, sync and the like,
+  and cron, whose crontab only rotates and gathers Amazon's logs);
   kindil runs Wi-Fi itself, so wifid doesn't run either. Of Amazon's system
   only volumd stays, unless kindil runs USB drive mode itself (off by default). kindil comes up about 20 s after
   the kernel, with more memory free. Every way back to Amazon's UI removes the flag first and

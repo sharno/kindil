@@ -75,7 +75,9 @@ startup → system
 
 - **Telemetry:** `syslog` (syslog-ng, `expect fork`) and `cron`
   (`crond -f -c /etc/crontab`) start on `started system`, among the very
-  first jobs, long before `volumd`. Kindil doesn't stop them today either.
+  first jobs, long before `volumd`. The session's stopper stops `cron`
+  (in SERVICES) and `restore()` starts it again; `syslog`
+  stays.
 - **`x`** starts on `started dbus`, which follows `dbus_ready` by the rest
   of dbus's post-start script (one `f_log`). In principle that is a race
   with kindil's job. In practice it is lost: the launcher has `/bin/sh`,
