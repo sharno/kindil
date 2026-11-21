@@ -116,6 +116,8 @@ pub trait Kernel {
     fn epoch(&self) -> i64;
     /// The system clock caught up with the RTC, if it lost a second or more.
     fn catch_up(&self) -> Option<Correction>;
+    /// Whether the kernel can take a suspend (src/health.rs).
+    fn health(&self) -> crate::health::Health;
 }
 
 /// What a suspend needs: the RTC, if there is one, the kernel, and the
@@ -339,8 +341,18 @@ fn suspend(env: &Env, what: &str, armed: bool) -> Back {
 }
 
 /// One suspend, ending as `wake` says: back (refused or not), or an error
-/// if `wake` needs an alarm that couldn't be armed, with no suspend.
+/// if `wake` needs an alarm that couldn't be armed, with no suspend; or
+/// [`crate::health::Unfit`], with no suspend and no alarm, once the kernel
+/// has oopsed (every driver suspends with the device, the broken one too,
+/// and on 2026-11-20 that one never returned) or lost too much memory.
 pub fn once(env: &Env, what: &'static str, wake: Wake) -> anyhow::Result<Back> {
+    match env.kernel.health() {
+        crate::health::Health::Sound => {}
+        crate::health::Health::Unfit(unfit) => {
+            env.kernel.note(&format!("{what}: not suspending: {unfit}"));
+            return Err(unfit.into());
+        }
+    }
     let awake = Suspend::awake(what);
     let resumed = match wake {
         Wake::Alarm(after) => awake.arm(env, after)?.suspend(env),
@@ -398,6 +410,7 @@ mod tests {
     #[derive(Default)]
     struct FakeKernel {
         refuses: bool,
+        unfit: Option<crate::health::Unfit>,
         notes: RefCell<Vec<String>>,
         suspends: RefCell<u32>,
     }
@@ -418,6 +431,10 @@ mod tests {
         }
         fn catch_up(&self) -> Option<Correction> {
             None
+        }
+        fn health(&self) -> crate::health::Health {
+            self.unfit
+                .map_or(crate::health::Health::Sound, crate::health::Health::Unfit)
         }
     }
 
@@ -575,5 +592,48 @@ mod tests {
                 "sleep: resumed after 0 s by the clock,  at ?"
             ]
         );
+    }
+
+    /// 2026-11-20: the Wi-Fi driver oopsed out of memory, and the next nap's
+    /// suspend never came back. After an oops nothing suspends, a sleep the
+    /// user asked for neither, and no alarm is armed.
+    #[test]
+    fn nothing_suspends_after_an_oops() {
+        let asked = Asked::of(Why::Asked).unwrap();
+        for (what, wake) in [
+            ("nap", Wake::Alarm(Duration::from_secs(40))),
+            ("sleep", Wake::AlarmOrButton(Duration::from_secs(40), asked)),
+            ("sleep", Wake::Button(asked)),
+        ] {
+            let rtc = FakeRtc {
+                fails: false,
+                log: RefCell::default(),
+            };
+            let kernel = FakeKernel {
+                unfit: Some(crate::health::Unfit::Oopsed),
+                ..FakeKernel::default()
+            };
+            let ticket = Gate::default().ticket();
+            let env = Env {
+                rtc: Ok(&rtc),
+                kernel: &kernel,
+                ticket: &ticket,
+            };
+            let error = once(&env, what, wake).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<crate::health::Unfit>(),
+                Some(&crate::health::Unfit::Oopsed),
+                "{error:#}"
+            );
+            assert_eq!(*kernel.suspends.borrow(), 0, "{wake:?}");
+            assert!(rtc.log.borrow().is_empty(), "{wake:?}: no alarm touched");
+            assert_eq!(
+                *kernel.notes.borrow(),
+                [format!(
+                    "{what}: not suspending: the kernel has oopsed since boot (TAINT_DIE); \
+                     a suspend could hang"
+                )]
+            );
+        }
     }
 }

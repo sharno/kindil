@@ -119,6 +119,32 @@ against them: see [Formal models](DEVELOP.md#formal-models).
     is taken in `/var/local/kindil/naps.log` (96 KiB, and the file before
     it as `naps.log.1`): after a freeze its last line says where the device
     stopped.
+  - **The kernel's health**: before every suspend kindil also asks
+    whether the kernel can take one, and reboots instead when it can't
+    (src/health.rs). After an oops (`TAINT_DIE` in
+    `/proc/sys/kernel/tainted`): on 2026-11-20 the Wi-Fi driver oopsed
+    out of memory and the next nap's suspend never returned. And before
+    the kernel runs out of memory: Lab126's Wi-Fi driver cuts the chip's
+    power at each suspend and loads its four firmware files again at each
+    resume, and the PW1's 2.6.31 firmware loader never frees those pages
+    (fixed upstream in 2.6.35): 17 pages (68 KiB) a resume, about 4 MiB
+    an hour of doze, measured on the device. Neither the driver's own
+    "WLAN off" (the SDIO core still cycles the chip and the driver then
+    loses it) nor unloading it (which can hang) avoids that, so once the
+    kernel holds 144 MiB outside its lists (`/proc/zoneinfo`; about 27
+    after a boot) kindil reboots, after about a day of doze. At most one
+    such reboot in 6 hours: in between it stays awake rather than reboot
+    again, and says so in the log. A reboot through init that hasn't
+    happened a minute later is forced. With start at boot, kindil is back
+    by itself; without it, Amazon's UI is.
+  - **udev's workers**: each of those firmware requests comes to udev
+    with the kernel's 60-second timeout, and the PW1's udev 146 starts a
+    new worker for every such event, letting idle ones go only after 3 s
+    awake with nothing queued, which a doze wake never gives it: 8 more a
+    wake, 240 by each half-hourly fetch, 35 MiB. So while kindil runs, the
+    loader's timeout (`/sys/class/firmware/timeout`) is 0, and udev hands
+    the requests to the workers it has; kindil and the launcher put 60
+    back for Amazon's UI.
   - **Wi-Fi of its own**: kindil runs Wi-Fi itself with the networks joined
     in it, saved in `/var/local/kindil/networks.toml` (plain text, readable
     by root only; a network is saved once it has joined). It loads the
@@ -203,6 +229,22 @@ against them: see [Formal models](DEVELOP.md#formal-models).
     the driver's own). It only reads; should that fail, it says so in the
     log once and uses the driver's files until it works again.
     `kindil gauge [--every SECS]` prints the two side by side.
+    While dozing, the chip's charge runs low by about 11 mAh an hour
+    that the cell never gave: 2 s after each resume, the driver
+    subtracts from the chip's charge (NAC) what it supposes the suspend
+    drew, 765 µA for the suspend's length rounded *up* to whole hours,
+    and writes it back (`battery_handle_update_nac`, "Battery: Resume -
+    PostUpdate" in the kernel log). A wake back asleep within those 2 s
+    (a minute tick) cancels it; each full redraw and online wake (about
+    16 an hour) lets it take 4 counts, 0.71 mAh, as if it followed an
+    hour's sleep. Measured on 2026-11-19/20: 56-64 of the 87-92 counts
+    the chip lost each hour were these, so doze really draws about 5 mAh
+    an hour, not 16; a 60-minute suspend alone moved the chip's charge by
+    nothing at all (its current stayed under the chip's dead band: NOACT
+    in FLAGS). So the percentage falls about three times too fast while
+    dozing (12% at 3.94 V), until a full charge sets it right again. The
+    doze ledger and "doze drew" lines count the chip's charge as it is,
+    these subtractions included.
   - **Crash restart**: the launcher restarts kindil after a crash. After 3
     crashes within 5 minutes it runs the previous version (kept by the last
     update), and after 3 more it returns to Amazon's UI.

@@ -74,6 +74,11 @@ impl KindleHost {
         for line in crate::perms::narrow_own(Path::new(crate::perms::RUN)) {
             crate::log!("kindil: {line}");
         }
+        // Before Wi-Fi starts: its firmware requests then reuse udev's
+        // workers (src/firmware.rs).
+        if let Err(error) = crate::firmware::untimed(Path::new(crate::firmware::TIMEOUT)) {
+            crate::log!("kindil: firmware timeout: {error}");
+        }
         Self {
             frontlight: Frontlight::open().map_err(|e| e.to_string()),
             net: Arc::default(),
@@ -444,7 +449,9 @@ impl Host for KindleHost {
             recorder: crate::flight::Recorder::device(),
             ticket,
         };
-        match crate::power::sleep(&device, why)? {
+        let slept =
+            crate::power::sleep(&device, why).inspect_err(|error| self.after_refusal(error))?;
+        match slept {
             crate::power::Slept::Woken | crate::power::Slept::Charging => Ok(()),
             crate::power::Slept::Critical => {
                 crate::log!("kindil: battery critical; powering off");
@@ -471,7 +478,9 @@ impl Host for KindleHost {
             recorder.note(&format!("nap: {left:?} left; not suspending"));
             return Ok(());
         }
-        sleep_once(&recorder, "nap", crate::suspend::Wake::Alarm(left), ticket).map(drop)
+        sleep_once(&recorder, "nap", crate::suspend::Wake::Alarm(left), ticket)
+            .inspect_err(|error| self.after_refusal(error))
+            .map(drop)
     }
 
     /// [`sleep_once`] caught up already, before anything read the clock.
@@ -522,6 +531,49 @@ impl Host for KindleHost {
 
     fn locate_by_ip(&self) -> anyhow::Result<crate::location::Place> {
         crate::location::Lookup::default().locate()
+    }
+}
+
+/// Whether kindil said it stays up for its kernel's health rather than
+/// reboot again: said once, not at every refused nap.
+static STAYING_UNFIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+impl KindleHost {
+    /// A suspend refused for the kernel's health (src/health.rs): reboot,
+    /// unless kindil rebooted for it lately; then it stays awake.
+    fn after_refusal(&self, error: &anyhow::Error) {
+        use crate::health::{Remedy, LAST_REBOOT, REBOOT_GRACE};
+        let Some(unfit) = error.downcast_ref::<crate::health::Unfit>() else {
+            return;
+        };
+        let now = epoch_seconds();
+        match crate::health::remedy(crate::health::last_reboot(Path::new(LAST_REBOOT)), now) {
+            Remedy::StayAwake { rebooted_ago } => {
+                if !STAYING_UNFIT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::log!(
+                        "kindil: {unfit}; rebooted for that {} min ago, so staying \
+                         up awake instead",
+                        rebooted_ago.as_secs() / 60
+                    );
+                }
+            }
+            Remedy::Reboot => {
+                crate::log!("kindil: {unfit}; rebooting instead of suspending");
+                if let Err(error) = std::fs::write(LAST_REBOOT, format!("{now}\n")) {
+                    crate::log!("kindil: writing {LAST_REBOOT}: {error}");
+                }
+                // init's shutdown may wait on a broken driver: forced
+                // (synced, straight to the kernel) if still up by then.
+                std::thread::spawn(|| {
+                    std::thread::sleep(REBOOT_GRACE);
+                    crate::log!("kindil: still up {REBOOT_GRACE:?} after rebooting; forcing it");
+                    let _ = run(Command::new("/sbin/reboot").arg("-f"));
+                });
+                if let Err(error) = self.restart() {
+                    crate::log!("kindil: reboot: {error:#}");
+                }
+            }
+        }
     }
 }
 
@@ -594,6 +646,9 @@ impl crate::suspend::Kernel for Kernel<'_> {
     fn catch_up(&self) -> Option<crate::clock::Correction> {
         crate::clock::catch_up()
     }
+    fn health(&self) -> crate::health::Health {
+        crate::health::now()
+    }
 }
 
 /// Every suspend goes through here (src/suspend.rs): the wake alarm armed
@@ -621,6 +676,16 @@ fn sleep_once(
         Some(error) => Err(error.into()),
         None => Ok(back.armed),
     }
+}
+
+/// One nap of `seconds`, through the same checked step as doze's (for
+/// `kindil nap`, a device test): the alarm armed and read back, or no
+/// suspend.
+pub fn test_nap(seconds: u64) -> anyhow::Result<()> {
+    let recorder = crate::flight::Recorder::device();
+    let ticket = crate::suspend::Gate::default().ticket();
+    let wake = crate::suspend::Wake::Alarm(Duration::from_secs(seconds));
+    sleep_once(&recorder, "test nap", wake, &ticket).map(drop)
 }
 
 fn epoch_seconds() -> i64 {

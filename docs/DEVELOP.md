@@ -43,6 +43,12 @@ cargo xtask run experiment.sh 600 [ARGS]       # run a script, with a lifeline
 cargo xtask wait [--hours N] [COMMAND]         # wait for it to answer
 ```
 
+On the Kindle, `kindil nap SECONDS` suspends once through doze's own
+checked step (the wake alarm armed and read back, or no suspend), for
+tests that need a suspend: run it while something holds kindil awake (an
+SSH session, or a loopback `nc 127.0.0.1 22`), or kindil's own naps will
+move the alarm.
+
 `release` checks the release's signature, bundles it with the launcher
 files from its tag and waits for the Kindle; there the release installs
 itself (`kindil install`, src/install.rs) and rolls back, launcher files
@@ -65,6 +71,8 @@ someone nearby to press the power button, or must end on their own first.
 | `kindle.rs` | `Host` on the device: battery, charger and front light drivers, power button, volumd's events or kindil's USB drive mode, USBNetwork |
 | `power.rs` | powerd's rules kept by kindil: charging temperatures, critical battery; and the charger driver's stop at full and restart at 95% (`govern_charging`, see docs/CHARGING-TEST.md) |
 | `gauge.rs` | The fuel gauge read from the chip through the driver's register window, not its cached files |
+| `health.rs` | Whether the kernel can take a suspend (no oops, memory not leaked away); reboot instead, at most once in 6 hours |
+| `firmware.rs` | The firmware loader's timeout, 0 while kindil runs, so udev reuses its workers for the Wi-Fi driver's firmware |
 | `wifi.rs` | wpa_supplicant control socket, typed SSID/passphrase |
 | `net.rs` | Wi-Fi run by kindil: driver, supervised wpa_supplicant and udhcpc (or kindil's own DHCP client) |
 | `dhcp.rs` | udhcpc's hook, `kindil-dhcp`: the lease onto the interface, and its marker for kindil's own Wi-Fi |

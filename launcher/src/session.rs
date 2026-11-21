@@ -825,6 +825,9 @@ mod lifecycle {
             // now, keeps its own range, and the charger driver its own end
             // of charge, which a `0` left in the switch would keep off.
             let _ = std::fs::write(&paths.charger, "1");
+            // kindil set the firmware loader's timeout to 0, and a crash
+            // leaves it so: the kernel's 60 back for Amazon's Wi-Fi.
+            let _ = std::fs::write(&paths.firmware_timeout, "60");
             if !os.running("powerd") {
                 os.start("powerd");
             }
@@ -898,6 +901,7 @@ mod tests {
                 flag: t.join("user/BOOT"),
                 skip: t.join("SKIP"),
                 charger: t.join("charging"),
+                firmware_timeout: t.join("firmware-timeout"),
                 wifi_pids: vec![t.join("udhcpc.pid"), t.join("wpa.pid")],
                 sshd_pid: t.join("sshd.pid"),
                 pid_file: t.join("kindil.pid"),
@@ -1176,6 +1180,11 @@ mod tests {
             std::fs::read_to_string(&env.paths.charger).unwrap(),
             "1",
             "charging on"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&env.paths.firmware_timeout).unwrap(),
+            "60",
+            "the kernel's firmware timeout back"
         );
     }
 
