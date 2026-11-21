@@ -120,6 +120,67 @@ struct DashboardFrames {
 struct Shown {
     wake: Option<u64>,
     updates: u64,
+    /// How the frame was rendered, if it was (not its error).
+    rendering: Option<Rendering>,
+}
+
+/// How long a dashboard frame took to render, and what of it was rendered:
+/// for each doze wake's line in naps.log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rendering {
+    took: Duration,
+    body: BodyFate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyFate {
+    /// A tick: only the header.
+    Header,
+    /// A full frame whose body the window had already.
+    Kept,
+    /// A full frame, its body rendered anew.
+    Drawn,
+}
+
+impl std::fmt::Display for Rendering {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let body = match self.body {
+            BodyFate::Header => "header",
+            BodyFate::Kept => "header, body kept",
+            BodyFate::Drawn => "page",
+        };
+        write!(f, "{body} rendered in {:.2} s", self.took.as_secs_f64())
+    }
+}
+
+/// A doze wake's wait for its frame: how it ended, and when (from the
+/// wait's start) the frame was handed to the window and an update of it
+/// accepted by the panel.
+#[derive(Debug)]
+struct Waited {
+    drawn: Drawn,
+    shown: Option<Duration>,
+    sent: Option<Duration>,
+    rendering: Option<Rendering>,
+}
+
+impl Waited {
+    /// The wait's steps for naps.log: "page rendered in 0.31 s, shown at
+    /// 0.40 s, sent at 0.62 s".
+    fn steps(&self) -> String {
+        let at = |what: &str, when: Option<Duration>| {
+            when.map(|t| format!("{what} at {:.2} s", t.as_secs_f64()))
+        };
+        [
+            self.rendering.map(|r| r.to_string()),
+            at("shown", self.shown),
+            at("sent", self.sent),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ")
+    }
 }
 
 /// The doze wake whose redraw is awaited. Its end is claimed once, by the
@@ -152,9 +213,13 @@ impl Display {
 
     /// A dashboard frame (or its error) for `wake` was just handed to the
     /// window, on the UI thread, before the loop draws it.
-    fn dashboard_shown(&self, wake: Option<u64>) {
+    fn dashboard_shown(&self, wake: Option<u64>, rendering: Option<Rendering>) {
         let updates = self.updates();
-        *lock(&self.dashboard.shown) = Shown { wake, updates };
+        *lock(&self.dashboard.shown) = Shown {
+            wake,
+            updates,
+            rendering,
+        };
         self.dashboard.changed.notify_all();
     }
 
@@ -162,9 +227,16 @@ impl Display {
     /// the panel has finished it (`wake` None: any panel frame after
     /// `drawn`); [`Drawn::Sent`] if the panel can't say it finished,
     /// [`Drawn::NotSeen`] at `deadline`.
-    fn wait_drawn(&self, wake: Option<u64>, drawn: u64, deadline: Instant) -> Drawn {
+    fn wait_drawn(&self, wake: Option<u64>, drawn: u64, deadline: Instant) -> Waited {
+        let since = Instant::now();
+        let mut waited = Waited {
+            drawn: Drawn::NotSeen,
+            shown: None,
+            sent: None,
+            rendering: None,
+        };
         let Some(presented) = &self.presented else {
-            return Drawn::NotSeen;
+            return waited;
         };
         let left = || deadline.saturating_duration_since(Instant::now());
         let drawn = match wake {
@@ -178,21 +250,25 @@ impl Display {
                     })
                     .unwrap_or_else(|e| e.into_inner());
                 if timeout.timed_out() {
-                    return Drawn::NotSeen;
+                    return waited;
                 }
+                waited.shown = Some(since.elapsed());
+                waited.rendering = shown.rendering;
                 shown.updates
             }
         };
         while (presented.updates)() <= drawn {
             if left().is_zero() {
-                return Drawn::NotSeen;
+                return waited;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        match (presented.wait_idle)() {
+        waited.sent = Some(since.elapsed());
+        waited.drawn = match (presented.wait_idle)() {
             Ok(()) => Drawn::Done,
             Err(error) => Drawn::Sent(error),
-        }
+        };
+        waited
     }
 
     fn is_dozing(&self) -> bool {
@@ -1768,15 +1844,20 @@ impl Ctx {
             let deliver = Arc::new(self.deliver());
             let host = self.host.clone();
             let display = self.display.clone();
-            move |settle: Settle| {
+            move |settle: Settle, steps: String| {
                 let won = draw_wake.claim(wake);
                 if won {
                     host.note(&format!(
-                        "wake {wake}: {window:?} {redraw:?} for {}, {settle:?} after {:.1} s, \
-                         panel update {}",
+                        "wake {wake}: {window:?} {redraw:?} for {}, {settle:?} after {:.2} s, \
+                         panel update {}{}",
                         crate::logging::stamp(at, crate::logging::zone()),
                         since.elapsed().as_secs_f64(),
-                        display.updates()
+                        display.updates(),
+                        if steps.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({steps})")
+                        }
                     ));
                     if window == Window::Online {
                         crate::log!(
@@ -1794,10 +1875,12 @@ impl Ctx {
             let display = self.display.clone();
             let claim = claim.clone();
             let deadline = since + ceiling;
-            std::thread::spawn(
-                move || match display.wait_drawn(dashboard, drawn, deadline) {
+            std::thread::spawn(move || {
+                let waited = display.wait_drawn(dashboard, drawn, deadline);
+                let steps = waited.steps();
+                match waited.drawn {
                     Drawn::Done => {
-                        claim(Settle::Done);
+                        claim(Settle::Done, steps);
                     }
                     Drawn::Sent(error) => {
                         if !display.panel_error_logged.swap(true, Ordering::Relaxed) {
@@ -1807,14 +1890,14 @@ impl Ctx {
                             );
                         }
                         std::thread::sleep(PANEL_UPDATE);
-                        claim(Settle::Timed);
+                        claim(Settle::Timed, steps);
                     }
                     Drawn::NotSeen => {}
-                },
-            );
+                }
+            });
         }
         slint::Timer::single_shot(ceiling, move || {
-            if claim(Settle::NotSeen) {
+            if claim(Settle::NotSeen, String::new()) {
                 crate::log!(
                     "kindil: doze redraw not seen on the panel; napping at the {ceiling:?} ceiling"
                 );
@@ -2436,8 +2519,16 @@ fn load_miqat(
 /// header was drawn.
 type Rendered = (
     slint::SharedPixelBuffer<slint::Rgb8Pixel>,
-    Option<slint::SharedPixelBuffer<slint::Rgb8Pixel>>,
+    Option<BodyFrame>,
 );
+
+/// A rendered frame's body, for the window.
+enum BodyFrame {
+    /// A full frame's new body.
+    Drawn(slint::SharedPixelBuffer<slint::Rgb8Pixel>),
+    /// A full frame whose body the window shows already.
+    Same,
+}
 
 /// Renders what `asked` calls for at `now`, given the board of the full
 /// frame on screen; returns the frame (or its error), what it drew, and the
@@ -2449,14 +2540,21 @@ fn render_miqat(
     now: DateTime<Utc>,
     asked: Draw,
     shown: Option<Board>,
+    bodies: &mut crate::dashboards::Bodies,
 ) -> (Result<Rendered, String>, Draw, Option<Board>) {
+    use crate::dashboards::Body;
     let board = Board::at(config, now);
     let draw = crate::dashboards::draw(asked, shown, board);
     let frame = match draw {
-        Draw::Full => crate::dashboards::render(renderer, config, now, sources).map(|page| {
-            let split = crate::dashboards::Split::of(page);
-            (pixels(split.header), Some(pixels(split.body)))
-        }),
+        Draw::Full => crate::dashboards::render_full(renderer, config, now, sources, bodies).map(
+            |(header, body)| {
+                let body = match body {
+                    Body::Drawn(body) => BodyFrame::Drawn(pixels(body)),
+                    Body::Same => BodyFrame::Same,
+                };
+                (pixels(header), Some(body))
+            },
+        ),
         Draw::Header => {
             crate::dashboards::render_header(renderer, config, now).map(|h| (pixels(h), None))
         }
@@ -2472,6 +2570,14 @@ fn render_miqat(
 }
 
 /// Owns Miqat's cached weather and radar sources; renders on each minute.
+/// A full dashboard frame's update, for the ghosting policy.
+fn full(occasion: Occasion) -> Update {
+    match occasion {
+        Occasion::Clock => Update::DashboardFrame,
+        Occasion::Fetch => Update::DashboardFetched,
+    }
+}
+
 fn miqat_worker(
     path: &std::path::Path,
     weak: &slint::Weak<AppWindow>,
@@ -2481,16 +2587,38 @@ fn miqat_worker(
     let Some(config) = load_miqat(path, weak, ticks) else {
         return;
     };
-    // The board of the full frame on screen.
+    // The board of the full frame on screen, and its body.
     let mut shown = None;
+    let mut bodies = crate::dashboards::Bodies::default();
     let show = |config: &miqat::config::Config,
                 renderer: &miqat::render::Renderer,
                 sources: &miqat::sources::Sources,
                 wake: Option<u64>,
-                asked: Draw| {
-        let (frame, drew, board) =
-            render_miqat(config, renderer, sources, Utc::now(), asked, shown);
+                asked: Draw,
+                occasion: Occasion| {
+        let since = Instant::now();
+        let (frame, drew, board) = render_miqat(
+            config,
+            renderer,
+            sources,
+            Utc::now(),
+            asked,
+            shown,
+            &mut bodies,
+        );
+        let rendering = frame.as_ref().ok().map(|(_, body)| Rendering {
+            took: since.elapsed(),
+            body: match body {
+                None => BodyFate::Header,
+                Some(BodyFrame::Same) => BodyFate::Kept,
+                Some(BodyFrame::Drawn(_)) => BodyFate::Drawn,
+            },
+        });
         shown = board;
+        if frame.is_err() {
+            // The window shows the error: whatever body it had may go.
+            bodies.forget();
+        }
         let display = display.clone();
         weak.upgrade_in_event_loop(move |ui| {
             let k = ui.global::<Kindil>();
@@ -2498,10 +2626,13 @@ fn miqat_worker(
                 Ok((header, body)) => {
                     k.set_miqat_header(slint::Image::from_rgb8(header));
                     let update = match body {
-                        Some(body) => {
+                        Some(BodyFrame::Drawn(body)) => {
                             k.set_miqat_body(slint::Image::from_rgb8(body));
-                            Update::DashboardFrame
+                            full(occasion)
                         }
+                        // Still a full frame: the half-hourly clean keeps
+                        // its pace.
+                        Some(BodyFrame::Same) => full(occasion),
                         None => Update::DashboardHeader,
                     };
                     display.updated(&ui, update);
@@ -2517,7 +2648,7 @@ fn miqat_worker(
             if wake.is_some() && (asked, drew) == (Draw::Header, Draw::Full) {
                 lock(&display.ledger).drew_full();
             }
-            display.dashboard_shown(wake);
+            display.dashboard_shown(wake, rendering);
         })
         .map_err(drop)
     };
@@ -2567,6 +2698,15 @@ enum Then {
     Done,
     /// Another, once it ends (if still due), for this wake.
     Again(Option<u64>),
+}
+
+/// Why the dashboard worker draws: its frame after a fetch (in doze, an
+/// online wake's) takes the panel's half-hourly clean
+/// ([`Update::DashboardFetched`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Occasion {
+    Clock,
+    Fetch,
 }
 
 /// What the worker does next: start a fetch, draw (for a wake), or both.
@@ -2662,6 +2802,7 @@ fn run_dashboard(
         &miqat::sources::Sources,
         Option<u64>,
         Draw,
+        Occasion,
     ) -> Result<(), ()>,
 ) {
     let mut renderer = miqat::render::Renderer::new(config.display.contrast);
@@ -2675,6 +2816,12 @@ fn run_dashboard(
     let mut tick = Tick::Fetch(None);
     loop {
         let now = Utc::now();
+        // A doze wake's fetch (drawn at once if nothing is due), or a
+        // fetch's end; not the awake dashboard's own minute clock.
+        let occasion = match tick {
+            Tick::Fetch(Some(_)) | Tick::Fetched => Occasion::Fetch,
+            Tick::Fetch(None) | Tick::Draw(_) | Tick::Minute(_) | Tick::Reload => Occasion::Clock,
+        };
         let (next, plan) = match tick {
             Tick::Draw(wake) => (fetching, Plan::draw(wake, Draw::Full)),
             Tick::Minute(wake) => (fetching, Plan::draw(wake, Draw::Header)),
@@ -2714,7 +2861,7 @@ fn run_dashboard(
             });
         }
         if let Some((wake, asked)) = plan.draw {
-            if show(&config, &renderer, &sources, wake, asked).is_err() {
+            if show(&config, &renderer, &sources, wake, asked, occasion).is_err() {
                 return;
             }
         }
@@ -2811,15 +2958,48 @@ mod tests {
         // A frame from before, and a dashboard rendered for an earlier wake
         // or for no wake, don't count.
         frames.fetch_add(1, Ordering::Release);
-        display.dashboard_shown(Some(6));
-        display.dashboard_shown(None);
+        display.dashboard_shown(Some(6), None);
+        display.dashboard_shown(None, None);
         std::thread::sleep(Duration::from_millis(30));
         assert!(!waiter.is_finished());
-        display.dashboard_shown(Some(7));
+        let rendering = Rendering {
+            took: Duration::from_millis(310),
+            body: BodyFate::Kept,
+        };
+        display.dashboard_shown(Some(7), Some(rendering));
         std::thread::sleep(Duration::from_millis(30));
         assert!(!waiter.is_finished(), "shown, not yet drawn");
         frames.fetch_add(1, Ordering::Release);
-        assert!(matches!(waiter.join().unwrap(), Drawn::Done));
+        let waited = waiter.join().unwrap();
+        assert!(matches!(waited.drawn, Drawn::Done));
+        assert_eq!(waited.rendering, Some(rendering));
+        let (shown, sent) = (waited.shown.unwrap(), waited.sent.unwrap());
+        // Sent a 30 ms pause after it was shown.
+        assert!(sent > shown, "{shown:?} {sent:?}");
+    }
+
+    #[test]
+    fn a_wakes_steps_read_in_naps_log() {
+        let waited = Waited {
+            drawn: Drawn::Done,
+            shown: Some(Duration::from_millis(400)),
+            sent: Some(Duration::from_millis(620)),
+            rendering: Some(Rendering {
+                took: Duration::from_millis(310),
+                body: BodyFate::Kept,
+            }),
+        };
+        assert_eq!(
+            waited.steps(),
+            "header, body kept rendered in 0.31 s, shown at 0.40 s, sent at 0.62 s"
+        );
+        let unseen = Waited {
+            drawn: Drawn::NotSeen,
+            shown: None,
+            sent: None,
+            rendering: None,
+        };
+        assert_eq!(unseen.steps(), "");
     }
 
     #[test]
@@ -2837,7 +3017,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         // The ceiling ends it, and logs it (settle_wake).
-        assert!(matches!(waiter.join().unwrap(), Drawn::NotSeen));
+        assert!(matches!(waiter.join().unwrap().drawn, Drawn::NotSeen));
     }
 
     #[test]
@@ -2847,10 +3027,10 @@ mod tests {
         // one the driver refused) leaves the count as it was: the wake isn't
         // over until the ceiling, which logs it.
         let (display, _updates) = eink();
-        display.dashboard_shown(Some(7));
+        display.dashboard_shown(Some(7), None);
         let soon = Instant::now() + Duration::from_millis(60);
         assert!(matches!(
-            display.wait_drawn(Some(7), 0, soon),
+            display.wait_drawn(Some(7), 0, soon).drawn,
             Drawn::NotSeen
         ));
     }
@@ -2863,7 +3043,9 @@ mod tests {
         // Not the ceiling: the frame is with the panel, which only can't
         // tell when it's done; the wake naps a panel update later.
         assert!(matches!(
-            display.wait_drawn(None, 0, Instant::now() + Duration::from_secs(5)),
+            display
+                .wait_drawn(None, 0, Instant::now() + Duration::from_secs(5))
+                .drawn,
             Drawn::Sent(_)
         ));
     }
@@ -2873,17 +3055,22 @@ mod tests {
         let (display, _) = eink();
         let soon = Instant::now() + Duration::from_millis(40);
         assert!(matches!(
-            display.wait_drawn(Some(1), 0, soon),
+            display.wait_drawn(Some(1), 0, soon).drawn,
             Drawn::NotSeen
         ));
-        assert!(matches!(display.wait_drawn(None, 0, soon), Drawn::NotSeen));
+        assert!(matches!(
+            display.wait_drawn(None, 0, soon).drawn,
+            Drawn::NotSeen
+        ));
         let (no_panel, _) = eink();
         let no_panel = Display {
             presented: None,
             ..no_panel
         };
         assert!(matches!(
-            no_panel.wait_drawn(None, 0, Instant::now() + Duration::from_secs(5)),
+            no_panel
+                .wait_drawn(None, 0, Instant::now() + Duration::from_secs(5))
+                .drawn,
             Drawn::NotSeen
         ));
     }
@@ -2907,7 +3094,7 @@ mod tests {
     /// way to send ticks and to let each fetch return.
     struct DashboardWorker {
         ticks: mpsc::Sender<Tick>,
-        drawn: mpsc::Receiver<(Option<u64>, Draw)>,
+        drawn: mpsc::Receiver<(Option<u64>, Draw, Occasion)>,
         release: mpsc::Sender<()>,
         fetches: Arc<AtomicU64>,
     }
@@ -2936,7 +3123,9 @@ mod tests {
                     (sender, &receiver),
                     &|| true,
                     Arc::new(fetch),
-                    |_, _, _, wake, asked| drew.send((wake, asked)).map_err(drop),
+                    |_, _, _, wake, asked, occasion| {
+                        drew.send((wake, asked, occasion)).map_err(drop)
+                    },
                 );
             });
             Self {
@@ -2948,6 +3137,10 @@ mod tests {
         }
 
         fn next(&self) -> Option<(Option<u64>, Draw)> {
+            self.next_drawn().map(|(wake, draw, _)| (wake, draw))
+        }
+
+        fn next_drawn(&self) -> Option<(Option<u64>, Draw, Occasion)> {
             self.drawn.recv_timeout(Duration::from_secs(5)).ok()
         }
     }
@@ -2970,12 +3163,17 @@ mod tests {
             );
         }
         worker.ticks.send(Tick::Draw(Some(5))).unwrap();
-        assert_eq!(worker.next(), Some((Some(5), Draw::Full)));
-        // The fetches end: the fetched frame, for the wake that asked.
+        assert_eq!(
+            worker.next_drawn(),
+            Some((Some(5), Draw::Full, Occasion::Clock)),
+            "a 5-minute frame doesn't take the clean"
+        );
+        // The fetches end: the fetched frame, for the wake that asked, which
+        // takes the half-hourly clean.
         (0..2).for_each(|_| worker.release.send(()).unwrap());
-        let fetched = std::iter::from_fn(|| worker.next())
+        let fetched = std::iter::from_fn(|| worker.next_drawn())
             .take(3)
-            .any(|drawn| drawn == (Some(1), Draw::Full));
+            .any(|drawn| drawn == (Some(1), Draw::Full, Occasion::Fetch));
         assert!(fetched);
         assert_eq!(worker.fetches.load(Ordering::Acquire), 2);
     }

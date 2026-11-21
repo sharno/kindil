@@ -244,7 +244,16 @@ against them: see [Formal models](DEVELOP.md#formal-models).
     in FLAGS). So the percentage falls about three times too fast while
     dozing (12% at 3.94 V), until a full charge sets it right again. The
     doze ledger and "doze drew" lines count the chip's charge as it is,
-    these subtractions included.
+    these subtractions included. kindil neither writes the gauge nor
+    redraws less; it keeps its wakes short instead. A full redraw whose
+    body (timetable, weather, radar) is the same as the window's renders
+    only the header, as a tick does: Miqat keys the body by its SVG and
+    the radar raster under it, and equal keys draw equal pixels (tested
+    through the day). Most of the 5-minute full redraws are such. And the
+    half-hourly clean flash comes with an online wake's fetched frame,
+    which is long anyway. Each doze wake's line in naps.log says what it
+    rendered and when its frame was shown and sent ("header, body kept
+    rendered in 0.31 s, shown at 0.40 s, sent at 0.62 s").
   - **Crash restart**: the launcher restarts kindil after a crash. After 3
     crashes within 5 minutes it runs the previous version (kept by the last
     update), and after 3 more it returns to Amazon's UI.
@@ -254,9 +263,10 @@ against them: see [Formal models](DEVELOP.md#formal-models).
   the moved area gets a fast black-and-white clean, and on release a hard
   grayscale clean (a flash of that area only). In the
   reader, swipe left/right or tap to turn pages. Page changes flash the panel
-  once; reading flashes every 6th page turn, the dashboard every 30 minutes
-  (on the first full redraw after 30 updates; a minute tick never flashes), to
-  clear ghosting.
+  once; reading flashes every 6th page turn, the dashboard every half hour
+  (on the first frame after a fetch once 20 updates have gone by, which
+  dozing is an online wake's; on any full redraw after 40 without one; a
+  minute tick never flashes), to clear ghosting.
 
 ## Updates
 

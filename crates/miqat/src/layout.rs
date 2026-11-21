@@ -188,6 +188,14 @@ pub fn header_svg(frame: &Frame) -> String {
     document(frame.page.header_height(), &header(frame))
 }
 
+/// What the page draws under the header, as SVG elements: the prayers and
+/// the weather. Uses everything [`svg`] does; two frames whose bodies are
+/// the same text (with the same radar raster under them) draw the same
+/// pixels below [`Page::header_height`], the header's own rows aside.
+pub fn body_svg(frame: &Frame) -> String {
+    [prayers(frame), weather(frame)].concat()
+}
+
 fn document(height: u32, body: &str) -> String {
     format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{height}" viewBox="0 0 {WIDTH} {height}" font-family="IBM Plex Sans Arabic">{body}</svg>"#

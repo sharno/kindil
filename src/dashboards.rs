@@ -92,14 +92,77 @@ pub fn render(
     sources: &miqat::sources::Sources,
 ) -> anyhow::Result<Gray> {
     let prayers = miqat::prayer::DayTimes::current(&config.location, &config.prayer, now)?;
-    renderer.gray(&miqat::layout::Frame {
+    renderer.gray(&frame(config, now, &prayers, sources))
+}
+
+fn frame<'a>(
+    config: &'a miqat::config::Config,
+    now: DateTime<Utc>,
+    prayers: &'a miqat::prayer::DayTimes,
+    sources: &'a miqat::sources::Sources,
+) -> miqat::layout::Frame<'a> {
+    miqat::layout::Frame {
         now,
         config,
-        prayers: &prayers,
+        prayers,
         weather: sources.weather(),
         radar: sources.radar(),
         page: PAGE,
-    })
+    }
+}
+
+/// The body of the last full frame handed to the window, as Miqat keys it
+/// ([`miqat::render::Body`]): while a full redraw's body is the same, its
+/// pixels are too, and the window still has them.
+///
+/// Why it matters: a full redraw rasterises the whole page, about twice a
+/// minute tick's work, which keeps a doze wake up past 2 s from its resume;
+/// the PW1's battery driver then writes an hour of supposed suspend
+/// current off the gauge (src/health.rs, docs/HOW-IT-WORKS.md). Most full
+/// redraws (every 5 minutes) find the body as it was: they render only the
+/// header, like a tick.
+#[derive(Debug, Default)]
+pub struct Bodies {
+    shown: Option<miqat::render::Body>,
+}
+
+impl Bodies {
+    /// Whatever the window shows now, the next full frame renders its body.
+    pub fn forget(&mut self) {
+        self.shown = None;
+    }
+}
+
+/// A full frame's body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Body {
+    /// Rendered anew: the window takes it.
+    Drawn(Gray),
+    /// The same as the window's ([`Bodies`]): nothing to hand over.
+    Same,
+}
+
+/// A full frame: the header, rendered, and the body, rendered unless the
+/// window has it already.
+pub fn render_full(
+    renderer: &miqat::render::Renderer,
+    config: &miqat::config::Config,
+    now: DateTime<Utc>,
+    sources: &miqat::sources::Sources,
+    bodies: &mut Bodies,
+) -> anyhow::Result<(Gray, Body)> {
+    let prayers = miqat::prayer::DayTimes::current(&config.location, &config.prayer, now)?;
+    let frame = frame(config, now, &prayers, sources);
+    let body = renderer.body(&frame);
+    if bodies.shown.as_ref() == Some(&body) {
+        return Ok((renderer.header_gray(&frame)?, Body::Same));
+    }
+    // Forgotten until the new one is in hand: a failed render leaves the
+    // window's body unknown.
+    bodies.shown = None;
+    let split = Split::of(renderer.gray(&frame)?);
+    bodies.shown = Some(body);
+    Ok((split.header, Body::Drawn(split.body)))
 }
 
 /// Only the header, [`WIDTH`] × [`HEADER_HEIGHT`]: the same pixels as
@@ -232,6 +295,38 @@ mod tests {
 
     fn config() -> miqat::config::Config {
         toml::from_str(include_str!("../examples/miqat.toml")).unwrap()
+    }
+
+    /// A full redraw five minutes on, its body unchanged, renders only the
+    /// header, the same as a tick's; the window's body is the one a fresh
+    /// render would draw. A new day, or a forgotten body, renders it anew.
+    #[test]
+    fn a_full_redraw_keeps_a_body_that_hasnt_changed() {
+        let config = config();
+        let renderer = miqat::render::Renderer::new(config.display.contrast);
+        let sources = miqat::sources::Sources::new(&config);
+        let noon = DateTime::from_timestamp(1_794_398_400, 0).unwrap();
+        let mut bodies = Bodies::default();
+        let full = |at, bodies: &mut Bodies| {
+            render_full(&renderer, &config, at, &sources, bodies).unwrap()
+        };
+        let (header, Body::Drawn(body)) = full(noon, &mut bodies) else {
+            panic!("the first full frame renders its body");
+        };
+        assert_eq!(header, render_header(&renderer, &config, noon).unwrap());
+        let later = noon + TimeDelta::minutes(5);
+        let (header, kept) = full(later, &mut bodies);
+        assert_eq!(kept, Body::Same);
+        assert_eq!(header, render_header(&renderer, &config, later).unwrap());
+        assert_eq!(
+            Split::of(render(&renderer, &config, later, &sources).unwrap()).body,
+            body,
+            "the window's body is the one a full render draws"
+        );
+        let tomorrow = noon + TimeDelta::days(1);
+        assert!(matches!(full(tomorrow, &mut bodies).1, Body::Drawn(_)));
+        bodies.forget();
+        assert!(matches!(full(tomorrow, &mut bodies).1, Body::Drawn(_)));
     }
 
     #[test]

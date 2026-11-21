@@ -12,6 +12,13 @@ pub enum Update {
     PageTurn,
     /// The wall dashboard redrew in full.
     DashboardFrame,
+    /// The wall dashboard redrew in full after a fetch: in doze, an online
+    /// wake's frame. Such a wake is long anyway (Wi-Fi, the fetch), so the
+    /// half-hourly clean comes here: a GC16 flash keeps a wake up well past
+    /// the 2 s after which the PW1's battery driver writes an hour of
+    /// supposed suspend current off the gauge (docs/HOW-IT-WORKS.md), and
+    /// the 5-minute full frames, otherwise short, are spared it.
+    DashboardFetched,
     /// Only the dashboard's clock and countdown redrew: it ghosts like a
     /// frame, but the flash waits for the next full one, so a minute tick
     /// stays a small partial update.
@@ -34,8 +41,12 @@ pub struct Ghosting {
 
 impl Ghosting {
     pub const PAGE_TURNS: u16 = 6;
-    /// Half an hour of minute updates, full or header-only.
-    pub const DASHBOARD_FRAMES: u16 = 30;
+    /// The earliest a frame after a fetch flashes: fetches come every half
+    /// hour in doze (every 15 minutes awake, so every other one).
+    pub const DASHBOARD_FETCHED: u16 = 20;
+    /// The latest any full frame flashes, if no fetched frame has: fetches
+    /// failing, or none due.
+    pub const DASHBOARD_FRAMES: u16 = 40;
 
     pub fn after(self, update: Update) -> (Self, Refresh) {
         match update {
@@ -54,14 +65,25 @@ impl Ghosting {
                 },
                 Refresh::Partial,
             ),
-            Update::DashboardFrame if self.dashboard_frames + 1 >= Self::DASHBOARD_FRAMES => (
+            Update::DashboardFetched if self.dashboard_frames + 1 >= Self::DASHBOARD_FETCHED => (
                 Self {
                     dashboard_frames: 0,
                     ..self
                 },
                 Refresh::Full,
             ),
-            Update::DashboardFrame | Update::DashboardHeader => (
+            Update::DashboardFrame | Update::DashboardFetched
+                if self.dashboard_frames + 1 >= Self::DASHBOARD_FRAMES =>
+            {
+                (
+                    Self {
+                        dashboard_frames: 0,
+                        ..self
+                    },
+                    Refresh::Full,
+                )
+            }
+            Update::DashboardFrame | Update::DashboardFetched | Update::DashboardHeader => (
                 Self {
                     dashboard_frames: self.dashboard_frames.saturating_add(1),
                     ..self
@@ -115,9 +137,29 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_flashes_every_half_hour() {
-        let frames = refreshes(std::iter::repeat_n(Update::DashboardFrame, 60));
+    fn without_fetches_full_frames_flash_every_forty_minutes() {
+        let frames = refreshes(std::iter::repeat_n(Update::DashboardFrame, 80));
         assert_eq!(frames.iter().filter(|r| **r == Refresh::Full).count(), 2);
+    }
+
+    /// A doze's hour: ticks, a full frame every 5 minutes, and an online
+    /// wake every 30 (its tick, then its fetched frame). Every clean comes
+    /// on the fetched frame, every half hour; no 5-minute frame flashes.
+    #[test]
+    fn a_dozing_dashboard_cleans_on_its_online_wakes() {
+        let minute = |m: u32| match m % 30 {
+            29 => vec![Update::DashboardHeader, Update::DashboardFetched],
+            _ if m.is_multiple_of(5) => vec![Update::DashboardFrame],
+            _ => vec![Update::DashboardHeader],
+        };
+        let updates: Vec<Update> = (0..180).flat_map(minute).collect();
+        let full: Vec<Update> = updates
+            .iter()
+            .zip(refreshes(updates.iter().copied()))
+            .filter(|(_, r)| *r == Refresh::Full)
+            .map(|(u, _)| *u)
+            .collect();
+        assert_eq!(full, [Update::DashboardFetched; 6]);
     }
 
     #[test]
@@ -137,8 +179,8 @@ mod tests {
             .filter(|(_, r)| **r == Refresh::Full)
             .map(|(i, _)| i + 1)
             .collect();
-        // Every half hour of minutes, on the full frame that ends it.
-        assert_eq!(full, [30, 60]);
+        // Without fetches, on the full frame that ends 40 minutes of them.
+        assert_eq!(full, [40]);
         // Ticks alone never flash.
         let ticks = refreshes(std::iter::repeat_n(Update::DashboardHeader, 100));
         assert!(ticks.iter().all(|r| *r == Refresh::Partial));
