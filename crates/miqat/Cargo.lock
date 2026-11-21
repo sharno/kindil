@@ -170,10 +170,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
  "serde",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -1010,6 +1008,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "salah"
 version = "0.7.6"
+source = "git+https://github.com/sharno/salah-rs#5b0f34616c375029673f1b2c43bac9259dc16c87"
 dependencies = [
  "chrono",
 ]

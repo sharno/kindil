@@ -2,8 +2,9 @@
 members = [".", "launcher", "sshd", "xtask", "installer", "installer/gui"]
 # `cargo build` and the Nix build at the root build the app alone.
 default-members = ["."]
-# Miqat's vendored, patched salah is its dependency, not a crate of ours to lint.
-exclude = ["crates/miqat/vendor"]
+# salah (the salah-rs fork, a subtree) is Miqat's dependency, with its own
+# tests and lints: not a member of kindil's workspace.
+exclude = ["crates/salah"]
 
 [package]
 name = "kindil"
@@ -80,6 +81,11 @@ slint-build = "=1.18.1"
 # Vendored to add request_full_refresh() for ghosting control; upstream candidate.
 [patch.crates-io]
 slint-backend-kindle = { path = "vendor/slint-backend-kindle" }
+
+# Miqat takes salah from the salah-rs repository; kindil builds the copy
+# it carries (a git subtree, offline in the Nix build).
+[patch."https://github.com/sharno/salah-rs"]
+salah = { path = "crates/salah" }
 
 [profile.release]
 # Speed over size: the binary is a few MB either way, and page turns matter more.

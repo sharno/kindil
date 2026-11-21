@@ -39,6 +39,14 @@ pub struct Location {
     pub timezone: Tz,
 }
 
+impl Location {
+    /// The place, as salah takes it (latitude and longitude are already in
+    /// its ranges).
+    pub fn coordinates(&self) -> Result<salah::Coordinates, salah::CoordinatesError> {
+        salah::Coordinates::new(self.latitude.degrees(), self.longitude.degrees())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(try_from = "f64")]
 pub struct Latitude(f64);

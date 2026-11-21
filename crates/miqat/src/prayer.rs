@@ -2,7 +2,7 @@
 
 use anyhow::Context;
 use chrono::{DateTime, NaiveDate, Utc, Weekday};
-use salah::{Configuration, Coordinates, Parameters, Prayer, PrayerSchedule};
+use salah::{Configuration, Parameters, Prayer, PrayerTimes};
 
 use crate::config::{CalculationMethod, Location, Madhab, PrayerConfig};
 
@@ -67,30 +67,24 @@ pub struct Upcoming {
 }
 
 impl DayTimes {
-    /// The times of the local calendar day `date`.
-    ///
-    /// salah computes a UTC date's solar day: the one whose noon is in it.
-    /// That is the local date's only where the zone keeps near its
-    /// meridian; Kiritimati, at UTC+14 and 157°W, has its noon on the UTC
-    /// date before. So the solar day is the one whose Dhuhr falls on `date`.
+    /// The times of the local calendar day `date`: those of salah's solar
+    /// day whose Dhuhr falls on `date` in the location's zone (Kiritimati,
+    /// at UTC+14 and 157°W, has its noon on the UTC date before).
     pub fn compute(
         location: &Location,
         config: &PrayerConfig,
         date: NaiveDate,
     ) -> anyhow::Result<Self> {
-        let solar = |date| solar_day(location, config, date);
-        let first = solar(date)?;
-        let noon = first[Salah::Dhuhr as usize].with_timezone(&location.timezone);
-        let solar_date = date + (date - noon.date_naive());
-        let times = match solar_date == date {
-            true => first,
-            false => solar(solar_date)?,
-        };
-        let tomorrow = solar(solar_date.succ_opt().context("the end of time")?)?;
+        let times = PrayerTimes::on_local_date(
+            date,
+            &location.timezone,
+            location.coordinates()?,
+            parameters(config),
+        )?;
         Ok(Self {
             date,
-            times,
-            fajr_tomorrow: tomorrow[Salah::Fajr as usize],
+            times: Salah::DAY.map(|s| times.time(s.library())),
+            fajr_tomorrow: times.time(Prayer::FajrTomorrow),
         })
     }
 
@@ -155,24 +149,6 @@ impl DayTimes {
             self.date
         }
     }
-}
-
-/// salah's six times for the solar day of the UTC date `date`.
-fn solar_day(
-    location: &Location,
-    config: &PrayerConfig,
-    date: NaiveDate,
-) -> anyhow::Result<[DateTime<Utc>; 6]> {
-    let schedule = PrayerSchedule::new()
-        .on(date)
-        .for_location(Coordinates::new(
-            location.latitude.degrees(),
-            location.longitude.degrees(),
-        ))
-        .with_configuration(parameters(config))
-        .calculate()
-        .map_err(anyhow::Error::msg)?;
-    Ok(Salah::DAY.map(|s| schedule.time(s.library())))
 }
 
 fn parameters(config: &PrayerConfig) -> Parameters {
@@ -296,17 +272,11 @@ pub(crate) mod oracle {
         config: &PrayerConfig,
         now: DateTime<Utc>,
     ) -> (Salah, DateTime<Utc>, Weekday) {
-        let coordinates =
-            Coordinates::new(location.latitude.degrees(), location.longitude.degrees());
+        let coordinates = location.coordinates().unwrap();
         (-3..=3)
             .flat_map(|days| {
                 let date = now.date_naive() + TimeDelta::days(days);
-                let schedule = PrayerSchedule::new()
-                    .on(date)
-                    .for_location(coordinates)
-                    .with_configuration(parameters(config))
-                    .calculate()
-                    .unwrap();
+                let schedule = PrayerTimes::new(date, coordinates, parameters(config)).unwrap();
                 let weekday = schedule
                     .time(Prayer::Dhuhr)
                     .with_timezone(&location.timezone)

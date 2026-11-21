@@ -4,11 +4,12 @@
 // Copyright (c) 2019-2022 Farhan Ahmed. All rights reserved.
 //
 
-use chrono::{DateTime, Duration, Utc};
-
-use crate::astronomy::unit::{Angle, Coordinates};
-use crate::astronomy::unit::{Normalize, Stride};
-use crate::models::rounding::Rounding;
+use crate::astronomy::unit::Angle;
+use crate::astronomy::unit::Normalize;
+#[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
+use crate::math::Float;
+use crate::models::coordinates::Coordinates;
 use crate::models::shafaq::Shafaq;
 
 // The geometric mean longitude of the sun.
@@ -159,13 +160,18 @@ pub fn altitude_of_celestial_body(
     Angle::from_radians((term1 + term2).asin())
 }
 
+// The fraction of the UTC day of the sun's transit, near local mean noon:
+// within half a day of 12:00 - longitude / 15 hours. That keeps the transit
+// on the date at the place, either side of the date line (east of 180° - 4°
+// the sun can cross the meridian before 00:00 UTC), and the date's noon at
+// -180° about 24:00 UTC, at 180° about 00:00.
 pub fn approximate_transit(longitude: Angle, sidereal_time: Angle, right_ascension: Angle) -> f64 {
     // Equation from page Astronomical Algorithms 102
     let longitude_angle = longitude * Angle::new(-1.0);
+    let transit = (right_ascension + longitude_angle - sidereal_time).degrees / 360.0;
+    let mean_noon = (12.0 - longitude.degrees / 15.0) / 24.0;
 
-    ((right_ascension + longitude_angle - sidereal_time) / Angle::new(360.0))
-        .degrees
-        .normalized_to_scale(1.0)
+    mean_noon + (transit - mean_noon + 0.5).normalized_to_scale(1.0) - 0.5
 }
 
 // The time at which the sun is at its highest point in the sky (in universal time)
@@ -189,11 +195,14 @@ pub fn corrected_transit(
     )
     .unwound();
     let angles = (plane_angle - longitude_angle - interpolated_angles).quadrant_shifted();
-    let angle_delta = angles / Angle::new(-360.0);
+    let angle_delta = angles.degrees / -360.0;
 
-    (approximate_transit + angle_delta.degrees) * 24.0
+    (approximate_transit + angle_delta) * 24.0
 }
 
+// When the sun's center is at `angle` (degrees above the horizon), before
+// or after transit, in hours after 00:00 UTC; NaN if it isn't that day.
+#[allow(clippy::too_many_arguments)]
 pub fn corrected_hour_angle(
     approximate_transit: f64,
     angle: Angle,
@@ -207,48 +216,129 @@ pub fn corrected_hour_angle(
     previous_declination: Angle,
     next_declination: Angle,
 ) -> f64 {
-    // Equation from page Astronomical Algorithms 102
-    let longitude_angle = coordinates.longitude_angle() * Angle::new(-1.0);
-    let term1 = angle.radians().sin()
-        - (coordinates.latitude_angle().radians().sin() * declination.radians().sin());
-    let term2 = coordinates.latitude_angle().radians().cos() * declination.radians().cos();
-    let term_angle = Angle::from_radians((term1 / term2).acos());
+    let h0 = angle.degrees;
+    let longitude = coordinates.longitude_angle();
+    let latitude = coordinates.latitude_angle();
+    let longitude_angle = longitude * Angle::new(-1.0);
 
-    let adjusted_approx_transit = if after_transit {
-        approximate_transit + (term_angle.degrees / 360.0)
-    } else {
-        approximate_transit - (term_angle.degrees / 360.0)
+    // The altitude of the sun at time m (a fraction of the day), with the
+    // right ascension and declination interpolated to m: Astronomical
+    // Algorithms page 103.
+    let altitude_at = |m: f64| {
+        let plane_angle = Angle::new(sidereal_time.degrees + (360.985647 * m)).unwound();
+        let interpolated = interpolate_angles(
+            right_ascension,
+            previous_right_ascension,
+            next_right_ascension,
+            m,
+        )
+        .unwound();
+        let declination_angle = Angle::new(interpolate(
+            declination.degrees,
+            previous_declination.degrees,
+            next_declination.degrees,
+            m,
+        ));
+        let hour_angle = plane_angle - longitude_angle - interpolated;
+        let altitude = altitude_of_celestial_body(latitude, declination_angle, hour_angle);
+        (altitude.degrees, declination_angle, hour_angle)
     };
 
-    let plane_angle =
-        Angle::new(sidereal_time.degrees + (360.985647 * adjusted_approx_transit)).unwound();
-    let interpolated_angles = interpolate_angles(
+    // The altitude is highest at transit and lowest at the lower
+    // culmination, and changes monotonically between them (the declination
+    // barely moves in half a day), so the angle is reached once between
+    // transit and the adjacent lower culmination if, and only if, it lies
+    // between their altitudes (Note 2 on page 104). The lower culmination
+    // is the transit across the opposite meridian.
+    let transit = corrected_transit(
+        approximate_transit,
+        longitude,
+        sidereal_time,
         right_ascension,
         previous_right_ascension,
         next_right_ascension,
-        adjusted_approx_transit,
-    )
-    .unwound();
-    let declination_angle = Angle::new(interpolate(
-        declination.degrees,
-        previous_declination.degrees,
-        next_declination.degrees,
-        adjusted_approx_transit,
-    ));
-    let adjusted_angles = plane_angle - longitude_angle - interpolated_angles;
-    let celestial_body_altitude = altitude_of_celestial_body(
-        coordinates.latitude_angle(),
-        declination_angle,
-        adjusted_angles,
-    );
-    let term3 = (celestial_body_altitude - angle).degrees;
-    let term4 = 360.0
-        * declination_angle.radians().cos()
-        * coordinates.latitude_angle().radians().cos()
-        * adjusted_angles.radians().sin();
-    let angle_delta = term3 / term4;
+    ) / 24.0;
+    let lower_culmination = corrected_transit(
+        if after_transit {
+            transit + 0.5
+        } else {
+            transit - 0.5
+        },
+        longitude + Angle::new(180.0),
+        sidereal_time,
+        right_ascension,
+        previous_right_ascension,
+        next_right_ascension,
+    ) / 24.0;
+    // Written so that NaN altitudes are no crossing too.
+    let above_at_transit = altitude_at(transit).0 > h0;
+    let below_at_lower_culmination = altitude_at(lower_culmination).0 < h0;
+    if !(above_at_transit && below_at_lower_culmination) {
+        return f64::NAN;
+    }
+    // A bracket around the crossing: above h0 on the transit side, below
+    // it on the lower culmination side.
+    let mut lo = transit.min(lower_culmination);
+    let mut hi = transit.max(lower_culmination);
 
-    (adjusted_approx_transit + angle_delta) * 24.0
+    // The first guess from equations (15.1) and (15.2) on page 102, with the
+    // declination at 0h; the middle of the bracket if that is outside it.
+    let cos_h0 = (angle.radians().sin() - latitude.radians().sin() * declination.radians().sin())
+        / (latitude.radians().cos() * declination.radians().cos());
+    let h0_degrees = Angle::from_radians(cos_h0.acos()).degrees;
+    let guess = if after_transit {
+        approximate_transit + h0_degrees / 360.0
+    } else {
+        approximate_transit - h0_degrees / 360.0
+    };
+    let mut m = if guess > lo && guess < hi {
+        guess
+    } else {
+        (lo + hi) / 2.0
+    };
+
+    // Correct m by dm = (h - h0) / (360 cos δ cos φ sin H) (page 103) until
+    // the correction is negligible, as in Example 15.a. Near the transit or
+    // the lower culmination sin H nears zero and the step can overshoot, so
+    // a step that would leave the bracket, or isn't shrinking fast enough,
+    // halves the bracket instead (chapter 5's bisection, page 52): rtsafe
+    // in Numerical Recipes, section 9.4. This always converges, to the
+    // solution the textbook iteration finds when it does.
+    let mut dm = hi - lo;
+    let mut previous_dm = dm;
+    for _ in 0..100 {
+        let (h, declination_angle, hour_angle) = altitude_at(m);
+        let f = h - h0;
+        if f == 0.0 {
+            break;
+        }
+        if (f > 0.0) == after_transit {
+            lo = m;
+        } else {
+            hi = m;
+        }
+        // The altitude's rate of change, in degrees per day.
+        let slope = -360.0
+            * declination_angle.radians().cos()
+            * latitude.radians().cos()
+            * hour_angle.radians().sin();
+        let newton_leaves_bracket = ((m - hi) * slope - f) * ((m - lo) * slope - f) >= 0.0;
+        let newton_too_slow = (2.0 * f).abs() > (previous_dm * slope).abs();
+        previous_dm = dm;
+        if newton_leaves_bracket || newton_too_slow {
+            dm = (hi - lo) / 2.0;
+            m = lo + dm;
+        } else {
+            dm = -f / slope;
+            m += dm;
+        }
+        // About 0.1 milliseconds.
+        if dm.abs() < 1e-9 {
+            break;
+        }
+    }
+
+    m * 24.0
 }
 
 // Interpolation of a value given equidistant previous and
@@ -305,33 +395,31 @@ pub fn julian_century(julian_day: f64) -> f64 {
 
 // Checks if the given year is a leap year.
 pub fn is_leap_year(year: u32) -> bool {
-    if year % 4 != 0 {
+    if !year.is_multiple_of(4) {
         return false;
     }
 
-    if year % 100 == 0 && year % 400 != 0 {
+    if year.is_multiple_of(100) && !year.is_multiple_of(400) {
         return false;
     }
 
     true
 }
 
-// Twilight adjustment based on observational data for use
-// in the Moonsighting Committee calculation method.
-pub fn season_adjusted_morning_twilight(
-    latitude: f64,
-    day: u32,
-    year: u32,
-    sunrise: DateTime<Utc>,
-) -> DateTime<Utc> {
+// Round half up, as JavaScript's Math.round: Adhan's rounding, which
+// f64::round (half away from zero) differs from on negative halves.
+fn round_half_up(value: f64) -> i64 {
+    (value + 0.5).floor() as i64
+}
+
+// Seconds from sunrise to the start of the Moonsighting Committee's morning
+// twilight (negative: before sunrise), from observational data.
+pub fn season_adjusted_morning_twilight(latitude: f64, day: u32, year: u32) -> i64 {
     let dyy = days_since_solstice(day, year, latitude) as f64;
     let adjustment =
         twilight_adjustments(AdjustmentDaytime::Morning, latitude, dyy, Shafaq::General);
 
-    let rounded_adjustment = (adjustment * -60.0).round() as i64;
-    sunrise
-        .checked_add_signed(Duration::seconds(rounded_adjustment))
-        .unwrap()
+    round_half_up(adjustment * -60.0)
 }
 
 fn twilight_adjustments(
@@ -407,49 +495,54 @@ fn twilight_adjustment_values(
     }
 }
 
-// Twilight adjustment based on observational data for use
-// in the Moonsighting Committee calculation method.
-pub fn season_adjusted_evening_twilight(
-    latitude: f64,
-    day: u32,
-    year: u32,
-    sunset: DateTime<Utc>,
-    shafaq: Shafaq,
-) -> DateTime<Utc> {
+// Seconds from sunset to the end of the Moonsighting Committee's evening
+// twilight, from observational data.
+pub fn season_adjusted_evening_twilight(latitude: f64, day: u32, year: u32, shafaq: Shafaq) -> i64 {
     let dyy = days_since_solstice(day, year, latitude) as f64;
     let adjustment = twilight_adjustments(AdjustmentDaytime::Evening, latitude, dyy, shafaq);
 
-    let rounded_adjustment = (adjustment * 60.0).round() as i64;
-    let adjusted_date = sunset
-        .checked_add_signed(Duration::seconds(rounded_adjustment))
-        .unwrap();
-
-    adjusted_date.rounded_minute(Rounding::Nearest)
+    round_half_up(adjustment * 60.0)
 }
 
-// Solstice calculation to determine a date's seasonal progression.
-// Used in the Moonsighting Committee calculation method.
+// Days since the winter solstice (the northern one's about 10 days before
+// the year begins, the southern one's day 172 or 173): a date's seasonal
+// progression, for the Moonsighting Committee method.
 pub fn days_since_solstice(day_of_year: u32, year: u32, latitude: f64) -> u32 {
     let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-
-    if latitude >= 0.0 {
-        let northern_offset = 10;
-        let lapsed_days = day_of_year + northern_offset;
-
-        if lapsed_days >= days_in_year {
-            lapsed_days - days_in_year
-        } else {
-            lapsed_days
-        }
+    let solstice_offset: i64 = if latitude >= 0.0 {
+        -10
+    } else if is_leap_year(year) {
+        173
     } else {
-        let southern_offset = if is_leap_year(year) { 173 } else { 172 };
-        (day_of_year - southern_offset) + days_in_year
-    }
+        172
+    };
+
+    (i64::from(day_of_year) - solstice_offset).rem_euclid(days_in_year) as u32
 }
 
-pub fn adjust_time(date: &DateTime<Utc>, minutes: i64) -> DateTime<Utc> {
-    date.checked_add_signed(Duration::seconds(minutes * 60))
-        .unwrap()
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// For any day of any supported year and any latitude, the days since
+    /// the solstice are a day of that year.
+    #[kani::proof]
+    fn days_since_solstice_is_a_day_of_the_year() {
+        let (day, year, latitude): (u32, u32, f64) = (kani::any(), kani::any(), kani::any());
+        kani::assume((1..=366).contains(&day) && (1000..=3000).contains(&year));
+        let days = days_since_solstice(day, year, latitude);
+        assert!(days < if is_leap_year(year) { 366 } else { 365 });
+    }
+
+    /// Julian days of supported dates are computed without overflow, and
+    /// are finite.
+    #[kani::proof]
+    fn julian_day_is_total() {
+        let (year, month, day): (i32, i32, i32) = (kani::any(), kani::any(), kani::any());
+        kani::assume((1000..=3000).contains(&year) && (1..=12).contains(&month));
+        kani::assume((1..=31).contains(&day));
+        assert!(julian_day(year, month, day, 0.0).is_finite());
+    }
 }
 
 #[cfg(test)]
@@ -468,7 +561,7 @@ mod tests {
         let julian_day = julian_day(1992, 10, 13, 0.0);
         let julian_century = julian_century(julian_day);
 
-        assert_eq!(julian_century, -0.072183436002737855);
+        assert_eq!(julian_century, -0.072_183_436_002_737_86);
     }
 
     #[test]
@@ -488,7 +581,7 @@ mod tests {
         let apparent_solar_longitude =
             apparent_solar_longitude(julian_century, mean_solar_longitude).radians();
 
-        assert_eq!(apparent_solar_longitude, 3.4890691820452062);
+        assert_eq!(apparent_solar_longitude, 3.489_069_182_045_206);
     }
 
     #[test]
@@ -517,7 +610,7 @@ mod tests {
         let julian_century = julian_century(julian_day);
         let mean_solar_anomaly = mean_solar_anomaly(julian_century);
 
-        assert_eq!(mean_solar_anomaly.degrees, 278.99396643159753);
+        assert_eq!(mean_solar_anomaly.degrees, 278.993_966_431_597_5);
     }
 
     #[test]
@@ -587,12 +680,12 @@ mod tests {
             ascending_lunar_node,
         );
 
-        assert_eq!(nutation_obliq, -0.000092747500292341556);
+        assert_eq!(nutation_obliq, -0.000_092_747_500_292_341_56);
     }
 
     #[test]
     fn calculate_altitude_of_celestial_body() {
-        let coordinates = Coordinates::new(35.783333333333331, -78.650000000000006);
+        let coordinates = Coordinates::new(35.783_333_333_333_33, -78.65).unwrap();
         let declination_angle = Angle::new(21.894701414701338);
         let local_hour_angle = Angle::new(108.09275357838322);
         let celestial_body = altitude_of_celestial_body(
@@ -601,6 +694,6 @@ mod tests {
             local_hour_angle,
         );
 
-        assert_eq!(celestial_body.degrees, -0.90061562155943208);
+        assert_eq!(celestial_body.degrees, -0.900_615_621_559_432_1);
     }
 }
