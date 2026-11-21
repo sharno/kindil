@@ -18,6 +18,18 @@ pub struct Renderer {
     contrast: Contrast,
 }
 
+/// What a page's rows below the header are drawn from: the body's SVG
+/// elements ([`layout::body_svg`]), the radar raster laid under them, and
+/// the contrast. Two pages with equal bodies have the same pixels there,
+/// so a host can keep the body it rendered and render only the header
+/// ([`Renderer::header_gray`]) while the body stays the same.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Body {
+    svg: String,
+    radar: Option<Gray>,
+    contrast: Contrast,
+}
+
 impl Renderer {
     pub fn new(contrast: Contrast) -> Self {
         let mut options = usvg::Options::default();
@@ -33,14 +45,17 @@ impl Renderer {
 
     /// The whole page, [`layout::WIDTH`] × the frame's page height.
     pub fn gray(&self, frame: &Frame) -> anyhow::Result<Gray> {
-        self.rasterize(
-            &layout::svg(frame),
-            frame.page.height(),
-            frame
-                .radar
-                .filter(|_| frame.rain_expected())
-                .map(|radar| (&radar.data.map, layout::RADAR_LEFT, frame.page.radar_top())),
-        )
+        self.rasterize(&layout::svg(frame), frame.page.height(), drawn_radar(frame))
+    }
+
+    /// What `frame`'s page draws below the header from: cheap, no
+    /// rasterising.
+    pub fn body(&self, frame: &Frame) -> Body {
+        Body {
+            svg: layout::body_svg(frame),
+            radar: drawn_radar(frame).map(|(map, _, _)| map.clone()),
+            contrast: self.contrast,
+        }
     }
 
     /// Only the header: the top [`layout::Page::header_height`] rows of
@@ -84,6 +99,15 @@ impl Renderer {
                 .collect(),
         })
     }
+}
+
+/// The radar raster a page lays under its SVG, and where: only when rain
+/// is expected.
+fn drawn_radar<'a>(frame: &Frame<'a>) -> Option<(&'a Gray, i64, i64)> {
+    frame
+        .radar
+        .filter(|_| frame.rain_expected())
+        .map(|radar| (&radar.data.map, layout::RADAR_LEFT, frame.page.radar_top()))
 }
 
 fn draw_gray(pixmap: &mut tiny_skia::Pixmap, image: &Gray, left: i64, top: i64) {
@@ -193,6 +217,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A host keeps the body it rendered while [`Renderer::body`] says it
+    /// is the same: through the day, across the hour, the quarter hours
+    /// and prayers, with no weather, dry and wet with the radar, each pair
+    /// of 5-minute full frames whose bodies are equal has the same pixels
+    /// below the header (and some bodies change, which the key sees).
+    #[test]
+    fn equal_bodies_draw_the_same_pixels_below_the_header() {
+        let mut config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        let mut dry = crate::weather::decode(
+            include_str!("../tests/fixtures/open-meteo.json"),
+            config.location.timezone,
+        )
+        .unwrap();
+        let start = dry.hours[0].at;
+        let mut wet = dry.clone();
+        wet.quarters = (0..400)
+            .map(|i| Quarter {
+                at: start + Duration::minutes(15 * i),
+                precipitation_mm: if i % 3 == 0 { WET_MM } else { 0.0 },
+            })
+            .collect();
+        dry.quarters
+            .iter_mut()
+            .for_each(|q| q.precipitation_mm = 0.0);
+        let snapshot = |data| Snapshot {
+            data,
+            fetched_at: start,
+        };
+        let (dry, wet) = (snapshot(dry), snapshot(wet));
+        let radar = Snapshot {
+            data: crate::radar::RadarImage {
+                observed_at: start,
+                map: Gray {
+                    width: layout::RADAR_SIZE.0,
+                    height: layout::RADAR_SIZE.1,
+                    pixels: (0..layout::RADAR_SIZE.0 * layout::RADAR_SIZE.1)
+                        .map(|i| (i % 251) as u8)
+                        .collect(),
+                },
+            },
+            fetched_at: start,
+        };
+        let page = Page::below(56);
+        let header_len = (layout::WIDTH * page.header_height()) as usize;
+        let renderer = Renderer::new(config.display.contrast);
+        let (mut same, mut changed) = (0, 0);
+        for clock in [ClockFormat::TwentyFourHour, ClockFormat::TwelveHour] {
+            config.display.clock = clock;
+            for (weather, radar) in [(None, None), (Some(&dry), None), (Some(&wet), Some(&radar))] {
+                for hours in (1..24).step_by(4) {
+                    let at =
+                        |minutes: i64| start + Duration::hours(hours) + Duration::minutes(minutes);
+                    let mut last: Option<(Body, Gray)> = None;
+                    for minutes in (40..=80).step_by(5) {
+                        let now = at(minutes);
+                        let prayers =
+                            DayTimes::current(&config.location, &config.prayer, now).unwrap();
+                        let frame = Frame {
+                            now,
+                            config: &config,
+                            prayers: &prayers,
+                            weather,
+                            radar,
+                            page,
+                        };
+                        let body = renderer.body(&frame);
+                        let gray = renderer.gray(&frame).unwrap();
+                        if let Some((before, before_gray)) = &last {
+                            if *before == body {
+                                same += 1;
+                                assert!(
+                                    before_gray.pixels[header_len..] == gray.pixels[header_len..],
+                                    "the body's key held but its pixels moved at {now} \
+                                     ({clock:?})"
+                                );
+                            } else {
+                                changed += 1;
+                            }
+                        }
+                        last = Some((body, gray));
+                    }
+                }
+            }
+        }
+        assert!(same > 50 && changed > 5, "{same} same, {changed} changed");
     }
 
     /// Under a bar, the page is the full page's elements with the spacing

@@ -22,8 +22,8 @@ After deploying, let it doze ten minutes, then in a maintenance window:
 $K "$P tail -12 /var/local/kindil/naps.log"
 ```
 
-Expect, per nap: `wake N: Draw Tick for … , Done after 1.2 s, panel
-update U`, `Wi-Fi parked in 0.0x s`, `nap: suspending, rtc1 alarm at
+Expect, per nap: `wake N: Draw Tick for … , Done after 1.20 s, panel
+update U (header rendered in R s, shown at S s, sent at T s)`, `Wi-Fi parked in 0.0x s`, `nap: suspending, rtc1 alarm at
 N (rtc M +K s, read back N)`, `nap: resumed after K s by the clock, rtc1 at
 N...`. A `not read back` means `/dev/rtc1` couldn't be opened (it is
 exclusive): note who holds it (`fuser /dev/rtc1`). A `not suspending` line
