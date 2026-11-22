@@ -16,39 +16,36 @@ storage's Mounted, Released and Exported.
 
 src/install.rs: a release installs itself, and rolls back unless it comes up and holds.
 
-`install::steps::Installing`: Checked, BackedUp, Stopped, Placed, Started, Up, Kept, Failed, RolledBack.
+`install::steps::Installing`: Checked, BackedUp, Placed, Started, Up, Kept, Failed, RolledBack.
 
 ```mermaid
 stateDiagram-v2
     %% machine: install::steps::Installing
     state "Checked" as s0
     state "BackedUp" as s1
-    state "Stopped" as s2
-    state "Placed" as s3
-    state "Started" as s4
-    state "Up" as s5
-    state "Kept" as s6
-    state "Failed" as s7
-    state "RolledBack" as s8
-    s1 --> s2: stop
+    state "Placed" as s2
+    state "Started" as s3
+    state "Up" as s4
+    state "Kept" as s5
+    state "Failed" as s6
+    state "RolledBack" as s7
+    s1 --> s2: place
+    s1 --> s6: place
     s0 --> s1: back_up
-    s7 --> s8: roll_back
-    s3 --> s4: start
-    s4 --> s5: come_up
-    s4 --> s7: come_up
-    s2 --> s3: place
-    s2 --> s7: place
-    s5 --> s6: hold
-    s5 --> s7: hold
+    s6 --> s7: roll_back
+    s2 --> s3: start
+    s3 --> s4: come_up
+    s3 --> s6: come_up
+    s4 --> s5: hold
+    s4 --> s6: hold
 ```
 
 ```text
-BackedUp.stop -> Stopped
+BackedUp.place -> Placed | Failed
 Checked.back_up -> BackedUp
 Failed.roll_back -> RolledBack
 Placed.start -> Started
 Started.come_up -> Up | Failed
-Stopped.place -> Placed | Failed
 Up.hold -> Kept | Failed
 ```
 

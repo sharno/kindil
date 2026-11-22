@@ -193,6 +193,10 @@ fn kindle(cli: &Cli) -> anyhow::Result<Exit> {
     kindil::kindle::release_charging();
     // The kernel's firmware timeout back, for Amazon's Wi-Fi (src/firmware.rs).
     let _ = kindil::firmware::restore(std::path::Path::new(kindil::firmware::TIMEOUT));
+    // An install asked for the new binary (src/install.rs).
+    if kindil::signals::restart_asked() {
+        return Ok(Exit::Restart);
+    }
     Ok(app.exit())
 }
 
