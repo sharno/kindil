@@ -74,12 +74,11 @@ fn machines() -> Vec<(&'static str, &'static str, StableGraphMetadata)> {
 fn each_transition_has_exactly_its_legal_targets() {
     let want = [
         &[
-            "BackedUp.stop -> Stopped",
+            "BackedUp.place -> Placed | Failed",
             "Checked.back_up -> BackedUp",
             "Failed.roll_back -> RolledBack",
             "Placed.start -> Started",
             "Started.come_up -> Up | Failed",
-            "Stopped.place -> Placed | Failed",
             "Up.hold -> Kept | Failed",
         ][..],
         &[

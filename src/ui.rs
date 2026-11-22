@@ -1660,7 +1660,7 @@ impl Ctx {
             if opens {
                 ledger.window_opened();
             }
-            ledger.due(now)
+            ledger.due_at(now, window)
         };
         if due {
             self.log_ledger(now);

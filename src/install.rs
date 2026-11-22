@@ -40,8 +40,6 @@ impl Default for Paths {
 
 /// How long kindil gets to come back up, and to stay so.
 pub struct Timing {
-    /// kindil stopping fully: its session restores Amazon's UI on the way out.
-    pub settle: Duration,
     pub up_within: Duration,
     pub hold: Duration,
     pub poll: Duration,
@@ -50,7 +48,6 @@ pub struct Timing {
 impl Default for Timing {
     fn default() -> Self {
         Self {
-            settle: Duration::from_secs(20),
             up_within: Duration::from_secs(180),
             hold: Duration::from_secs(60),
             poll: Duration::from_secs(5),
@@ -60,8 +57,20 @@ impl Default for Timing {
 
 /// What the install does to the device beyond its files.
 pub trait Kindle {
-    fn stop_kindil(&self);
-    fn start_kindil(&self, extension: &Path);
+    /// kindil runs the binary now in `extension`: a running kindil is asked
+    /// to restart (SIGUSR1: it exits with the launcher's restart code, and
+    /// the launcher's session copies and runs the new binary, Amazon's UI
+    /// staying stopped); with none running, `bin/start.sh` starts it.
+    ///
+    /// Until 0.21 the install killed kindil, which the launcher takes for
+    /// Exit to Kindle: it brought Amazon's whole UI (X, its Java
+    /// framework) back up, and the new session stopped it again, copying
+    /// the binary meanwhile, while it started: 151 s from start to up on
+    /// 0.21, growing with each release (36 s on 0.16). A kindil before
+    /// 0.22 has no handler: SIGUSR1 ends it, which the launcher takes for a
+    /// crash and runs kindil again 2 s later, Amazon's UI staying stopped
+    /// too.
+    fn restart_kindil(&self, extension: &Path);
     /// The running kindil reports `version` and has its Wi-Fi.
     fn up(&self, version: &str, run: &Path) -> bool;
     fn sleep(&self, time: Duration);
@@ -71,12 +80,15 @@ pub trait Kindle {
 pub struct Device;
 
 impl Kindle for Device {
-    fn stop_kindil(&self) {
-        let _ = std::process::Command::new("killall").arg("kindil").status();
-    }
-
-    fn start_kindil(&self, extension: &Path) {
-        let _ = std::process::Command::new(extension.join("bin/start.sh")).status();
+    fn restart_kindil(&self, extension: &Path) {
+        let running = sessions_kindil(&Paths::default().run.join("kindil"));
+        if running.is_empty() {
+            let _ = std::process::Command::new(extension.join("bin/start.sh")).status();
+        }
+        for pid in running {
+            // SAFETY: kill(2) on a pid just read from /proc.
+            unsafe { libc::kill(pid, libc::SIGUSR1) };
+        }
     }
 
     fn up(&self, version: &str, run: &Path) -> bool {
@@ -90,6 +102,29 @@ impl Kindle for Device {
     fn sleep(&self, time: Duration) {
         std::thread::sleep(time);
     }
+}
+
+/// The kindil the launcher's session runs: the copy at `bin`, run as
+/// `kindil ... kindle` (not its DHCP hook or lifeline, which are links to
+/// it, nor this install).
+fn sessions_kindil(bin: &Path) -> Vec<i32> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
+            let exe = std::fs::read_link(entry.path().join("exe")).ok()?;
+            let cmdline = std::fs::read(entry.path().join("cmdline")).ok()?;
+            (exe == bin && is_session(&cmdline)).then_some(pid)
+        })
+        .collect()
+}
+
+/// A `/proc/PID/cmdline` whose last argument is `kindle`: the session's
+/// kindil (`kindil [--config FILE] kindle`).
+fn is_session(cmdline: &[u8]) -> bool {
+    cmdline.split(|&b| b == 0).rfind(|arg| !arg.is_empty()) == Some(b"kindle")
 }
 
 /// kindil runs, the copy that runs is `version` (not the launcher's
@@ -146,8 +181,8 @@ fn run(id: &str, paths: &Paths, timing: &Timing, kindle: &dyn Kindle) -> anyhow:
     };
     // Nothing changes before the backup: a failed check or backup is only
     // an error. From the stop on, every failure rolls back.
-    let stopped = steps::check(id, paths)?.back_up(paths)?.stop(&env);
-    let kept = stopped
+    let backed_up = steps::check(id, paths)?.back_up(paths)?;
+    let kept = backed_up
         .place(paths)
         .and_then(|placed| placed.start(&env).come_up(&env))
         .and_then(|up| up.hold(&env));
@@ -180,10 +215,9 @@ mod steps {
         /// The bundle matched its checksum and unpacked here, and its binary
         /// runs.
         Checked(PathBuf),
-        /// The extension and the launcher are backed up.
+        /// The extension and the launcher are backed up. kindil still runs
+        /// the old binary, from its copy on the system storage.
         BackedUp(PathBuf),
-        /// kindil stopped, and settled.
-        Stopped(PathBuf),
         /// Every file of the bundle in place.
         Placed,
         Started,
@@ -257,15 +291,6 @@ mod steps {
 
     #[transition]
     impl Installing<BackedUp> {
-        pub(super) fn stop(self, env: &Env) -> Installing<Stopped> {
-            env.kindle.stop_kindil();
-            env.kindle.sleep(env.timing.settle);
-            self.transition_map(|new| new)
-        }
-    }
-
-    #[transition]
-    impl Installing<Stopped> {
         pub(super) fn place(
             self,
             paths: &Paths,
@@ -280,7 +305,7 @@ mod steps {
     #[transition]
     impl Installing<Placed> {
         pub(super) fn start(self, env: &Env) -> Installing<Started> {
-            env.kindle.start_kindil(&env.paths.extension);
+            env.kindle.restart_kindil(&env.paths.extension);
             self.transition()
         }
     }
@@ -341,8 +366,6 @@ mod steps {
         pub(super) fn roll_back(self, env: &Env) -> Installing<RolledBack> {
             let (id, paths) = (&self.id, env.paths);
             log(id, &format!("{}; rolling back", self.state_data));
-            env.kindle.stop_kindil();
-            env.kindle.sleep(env.timing.settle);
             let restored = (|| -> anyhow::Result<()> {
                 let _ = std::fs::remove_dir_all(&paths.extension);
                 std::fs::create_dir_all(&paths.extension)?;
@@ -363,7 +386,7 @@ mod steps {
             if let Err(error) = restore_launcher(paths) {
                 log(id, &format!("restoring the launcher failed: {error:#}"));
             }
-            env.kindle.start_kindil(&paths.extension);
+            env.kindle.restart_kindil(&paths.extension);
             let back =
                 version_of(&paths.extension.join("bin/kindil")).unwrap_or_else(|_| "?".into());
             log(id, &format!("rolled back to {back}"));
@@ -564,12 +587,11 @@ mod tests {
     }
 
     impl Kindle for Fake {
-        fn stop_kindil(&self) {
-            self.calls.borrow_mut().push("stop".into());
-        }
-        fn start_kindil(&self, extension: &Path) {
+        fn restart_kindil(&self, extension: &Path) {
             let version = version_of(&extension.join("bin/kindil")).unwrap();
-            self.calls.borrow_mut().push(format!("start {version}"));
+            self.calls
+                .borrow_mut()
+                .push(format!("restart into {version}"));
             let bin = extension.join("bin");
             let runs = if self.falls_back && bin.join("kindil.previous").exists() {
                 bin.join("kindil.previous")
@@ -623,7 +645,6 @@ mod tests {
 
     fn timing() -> Timing {
         Timing {
-            settle: Duration::ZERO,
             up_within: Duration::from_millis(50),
             hold: Duration::ZERO,
             poll: Duration::ZERO,
@@ -636,6 +657,26 @@ mod tests {
 
     fn launcher(paths: &Paths) -> String {
         std::fs::read_to_string(paths.extension.join("menu.json")).unwrap()
+    }
+
+    #[test]
+    fn only_the_sessions_kindil_is_asked_to_restart() {
+        let args = |args: &[&str]| args.join("\0").into_bytes();
+        assert!(is_session(&args(&["/var/local/kindil/kindil", "kindle"])));
+        assert!(is_session(&args(&[
+            "/var/local/kindil/kindil",
+            "--config",
+            "/mnt/us/kindil/kindil.toml",
+            "kindle",
+            ""
+        ])));
+        // udhcpc's hook (a link to the same file), and this install.
+        assert!(!is_session(&args(&[
+            "/var/local/kindil/kindil-dhcp",
+            "bound"
+        ])));
+        assert!(!is_session(&args(&["kindil", "install", "1795329732"])));
+        assert!(!is_session(b""));
     }
 
     #[test]
@@ -665,7 +706,7 @@ mod tests {
             "new launcher",
             "every file in the bundle"
         );
-        assert_eq!(*fake.calls.borrow(), ["stop", "start kindil 2.0.0"]);
+        assert_eq!(*fake.calls.borrow(), ["restart into kindil 2.0.0"]);
         let mode = std::fs::metadata(s.paths.extension.join("bin/start.sh")).unwrap();
         assert_eq!(
             std::os::unix::fs::PermissionsExt::mode(&mode.permissions()) & 0o111,
@@ -681,7 +722,10 @@ mod tests {
         assert!(error.to_string().contains("rolled back"), "{error}");
         assert_eq!(installed(&s.paths, "kindil"), "kindil 1.0.0");
         assert_eq!(launcher(&s.paths), "old launcher", "the launcher files too");
-        assert_eq!(fake.calls.borrow().last().unwrap(), "start kindil 1.0.0");
+        assert_eq!(
+            fake.calls.borrow().last().unwrap(),
+            "restart into kindil 1.0.0"
+        );
     }
 
     #[test]
@@ -699,7 +743,7 @@ mod tests {
         assert_eq!(launcher(&s.paths), "old launcher");
         assert_eq!(
             *fake.calls.borrow(),
-            ["stop", "stop", "start kindil 1.0.0"],
+            ["restart into kindil 1.0.0"],
             "the new version never started"
         );
     }

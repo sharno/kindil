@@ -55,6 +55,14 @@ pub const MIN_NAP: Duration = Duration::from_secs(5);
 pub const FULL_REDRAW_MINUTES: u32 = 5;
 /// How often dozing logs where its energy went ([`DozeLedger`]).
 pub const LEDGER_EVERY: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+/// A ledger past [`LEDGER_EVERY`] waits for an online wake, which is long
+/// anyway (Wi-Fi, a fetch): logged on a tick, its gauge reading and its
+/// write made that wake cross the 2 s after a resume past which the PW1's
+/// battery driver takes an hour of supposed suspend current off the gauge
+/// (docs/HOW-IT-WORKS.md). Online wakes come every 30 minutes; without
+/// them (no dashboard, or fetches failing), at this age it is logged
+/// anyway.
+pub const LEDGER_LATE: chrono::TimeDelta = chrono::TimeDelta::minutes(90);
 /// At or below this level on battery, kindil sleeps with a charge screen:
 /// suspended, the last few percent last for days instead of an hour.
 pub const BATTERY_EMPTY: u8 = 5;
@@ -649,6 +657,15 @@ impl DozeLedger {
     /// start).
     pub fn due(&self, now: DateTime<Utc>) -> bool {
         now - self.since >= LEDGER_EVERY || now < self.since
+    }
+
+    /// Whether to log it at a wake doing `window`: [`Self::due`] on an
+    /// online wake, or [`LEDGER_LATE`] on any.
+    pub fn due_at(&self, now: DateTime<Utc>, window: Window) -> bool {
+        match window {
+            Window::Online => self.due(now),
+            Window::Draw => now - self.since >= LEDGER_LATE || now < self.since,
+        }
     }
 
     /// The gauge when the doze began, read once it has been.
@@ -1289,7 +1306,7 @@ mod tests {
             let wake = schedule.wake(now, true);
             let opens = wake.window == Window::Online && maintenance.online_wake(now);
             ledger.woke(now, Instant::now(), wake.window, wake.redraw);
-            if ledger.due(now) {
+            if ledger.due_at(now, wake.window) {
                 ledger.close(now, None);
                 night.ledgers.push(real as i64);
             }
@@ -1354,8 +1371,9 @@ mod tests {
                 "{what}: full redraws {:?}",
                 &night.full[..night.full.len().min(16)]
             );
+            // On online wakes: an hour, and at most LEDGER_LATE.
             assert!(
-                gap(&night.ledgers) <= 62 * 60,
+                gap(&night.ledgers) <= LEDGER_LATE.num_seconds() + 120,
                 "{what}: ledgers {:?}",
                 night.ledgers
             );
@@ -1453,6 +1471,11 @@ mod tests {
         ledger.napping(t0 + secs(302), i0 + Duration::from_secs(32));
         assert!(!ledger.due(t0 + secs(3599)));
         assert!(ledger.due(t0 + secs(3600)));
+        // Logged on an online wake, or on any once it is late.
+        assert!(ledger.due_at(t0 + secs(3600), Window::Online));
+        assert!(!ledger.due_at(t0 + secs(3600), Window::Draw));
+        assert!(!ledger.due_at(t0 + secs(5399), Window::Draw));
+        assert!(ledger.due_at(t0 + secs(5400), Window::Draw));
         let line = ledger.close(t0 + secs(3600), Some(MilliampHours(490)));
         assert_eq!(
             line,

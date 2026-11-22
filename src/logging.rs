@@ -38,9 +38,57 @@ pub fn line(args: std::fmt::Arguments<'_>) {
     // On the device, a write that can't fail. Elsewhere (tests, previews)
     // eprint!, whose output the test harness captures.
     #[cfg(feature = "kindle")]
-    let _ = std::io::stderr().lock().write_all(text.as_bytes());
+    {
+        let stderr = std::io::stderr();
+        let mut locked = stderr.lock();
+        let _ = locked.write_all(text.as_bytes());
+        if LINES
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(CHECK_EVERY)
+        {
+            use std::os::fd::AsFd;
+            // The launcher opened it to append only: read through a fresh
+            // open of the same file.
+            let reader = std::fs::File::open("/proc/self/fd/2");
+            if let (Ok(fd), Ok(reader)) = (locked.as_fd().try_clone_to_owned(), reader) {
+                let _ = trim(&reader, &std::fs::File::from(fd), MAX_BYTES);
+            }
+        }
+    }
     #[cfg(not(feature = "kindle"))]
     eprint!("{text}");
+}
+
+/// The launcher's bound on kindil.log (launcher/src/main.rs `LOG_MAX`),
+/// which it applies only when a session starts: a doze running for weeks
+/// grows it by about 20 KB a day on /var/local, 64 MB and mostly Amazon's.
+/// kindil applies it too, every [`CHECK_EVERY`] lines.
+pub const MAX_BYTES: u64 = 256 * 1024;
+const CHECK_EVERY: u64 = 64;
+#[cfg(feature = "kindle")]
+static LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Past `max` bytes, keeps the file's last half (from a line's start), in
+/// place: the file is everyone's stderr, opened for appending by the
+/// launcher and shared with kindil's children, whose next writes go to
+/// its new end. `reader` and `writer` are the same file, opened to read
+/// and to append. Whether it was trimmed.
+pub fn trim(reader: &std::fs::File, writer: &std::fs::File, max: u64) -> std::io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom, Write as _};
+    let len = writer.metadata()?.len();
+    if len <= max {
+        return Ok(false);
+    }
+    let mut reader = reader;
+    reader.seek(SeekFrom::Start(len - max / 2))?;
+    let mut tail = Vec::new();
+    reader.read_to_end(&mut tail)?;
+    // From the first whole line.
+    let start = tail.iter().position(|&b| b == b'\n').map_or(0, |at| at + 1);
+    writer.set_len(0)?;
+    let mut writer = writer;
+    writer.write_all(&tail[start..])?;
+    Ok(true)
 }
 
 /// Hands the `log` crate's warnings and errors (the Kindle backend's: an
@@ -76,6 +124,31 @@ macro_rules! log {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn a_log_past_its_bound_keeps_its_last_half_in_place() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kindil.log");
+        // As the launcher opens it: to append only.
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let reader = std::fs::File::open(&path).unwrap();
+        let lines: Vec<String> = (0..100).map(|i| format!("line {i:03}\n")).collect();
+        file.write_all(lines.concat().as_bytes()).unwrap();
+        assert!(!trim(&reader, &file, 10_000).unwrap(), "under its bound");
+        assert!(trim(&reader, &file, 400).unwrap());
+        let kept = std::fs::read_to_string(&path).unwrap();
+        assert!(kept.len() <= 200 && kept.starts_with("line ") && kept.ends_with("line 099\n"));
+        // Appending goes on at the new end.
+        file.write_all(b"line 100\n").unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .ends_with("line 099\nline 100\n"));
+    }
 
     #[test]
     fn stamps_in_the_devices_zone_or_utc() {

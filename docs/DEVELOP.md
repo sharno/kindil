@@ -65,7 +65,11 @@ move the alarm.
 files from its tag and waits for the Kindle; there the release installs
 itself (`kindil install`, src/install.rs) and rolls back, launcher files
 and all, unless it is the version running, with its Wi-Fi joined, and stays
-so for a minute. `run` starts a script with `kindil-lifeline` beside it,
+so for a minute. The files go in place while kindil runs, then kindil is
+asked to restart (SIGUSR1): it exits with the launcher's restart code, and
+the launcher's session runs the new binary with Amazon's UI kept stopped,
+as after an update from Settings. A launcher the new version carries takes
+effect at the next session start (Exit to Kindle and back, or a boot). `run` starts a script with `kindil-lifeline` beside it,
 which brings kindil and Wi-Fi back when the script ends or at the deadline.
 It runs the installed binary on the user storage, never the copy on
 /var/local (which it would keep from being replaced), so USB drive mode
