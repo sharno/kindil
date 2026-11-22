@@ -26,6 +26,7 @@ pub mod maintenance;
 pub mod net;
 pub mod networks;
 pub mod perms;
+pub mod pmic;
 pub mod pmk;
 pub mod power;
 pub mod prayer;

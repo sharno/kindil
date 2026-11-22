@@ -17,6 +17,13 @@ $K "$P cat $C/connected $C/charging; /mnt/us/extensions/kindil/bin/kindil gauge"
 $K "$P grep -e 'kindil: charg' /var/local/kindil/kindil.log | tail"
 ```
 
+From 0.21 every change's line ends with the PMIC's own word on its charger
+(`; PMIC charger charging|stopped, current setting N[, fault: ...]`), and
+each restart adds `kindil: PMIC charger restarted: PMIC charger charging,
+...`. `PMIC charger stopped` after a restart, or `restarting the PMIC's
+charger: ...`, is a failure: report it. So is a line saying the PMIC
+couldn't be read (`/dev/pmic: ...; charging judged by the gauge`).
+
 SSH reaches a dozing Kindle only in its 2-minute window every 2 hours; a
 press of the power button wakes it for the checks (it then dozes again
 after 2 minutes), and each charging line stays in kindil.log meanwhile.
@@ -37,7 +44,19 @@ stopped at full earlier, the chip discharging) and let it doze.
   flag is wrong while charging, and kindil would restart every 30 minutes
   and never stop at full: report it.
 - A `restarted` line again 30 minutes later, with the chip still
-  discharging, means writing the switch doesn't restart the charger.
+  discharging, is the bug of 0.18-0.20 (below): report it.
+
+Why that happened up to 0.20: the charger is a state machine in the PMIC
+(MC13892), which stops by itself at the end of a charge and at its
+120-minute charge timer, and starts again only on a replug, on its
+self-clearing CHGRESTART bit, or once the cell sags under 98% of the charge
+voltage. The driver's `charging` switch only sets the charge current. On
+2026-11-21 kindil wrote `1` at 95%, then `0`, `1` at 95%, 94% and 92% half an
+hour apart with the cell discharging on the charger, until the PMIC
+restarted by itself at 92%; and again at 00:35. Since 0.21 kindil sets
+CHGRESTART after the switch, as the driver does on a plug-in (src/pmic.rs),
+and judges charging by the PMIC's CHGENS bit, not the gauge's sign (which
+read -7 mA: a small charge current under a wake's draw would read the same).
 
 ## 2. At 100%: charging stops
 
@@ -47,9 +66,11 @@ Leave it plugged in until it reaches 100%.
   under 55. `charging` then reads 0, and the chip's current goes negative
   (the device runs on the cell).
 - Over the next hours, as it drains to 95%: `kindil: charging restarted at
-  95% (95%, -N mA, T °F)`, `charging` reads 1 again and the current turns
-  positive. On the charger all night, the percentage stays between 95 and
-  100.
+  95% (95%, -N mA, T °F; PMIC charger stopped, ...)` and `kindil: PMIC
+  charger restarted: PMIC charger charging, current setting 5`. `charging`
+  reads 1 again, and 5 minutes later the current is positive, with no
+  `stopped on a charger` line after it. On the charger all night, the
+  percentage stays between 95 and 100.
 
 ## 3. Unplug and plug in again
 

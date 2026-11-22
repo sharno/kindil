@@ -85,6 +85,18 @@ pub struct Seen {
     /// mA, positive while the chip's FLAGS say charging.
     pub current: i32,
     pub temperature_f: i32,
+    /// The PMIC's charger state machine is charging (CHGENS,
+    /// src/pmic.rs), if `/dev/pmic` could be read.
+    pub running: Option<bool>,
+}
+
+impl Seen {
+    /// Whether the charger charges: the PMIC says so where it can be
+    /// read. The gauge's sign alone misleads near full: a few tens of mA
+    /// of charging current under a wake's draw read as discharging.
+    pub fn charging(&self) -> bool {
+        self.running.unwrap_or(self.current > 0)
+    }
 }
 
 /// What to do with the charger's `charging` switch.
@@ -94,10 +106,11 @@ pub enum Change {
     Stop(Hold),
     /// Write `1`: the hold is over.
     Resume(Hold),
-    /// Write `0`, then `1`: plugged in, the chip says not charging at
-    /// [`RESTART_PERCENT`] or below, and kindil holds nothing. The driver
-    /// stopped by itself (full, or its charge timer); `0` clears its
-    /// full flag and timer count, `1` sets the charge current anew.
+    /// Write `0`, then `1`, and restart the PMIC's charger: plugged in,
+    /// not charging at [`RESTART_PERCENT`] or below, and kindil holds
+    /// nothing. The driver or the PMIC stopped by itself (full, or the
+    /// charge timer); `0` clears the driver's full flag and timer count,
+    /// `1` sets the charge current anew.
     Restart,
     /// Write `1`: unplugged while kindil held the charger off. The driver
     /// forgets "full" on an unplug but not a `0` written to the switch,
@@ -106,6 +119,32 @@ pub enum Change {
     /// Nothing to write: the switch was found off with no hold of kindil's
     /// (a previous kindil's, or powerd's): held as if full.
     Adopted,
+}
+
+/// How a [`Change`] is carried out: the `charging` switch's writes, in
+/// order, then whether the PMIC's charger state machine is restarted
+/// (src/pmic.rs). Setting the charge current alone restarts nothing once
+/// the PMIC has stopped at the end of a charge or at its charge timer:
+/// every way back to charging restarts it, as the driver does on a
+/// plug-in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Writes {
+    pub switch: &'static [&'static str],
+    pub restart: bool,
+}
+
+impl Change {
+    pub fn writes(self) -> Writes {
+        let (switch, restart): (&'static [&'static str], bool) = match self {
+            Change::Stop(_) => (&["0"], false),
+            Change::Resume(_) => (&["1"], true),
+            Change::Restart => (&["0", "1"], true),
+            // Unplugged: the next plug-in restarts it.
+            Change::Release => (&["1"], false),
+            Change::Adopted => (&[], false),
+        };
+        Writes { switch, restart }
+    }
 }
 
 /// kindil's charging policy, one reading at a time: powerd's temperature
@@ -118,8 +157,8 @@ pub fn govern_charging(state: Charging, seen: Seen, now: i64) -> (Charging, Opti
         return (Charging::default(), state.held.map(|_| Change::Release));
     }
     let mut next = state;
-    if seen.current > 0 {
-        // Charging, by the chip: a restart worked, or wasn't needed.
+    if seen.charging() {
+        // A restart worked, or wasn't needed.
         next.restarted = None;
     }
     let off = !seen.enabled;
@@ -140,6 +179,8 @@ pub fn govern_charging(state: Charging, seen: Seen, now: i64) -> (Charging, Opti
         Some(Hold::Temperature) if pause => None,
         Some(Hold::Temperature) => {
             next.held = None;
+            // A restart: the next try waits its time.
+            next.restarted = Some(now);
             Some(Change::Resume(Hold::Temperature))
         }
         _ if pause => {
@@ -148,6 +189,9 @@ pub fn govern_charging(state: Charging, seen: Seen, now: i64) -> (Charging, Opti
         }
         Some(Hold::Full) if seen.percent <= RESTART_PERCENT => {
             next.held = None;
+            // A restart, as Change::Restart's: a reading right after it
+            // (2026-11-21 18:11:00.612 and .664) doesn't restart again.
+            next.restarted = Some(now);
             Some(Change::Resume(Hold::Full))
         }
         Some(Hold::Full) => None,
@@ -156,7 +200,7 @@ pub fn govern_charging(state: Charging, seen: Seen, now: i64) -> (Charging, Opti
             Some(Change::Stop(Hold::Full))
         }
         None if seen.percent <= RESTART_PERCENT
-            && seen.current <= 0
+            && !seen.charging()
             && next.restarted.is_none_or(|at| {
                 // A clock stepped back counts as time enough.
                 now < at || now - at >= RESTART_RETRY.as_secs() as i64
@@ -408,6 +452,7 @@ mod tests {
             percent,
             current,
             temperature_f: 77,
+            running: None,
         }
     }
 
@@ -906,5 +951,149 @@ mod tests {
         assert!(alarm_woke(1000, 999), "a second's slack");
         assert!(alarm_woke(1000, 1500));
         assert!(!alarm_woke(1000, 400), "pressed long before the alarm");
+    }
+
+    /// The PMIC's charger as the datasheet has it: charging while its state
+    /// machine runs and the charge current is set; the state machine stops
+    /// by itself (here it had, at the end of a charge) and starts again
+    /// only on a CHGRESTART, or once the cell sags under BATTCYCL (92% on
+    /// the gauge, on 2026-11-21).
+    struct Pmic {
+        running: bool,
+        current_on: bool,
+        percent: u8,
+    }
+
+    impl Pmic {
+        fn seen(&self, pmic_readable: bool) -> Seen {
+            let charging = self.running && self.current_on;
+            Seen {
+                // The gauge as it read on the charger: +0 or -7 mA when not
+                // charging, a charge current when it is.
+                current: if charging { 150 } else { -7 },
+                running: pmic_readable.then_some(self.running),
+                ..seen(self.percent, 0)
+            }
+        }
+
+        fn apply(&mut self, writes: Writes, carried_out: bool) {
+            for value in writes.switch {
+                self.current_on = *value == "1";
+            }
+            if writes.restart && carried_out {
+                self.running = true;
+            }
+        }
+
+        /// Five minutes on: a percent more charged, or the sag every
+        /// half hour or so.
+        fn later(&mut self, minutes: i64) {
+            if self.running && self.current_on {
+                self.percent = (self.percent + 2).min(100);
+            } else if minutes % 30 == 0 {
+                self.percent -= 1;
+            }
+            if self.percent <= 92 {
+                // BATTCYCL: the PMIC restarts by itself.
+                self.running = true;
+            }
+        }
+    }
+
+    /// Replays 2026-11-21 from 20:50 UTC: stopped at full at 18:55, and the
+    /// PMIC's state machine ended. `restarts`: whether kindil's restart of
+    /// the state machine is carried out (0.18-0.20 had none). Returns the
+    /// changes, by minute from 20:50, and the minute it charged again.
+    fn replay(restarts: bool, pmic_readable: bool) -> (Vec<(i64, Change)>, Option<i64>) {
+        let mut pmic = Pmic {
+            running: false,
+            current_on: false,
+            percent: 95,
+        };
+        let mut state = Charging {
+            held: Some(Hold::Full),
+            restarted: None,
+        };
+        let mut changes = Vec::new();
+        let mut charging_at = None;
+        for minute in (0..=120).step_by(5) {
+            let seen = Seen {
+                enabled: pmic.current_on,
+                ..pmic.seen(pmic_readable)
+            };
+            if seen.current > 0 && charging_at.is_none() {
+                charging_at = Some(minute);
+            }
+            let (next, change) = govern_charging(state, seen, minute * 60);
+            state = next;
+            if let Some(change) = change {
+                pmic.apply(change.writes(), restarts);
+                changes.push((minute, change));
+            }
+            pmic.later(minute + 5);
+        }
+        (changes, charging_at)
+    }
+
+    #[test]
+    fn setting_the_current_alone_left_the_cell_discharging_on_its_charger() {
+        // As kindil.log and the kernel's gauge lines had it: restarted at
+        // 95%, then "stopped on a charger" every 30 minutes, and charging
+        // only once the PMIC restarted by itself at 92%, 10 to 25 minutes
+        // after a write, never on the reading after one.
+        let (changes, charging_at) = replay(false, false);
+        assert_eq!(
+            changes,
+            [
+                (0, Change::Resume(Hold::Full)),
+                (30, Change::Restart),
+                (60, Change::Restart),
+            ]
+        );
+        assert!(charging_at.is_some_and(|at| at >= 60), "{charging_at:?}");
+    }
+
+    #[test]
+    fn restarting_the_pmics_charger_charges_at_95_percent() {
+        for pmic_readable in [true, false] {
+            let (changes, charging_at) = replay(true, pmic_readable);
+            assert_eq!(changes, [(0, Change::Resume(Hold::Full))]);
+            assert_eq!(charging_at, Some(5), "the next reading charges");
+        }
+    }
+
+    #[test]
+    fn the_pmics_word_wins_over_the_gauges_sign() {
+        // Charging under a wake's draw: the gauge reads -7 mA.
+        let under_load = Seen {
+            running: Some(true),
+            ..seen(94, -7)
+        };
+        assert_eq!(govern_charging(Charging::default(), under_load, 0).1, None);
+        // Stopped, though the gauge's average still shows the last charge.
+        let ended = Seen {
+            running: Some(false),
+            ..seen(94, 12)
+        };
+        assert_eq!(
+            govern_charging(Charging::default(), ended, 0).1,
+            Some(Change::Restart)
+        );
+    }
+
+    #[test]
+    fn every_way_back_to_charging_restarts_the_pmic() {
+        assert!(Change::Resume(Hold::Full).writes().restart);
+        assert!(Change::Resume(Hold::Temperature).writes().restart);
+        assert_eq!(
+            Change::Restart.writes(),
+            Writes {
+                switch: &["0", "1"],
+                restart: true
+            }
+        );
+        assert!(!Change::Stop(Hold::Full).writes().restart);
+        assert!(!Change::Release.writes().restart, "unplugged");
+        assert!(!Change::Adopted.writes().restart);
     }
 }
