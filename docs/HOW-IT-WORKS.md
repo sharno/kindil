@@ -85,7 +85,8 @@ against them: see [Formal models](DEVELOP.md#formal-models).
     is established in `/proc/net/tcp` or `tcp6`, checked every 5 seconds,
     it doesn't nap either, and naps once the last one closes; each session
     holds it at most 30 minutes, so a stuck one can't drain the battery.
-    Once an hour it logs a doze ledger: awake and asleep seconds, wakes
+    About once an hour, on the first online wake after an hour (at the
+    latest after 90 minutes), it logs a doze ledger: awake and asleep seconds, wakes
     (ticks and full redraws apart, with the seconds each), Wi-Fi-up
     seconds, seconds held awake (maintenance windows, and SSH), how
     redraws ended, the gauge, and the clock's corrections. The power button
