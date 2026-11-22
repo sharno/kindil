@@ -196,14 +196,23 @@ against them: see [Formal models](DEVELOP.md#formal-models).
     the 6-hourly check of a sleep; no wake of its own), in one policy
     (src/power.rs): outside 32-113 °F, powerd's range, it pauses charging,
     and resumes 3 °F back inside; this wins over the rest. On a charger it
-    stops at 100% under 55 mA and restarts at 95% or below. A charger the
-    driver stopped by itself (full, or its charge timer) that the chip
-    shows not charging at 95% or below gets `0` then `1`, at most once each
-    30 minutes until the chip shows it charging. Each change is logged with
-    the chip's percentage, current and temperature ("kindil: charging
-    stopped at full (100%, +41 mA, 75 °F)", "charging restarted at 95%");
-    the current's sign is the chip's charging flag (FLAGS bit 7), not yet
-    confirmed on the device while charging. kindil never leaves the switch
+    stops at 100% under 55 mA and restarts at 95% or below. The charger
+    itself is a state machine in the PMIC (MC13892), which stops by itself
+    at the end of a charge and at its 120-minute charge timer, and which
+    the switch's `1` (a charge current) doesn't start again: only a replug,
+    the PMIC's self-clearing CHGRESTART bit, or the cell sagging under 98%
+    of the charge voltage do. Up to 0.20 that left the cell discharging on
+    its charger from 95% down to about 92% (2026-11-21). So every way back
+    to charging also sets CHGRESTART through `/dev/pmic` (src/pmic.rs), as
+    the driver does on a plug-in, and kindil judges whether it charges by
+    the PMIC's CHGENS bit rather than the gauge's sign. A charger stopped
+    by itself at 95% or below gets `0`, `1` and a restart, at most once
+    each 30 minutes until it charges. Each change is logged with the
+    chip's percentage, current and temperature and the PMIC's charger
+    ("kindil: charging stopped at full (100%, +41 mA, 75 °F; PMIC charger
+    charging, current setting 5)", "charging restarted at 95%", "PMIC
+    charger restarted"). Without `/dev/pmic` it falls back to the gauge's
+    sign and the switch alone, and says so once. kindil never leaves the switch
     off: an unplug while it holds it puts it back to `1` (the driver forgets
     "full" on an unplug, but not a `0` written to the switch, which keeps
     its own rule off), and so does leaving kindil; the launcher writes `1`

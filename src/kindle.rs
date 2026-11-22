@@ -132,6 +132,12 @@ fn govern_charging(gauge: &crate::gauge::Cached) -> anyhow::Result<()> {
     // from more than one thread.
     let mut state = lock(&CHARGING);
     let plugged = plugged()?;
+    let pmic = pmic();
+    let charger = pmic.as_ref().and_then(|pmic| {
+        pmic.charger()
+            .inspect_err(|error| pmic_failed("reading the PMIC's charger", error))
+            .ok()
+    });
     let seen = crate::power::Seen {
         plugged,
         // Unplugged, the switch always reads 0.
@@ -139,6 +145,7 @@ fn govern_charging(gauge: &crate::gauge::Cached) -> anyhow::Result<()> {
         percent,
         current,
         temperature_f,
+        running: charger.map(|charger| charger.running),
     };
     let (next, change) = crate::power::govern_charging(*state, seen, epoch_seconds());
     let Some(change) = change else {
@@ -147,25 +154,52 @@ fn govern_charging(gauge: &crate::gauge::Cached) -> anyhow::Result<()> {
     };
     // The current's sign is the chip's charging flag (FLAGS bit 7), not yet
     // seen to be right while charging: in the log as evidence.
-    let at = format!("{percent}%, {current:+} mA, {temperature_f} °F");
-    let (writes, line): (&[&str], String) = match change {
-        Change::Stop(Hold::Full) => (&["0"], format!("charging stopped at full ({at})")),
-        Change::Stop(Hold::Temperature) => (&["0"], format!("charging paused ({at})")),
-        Change::Resume(Hold::Temperature) => (&["1"], format!("charging resumed ({at})")),
-        Change::Resume(Hold::Full) => (&["1"], format!("charging restarted at {percent}% ({at})")),
-        Change::Restart => (
-            &["0", "1"],
-            format!("charging restarted at {percent}%: stopped on a charger ({at})"),
-        ),
-        Change::Release => (&["1"], "charger unplugged; charging switch back on".into()),
-        Change::Adopted => (&[], format!("charging found off; held until 95% ({at})")),
+    let at = match charger {
+        Some(charger) => format!("{percent}%, {current:+} mA, {temperature_f} °F; {charger}"),
+        None => format!("{percent}%, {current:+} mA, {temperature_f} °F"),
     };
-    for value in writes {
+    let line = match change {
+        Change::Stop(Hold::Full) => format!("charging stopped at full ({at})"),
+        Change::Stop(Hold::Temperature) => format!("charging paused ({at})"),
+        Change::Resume(Hold::Temperature) => format!("charging resumed ({at})"),
+        Change::Resume(Hold::Full) => format!("charging restarted at {percent}% ({at})"),
+        Change::Restart => format!("charging restarted at {percent}%: stopped on a charger ({at})"),
+        Change::Release => "charger unplugged; charging switch back on".into(),
+        Change::Adopted => format!("charging found off; held until 95% ({at})"),
+    };
+    let writes = change.writes();
+    for value in writes.switch {
         std::fs::write(CHARGER, value)?;
     }
     *state = next;
     crate::log!("kindil: {line}");
+    if writes.restart {
+        match pmic.as_ref().map(crate::pmic::Pmic::restart) {
+            Some(Ok(charger)) => crate::log!("kindil: PMIC charger restarted: {charger}"),
+            Some(Err(error)) => crate::log!("kindil: restarting the PMIC's charger: {error}"),
+            None => {}
+        }
+    }
     Ok(())
+}
+
+/// Whether reading or writing the PMIC failed, so it is said once.
+static PMIC_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn pmic_failed(what: &str, error: &std::io::Error) {
+    if !PMIC_FAILED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::log!(
+            "kindil: {what}: {error}; charging judged by the gauge, \
+             and restarted by the charge current only"
+        );
+    }
+}
+
+/// The PMIC core's device, if it opens (src/pmic.rs).
+fn pmic() -> Option<crate::pmic::Pmic> {
+    crate::pmic::Pmic::open()
+        .inspect_err(|error| pmic_failed(crate::pmic::DEVICE, error))
+        .ok()
 }
 
 /// On the way out: a charger switch kindil holds off goes back on, so
