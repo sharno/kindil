@@ -8,7 +8,7 @@ exclude = ["crates/tawqit"]
 
 [package]
 name = "kindil"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2021"
 rust-version = "1.93"
 description = "A single-process Rust shell for the first-generation Amazon Kindle Paperwhite"
